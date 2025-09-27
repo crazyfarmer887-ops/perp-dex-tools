@@ -325,22 +325,64 @@ class TradingBot:
                                 f"Order quantity: {len(self.active_close_orders)}")
                 self.last_log_time = time.time()
                 # Check for position mismatch
-                if abs(position_amt - active_close_amount) > (2 * self.config.quantity):
-                    error_message = f"\n\nERROR: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] "
-                    error_message += "Position mismatch detected\n"
-                    error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
-                    error_message += "Please manually rebalance your position and take-profit orders\n"
-                    error_message += "请手动平衡当前仓位和正在关闭的仓位\n"
-                    error_message += f"current position: {position_amt} | active closing amount: {active_close_amount} | "f"Order quantity: {len(self.active_close_orders)}\n"
-                    error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
-                    self.logger.log(error_message, "ERROR")
+                diff = position_amt - active_close_amount
+                # Using a smaller threshold to detect meaningful mismatches
+                if abs(diff) > (self.config.quantity / 20):
+                    if self.config.exchange == 'aster':
+                        self.logger.log(
+                            f"Position mismatch detected on Aster. Position: {position_amt}, "
+                            f"Close Orders: {active_close_amount}. Reconciling...",
+                            "WARNING"
+                        )
 
-                    await self._lark_bot_notify(error_message.lstrip())
+                        side_to_reconcile = ''
+                        if diff > 0:  # Position is larger than closing orders, need to sell the excess
+                            side_to_reconcile = self.config.close_order_side
+                        else:  # Position is smaller than closing orders, need to buy to cover
+                            side_to_reconcile = self.config.direction
 
-                    if not self.shutdown_requested:
-                        self.shutdown_requested = True
+                        quantity_to_reconcile = abs(diff)
 
-                    mismatch_detected = True
+                        self.logger.log(
+                            f"Placing market order to {side_to_reconcile} {quantity_to_reconcile} of {self.config.ticker}",
+                            "INFO"
+                        )
+
+                        market_order_result = await self.exchange_client.place_market_order(
+                            self.config.contract_id,
+                            quantity_to_reconcile,
+                            side_to_reconcile
+                        )
+
+                        if market_order_result.success:
+                            self.logger.log(
+                                f"Successfully reconciled position with market order {market_order_result.order_id}.",
+                                "INFO"
+                            )
+                            # After reconciliation, we can continue. No mismatch to report.
+                            mismatch_detected = False
+                        else:
+                            self.logger.log(f"Failed to reconcile position: {market_order_result.error_message}", "ERROR")
+                            # If reconciliation fails, we should stop to prevent further issues.
+                            self.shutdown_requested = True
+                            mismatch_detected = True
+                    else:
+                        # Original logic for other exchanges
+                        error_message = f"\n\nERROR: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] "
+                        error_message += "Position mismatch detected\n"
+                        error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
+                        error_message += "Please manually rebalance your position and take-profit orders\n"
+                        error_message += "请手动平衡当前仓位和正在关闭的仓位\n"
+                        error_message += (f"current position: {position_amt} | active closing amount: {active_close_amount} | "
+                                          f"Order quantity: {len(self.active_close_orders)}\n")
+                        error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
+                        self.logger.log(error_message, "ERROR")
+
+                        await self._lark_bot_notify(error_message.lstrip())
+
+                        if not self.shutdown_requested:
+                            self.shutdown_requested = True
+                        mismatch_detected = True
                 else:
                     mismatch_detected = False
 

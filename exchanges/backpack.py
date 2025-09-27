@@ -426,6 +426,10 @@ class BackpackClient(BaseExchangeClient):
 
         return OrderResult(success=False, error_message='Max retries exceeded for close order')
 
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
+        """Place a market order."""
+        raise NotImplementedError("Market orders are not supported for Backpack exchange yet.")
+
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Backpack using official SDK."""
         try:

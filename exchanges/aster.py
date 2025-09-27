@@ -611,6 +611,41 @@ class AsterClient(BaseExchangeClient):
             else:
                 return OrderResult(success=False, error_message='Unknown order status: ' + order_status)
 
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
+        """Place a market order with Aster."""
+        try:
+            order_data = {
+                'symbol': contract_id,
+                'side': side.upper(),
+                'type': 'MARKET',
+                'quantity': str(quantity),
+            }
+
+            result = await self._make_request('POST', '/fapi/v1/order', data=order_data)
+
+            order_id = result.get('orderId')
+            status = result.get('status')
+            avg_price = result.get('avgPrice', '0')
+
+            if order_id and status == 'FILLED':
+                return OrderResult(
+                    success=True,
+                    order_id=str(order_id),
+                    side=side.lower(),
+                    size=Decimal(result.get('origQty', '0')),
+                    price=Decimal(avg_price),
+                    status=status,
+                    filled_size=Decimal(result.get('executedQty', '0'))
+                )
+            else:
+                error_message = result.get('msg', f'Market order failed with status: {status}')
+                self.logger.log(f"Failed to place market order: {error_message}", "ERROR")
+                return OrderResult(success=False, error_message=error_message)
+
+        except Exception as e:
+            self.logger.log(f"Error placing market order: {e}", "ERROR")
+            return OrderResult(success=False, error_message=str(e))
+
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Aster."""
         try:

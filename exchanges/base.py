@@ -122,6 +122,11 @@ class BaseExchangeClient(ABC):
         pass
 
     @abstractmethod
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
+        """Place a market order."""
+        pass
+
+    @abstractmethod
     def get_exchange_name(self) -> str:
         """Get the exchange name."""
         pass

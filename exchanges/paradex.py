@@ -477,6 +477,10 @@ class ParadexClient(BaseExchangeClient):
             status=order_status
         )
 
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
+        """Place a market order."""
+        raise NotImplementedError("Market orders are not supported for Paradex exchange yet.")
+
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Paradex using official SDK."""
         try:
