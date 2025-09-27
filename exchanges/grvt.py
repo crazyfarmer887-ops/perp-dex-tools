@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from pysdk.grvt_ccxt_pro import GrvtCcxtPro
 from pysdk.grvt_ccxt_env import GrvtEnv
@@ -62,9 +62,73 @@ class GRVTClient(BaseExchangeClient):
     def get_exchange_name(self) -> str:
         return "grvt"
 
+    def _order_update_handler(self, order: dict):
+        """Processes a single order update from the WebSocket stream."""
+        if not self.order_update_handler:
+            return
+
+        try:
+            status = order.get('status')
+            side = order.get('side')
+            filled_size = Decimal(str(order.get('filled', '0')))
+            size = Decimal(str(order.get('amount', '0')))
+
+            # Determine order type ('OPEN' or 'CLOSE')
+            order_type = "CLOSE" if side == self.config.close_order_side else "OPEN"
+
+            # Map exchange status to internal bot status
+            if status == 'closed':
+                mapped_status = 'FILLED'
+            elif status == 'canceled':
+                mapped_status = 'CANCELED'
+            elif status == 'open':
+                mapped_status = 'PARTIALLY_FILLED' if filled_size > 0 else 'OPEN'
+            else:
+                logger.warning(f"Unknown GRVT order status received: {status}")
+                return
+
+            # Construct the message payload for the trading bot
+            bot_message = {
+                'order_id': order.get('id'),
+                'side': side,
+                'order_type': order_type,
+                'status': mapped_status,
+                'size': str(size),
+                'price': str(order.get('price', '0')),
+                'contract_id': order.get('symbol'),
+                'filled_size': str(filled_size),
+            }
+
+            # Pass the processed message to the bot's handler
+            self.order_update_handler(bot_message)
+
+        except Exception as e:
+            logger.error(f"Error processing GRVT order update: {e}", exc_info=True)
+
+    async def _order_watcher(self):
+        """Continuously watches for order updates from the exchange."""
+        logger.info("Starting GRVT order watcher...")
+        while True:
+            try:
+                # watch_orders is a long-polling method that waits for updates
+                if not self.grvt_client or not self.grvt_client.markets:
+                    await self.connect()
+                orders = await self.grvt_client.watch_orders(symbol=self.config.contract_id)
+                for order in orders:
+                    self._order_update_handler(order)
+            except asyncio.CancelledError:
+                logger.info("GRVT order watcher cancelled.")
+                break
+            except Exception as e:
+                logger.error(f"Error in GRVT order watcher: {e}", exc_info=True)
+                # Wait before retrying to prevent spamming on connection issues
+                await asyncio.sleep(5)
+
     def setup_order_update_handler(self, handler) -> None:
+        """Sets up the handler for order updates and starts the watcher task."""
         self.order_update_handler = handler
-        logger.info("Order update handler set up for GRVT. (Placeholder for WebSocket implementation)")
+        logger.info("Order update handler set up for GRVT.")
+        asyncio.create_task(self._order_watcher())
 
     def _from_sdk_order(self, order: dict) -> OrderInfo:
         """Converts a ccxt-style order dict to an OrderInfo object."""
@@ -196,3 +260,43 @@ class GRVTClient(BaseExchangeClient):
         except Exception as e:
             logger.error(f"Error placing market order on GRVT: {e}", exc_info=True)
             return OrderResult(success=False, error_message=str(e))
+
+    async def get_contract_attributes(self) -> Tuple[str, Decimal]:
+        """Get contract ID and tick size for a ticker."""
+        ticker = self.config.ticker
+        if not ticker:
+            raise ValueError("Ticker is not configured.")
+
+        # In GRVT, the ticker is the contract_id
+        contract_id = ticker
+        self.config.contract_id = contract_id
+
+        if not self.grvt_client or not self.grvt_client.markets:
+            await self.connect()
+
+        market = self.grvt_client.markets.get(contract_id)
+        if not market:
+            raise ValueError(f"Market {contract_id} not found.")
+
+        # Extract tick size (price precision)
+        tick_size = Decimal(str(market['precision']['price']))
+        self.config.tick_size = tick_size
+
+        return contract_id, tick_size
+
+    async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
+        """Fetches the best bid and offer prices for a given contract."""
+        if not self.grvt_client:
+            raise ConnectionError("GRVT client not connected.")
+        try:
+            ticker = await self.grvt_client.fetch_ticker(contract_id)
+            best_bid = Decimal(str(ticker['bid']))
+            best_ask = Decimal(str(ticker['ask']))
+
+            if best_bid <= 0 or best_ask <= 0:
+                raise ValueError("Invalid bid/ask prices received from GRVT.")
+
+            return best_bid, best_ask
+        except Exception as e:
+            logger.error(f"Error fetching BBO prices from GRVT for {contract_id}: {e}", exc_info=True)
+            raise ValueError(f"Could not fetch BBO prices for {contract_id} from GRVT.")

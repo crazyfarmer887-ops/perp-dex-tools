@@ -77,6 +77,11 @@ class BaseExchangeClient(ABC):
         pass
 
     @abstractmethod
+    async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
+        """Fetches the best bid and offer prices for a given contract."""
+        pass
+
+    @abstractmethod
     async def connect(self) -> None:
         """Connect to the exchange (WebSocket, etc.)."""
         pass
