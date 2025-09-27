@@ -8,6 +8,7 @@ from .edgex import EdgeXClient
 from .backpack import BackpackClient
 from .paradex import ParadexClient
 from .aster import AsterClient
+from .grvt import GRVTClient
 
 
 class ExchangeFactory:
@@ -18,6 +19,7 @@ class ExchangeFactory:
         'backpack': BackpackClient,
         'paradex': ParadexClient,
         'aster': AsterClient,
+        'grvt': GRVTClient,
     }
 
     @classmethod

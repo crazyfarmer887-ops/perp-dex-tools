@@ -1,7 +1,7 @@
 ##### Follow Me - **X (Twitter)**: [@yourQuantGuy](https://x.com/yourQuantGuy)
 ## Multi-Exchange Trading Bot
 
-A modular trading bot that supports multiple exchanges including EdgeX, Backpack, Paradex, and Aster. The bot implements an automated strategy that places orders and automatically closes them at a profit.
+A modular trading bot that supports multiple exchanges including EdgeX, Backpack, Paradex, Aster, and GRVT. The bot implements an automated strategy that places orders and automatically closes them at a profit.
 
 ## Referral Links (Enjoy fee rebates and benefits)
 
@@ -16,6 +16,9 @@ You will get 10% taker fee discount rebates and potential future benefits
 
 #### Aster Exchange: [https://www.asterdex.com/zh-CN/referral/5191B1](https://www.asterdex.com/zh-CN/referral/5191B1)
 You will get 10% fee rebates and potential points boost
+
+#### GRVT Exchange: (Please replace with your referral link)
+Enjoy benefits by using a referral link.
 
 ## Installation
 
@@ -144,6 +147,14 @@ ETH Perpetual (with grid step control):
 python runbot.py --exchange backpack --ticker ETH --quantity 0.1 --take-profit 0.02 --max-orders 40 --wait-time 450 --grid-step 0.3
 ```
 
+### GRVT Exchange:
+
+ETH Perpetual:
+
+```bash
+python runbot.py --exchange grvt --ticker ETH-PERP --quantity 0.1 --take-profit 0.02 --max-orders 40 --wait-time 450
+```
+
 ## Configuration
 
 ### Environment Variables
@@ -173,9 +184,16 @@ python runbot.py --exchange backpack --ticker ETH --quantity 0.1 --take-profit 0
 - `ASTER_API_KEY`: Your Aster API Key
 - `ASTER_SECRET_KEY`: Your Aster API Secret
 
+#### GRVT Configuration
+
+- `GRVT_API_KEY`: Your GRVT API Key
+- `GRVT_PRIVATE_KEY`: Your GRVT Private Key
+- `GRVT_TRADING_ACCOUNT_ID`: Your GRVT Trading Account ID
+- `GRVT_ENV`: The GRVT environment (optional, defaults to `testnet`)
+
 ### Command Line Arguments
 
-- `--exchange`: Exchange to use: 'edgex', 'backpack', 'paradex', or 'aster' (default: edgex)
+- `--exchange`: Exchange to use: 'edgex', 'backpack', 'paradex', 'aster', or 'grvt' (default: edgex)
 - `--ticker`: Base asset symbol (e.g., ETH, BTC, SOL). Contract ID is auto-resolved.
 - `--quantity`: Order quantity (default: 0.1)
 - `--take-profit`: Take profit percent (e.g., 0.02 means 0.02%)

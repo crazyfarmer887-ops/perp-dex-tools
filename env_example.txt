@@ -22,6 +22,13 @@ PARADEX_ENVIRONMENT=prod # or testnet
 ASTER_API_KEY=your_aster_api_key
 ASTER_SECRET_KEY=your_aster_secret_key
 
+# GRVT Configuration
+# Find these in your GRVT account under API settings
+GRVT_API_KEY=your_grvt_api_key
+GRVT_PRIVATE_KEY=your_grvt_private_key
+GRVT_TRADING_ACCOUNT_ID=your_grvt_trading_account_id
+GRVT_ENV=testnet # or prod
+
 # Notification (optional)
 # guide: https://www.feishu.cn/hc/zh-CN/articles/185289387886-%E6%B6%88%E6%81%AF%E5%8A%A9%E6%89%8B-%E6%9C%BA%E5%99%A8%E4%BA%BA
 LARK_TOKEN=
