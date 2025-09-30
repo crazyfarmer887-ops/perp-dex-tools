@@ -502,16 +502,15 @@ class BackpackClient(BaseExchangeClient):
 
         return orders
 
-    @query_retry(default_return=0)
+    @query_retry(default_return=Decimal(0))
     async def get_account_positions(self) -> Decimal:
-        """Get account positions using official SDK."""
+        """Get account positions using official SDK. This should be a signed value."""
         positions_data = self.account_client.get_open_positions()
-        position_amt = 0
         for position in positions_data:
             if position.get('symbol', '') == self.config.contract_id:
-                position_amt = abs(Decimal(position.get('netQuantity', 0)))
-                break
-        return position_amt
+                # netQuantity is a signed value indicating long (+) or short (-)
+                return Decimal(position.get('netQuantity', 0))
+        return Decimal(0)
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID for a ticker."""
