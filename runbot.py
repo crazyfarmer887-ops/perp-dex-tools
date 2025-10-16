@@ -7,6 +7,7 @@ import argparse
 import asyncio
 from pathlib import Path
 import sys
+import os
 import dotenv
 from decimal import Decimal
 from trading_bot import TradingBot, TradingConfig
@@ -59,20 +60,29 @@ async def main():
         sys.exit(1)
     dotenv.load_dotenv(args.env_file)
 
+    # Read martingale-related settings from environment (after dotenv loaded)
+    env_tp = os.getenv("MARTINGALE_TP_PERCENT")
+    env_steps = os.getenv("MARTINGALE_STEPS")
+    env_sl = os.getenv("MARTINGALE_SL_PERCENT")
+
     # Create configuration
     config = TradingConfig(
         ticker=args.ticker,
         contract_id='',  # will be set in the bot's run method
         tick_size=Decimal(0),
         quantity=args.quantity,
-        take_profit=args.take_profit,
+        # Prefer env-driven TP if provided; fallback to CLI arg
+        take_profit=Decimal(env_tp) if env_tp is not None else args.take_profit,
         direction=args.direction,
         max_orders=args.max_orders,
         wait_time=args.wait_time,
         exchange=args.exchange,
         grid_step=Decimal(args.grid_step),
         stop_price=Decimal(args.stop_price),
-        pause_price=Decimal(args.pause_price)
+        pause_price=Decimal(args.pause_price),
+        # Martingale configuration (env-driven)
+        martingale_steps=int(env_steps) if env_steps is not None else 0,
+        martingale_sl=Decimal(env_sl) if env_sl is not None else Decimal(0)
     )
 
     # Create and run the bot

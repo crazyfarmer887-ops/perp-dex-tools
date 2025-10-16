@@ -30,6 +30,9 @@ class TradingConfig:
     grid_step: Decimal
     stop_price: Decimal
     pause_price: Decimal
+    # Martingale configuration (env-driven)
+    martingale_steps: int = 0
+    martingale_sl: Decimal = Decimal(0)
 
     @property
     def close_order_side(self) -> str:
@@ -80,6 +83,21 @@ class TradingBot:
         self.shutdown_requested = False
         self.loop = None
 
+        # Martingale state
+        self.martingale_active = (self.config.martingale_steps or 0) > 0
+        # Use env multiplier if provided, default to 2
+        try:
+            self.mg_multiplier = Decimal(os.getenv("MARTINGALE_MULTIPLIER", "2"))
+        except Exception:
+            self.mg_multiplier = Decimal(2)
+        self.mg_current_step = 0
+        self.mg_total_qty: Decimal = Decimal(0)
+        self.mg_total_cost: Decimal = Decimal(0)
+        self.mg_first_entry_price: Optional[Decimal] = None
+        self.mg_last_entry_price: Optional[Decimal] = None
+        self.mg_avg_entry_price: Optional[Decimal] = None
+        self.current_position_amt: Decimal = Decimal(0)
+
         # Register order callback
         self._setup_websocket_handlers()
 
@@ -122,6 +140,13 @@ class TradingBot:
                         else:
                             # Fallback (should not happen after run() starts)
                             self.order_filled_event.set()
+                    elif order_type == "CLOSE":
+                        # When a close order fully fills, reset martingale state
+                        self.mg_current_step = 0
+                        self.mg_total_qty = Decimal(0)
+                        self.mg_first_entry_price = None
+                        self.mg_last_entry_price = None
+                        self.mg_avg_entry_price = None
 
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
                                     f"{message.get('size')} @ {message.get('price')}", "INFO")
@@ -152,6 +177,102 @@ class TradingBot:
 
         # Setup order update handler
         self.exchange_client.setup_order_update_handler(order_update_handler)
+
+    def _get_next_open_quantity(self) -> Decimal:
+        if not self.martingale_active:
+            return self.config.quantity
+        step_multiplier = self.mg_multiplier ** self.mg_current_step
+        # Quantity step is exchange-specific; without explicit step, avoid quantization here
+        return (self.config.quantity * step_multiplier)
+
+    def _update_martingale_on_open_fill(self, filled_price: Decimal, filled_qty: Decimal) -> None:
+        if filled_qty is None or filled_qty <= 0:
+            return
+        if self.mg_first_entry_price is None:
+            self.mg_first_entry_price = filled_price
+        self.mg_last_entry_price = filled_price
+        self.mg_total_qty += Decimal(filled_qty)
+        self.mg_total_cost += Decimal(filled_qty) * Decimal(filled_price)
+        # Average entry price for the whole position
+        if self.mg_total_qty > 0:
+            self.mg_avg_entry_price = self.mg_total_cost / self.mg_total_qty
+        # Count this as one martingale step only when any fill occurs
+        self.mg_current_step += 1
+
+    async def _place_or_update_mg_close(self) -> None:
+        if not self.martingale_active or self.mg_total_qty <= 0 or self.mg_avg_entry_price is None:
+            return
+
+        # Cancel existing close orders to avoid duplicates
+        try:
+            for order in list(self.active_close_orders):
+                try:
+                    await self.exchange_client.cancel_order(order['id'])
+                except Exception:
+                    pass
+        finally:
+            self.active_close_orders = []
+
+        # Compute new close target from average entry
+        close_side = self.config.close_order_side
+        if close_side == 'sell':
+            target_price = self.mg_avg_entry_price * (1 + self.config.take_profit/100)
+        else:
+            target_price = self.mg_avg_entry_price * (1 - self.config.take_profit/100)
+
+        await self.exchange_client.place_close_order(
+            self.config.contract_id,
+            self.mg_total_qty,
+            target_price,
+            close_side
+        )
+
+    async def _check_martingale_stop_loss(self) -> bool:
+        """Returns True if stop-loss triggered and handled."""
+        if not self.martingale_active:
+            return False
+        if self.config.martingale_sl is None or self.config.martingale_sl <= 0:
+            return False
+        if self.mg_total_qty <= 0 or not self.mg_avg_entry_price:
+            return False
+
+        best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            return False
+
+        if self.config.direction == 'buy':
+            sl_price = self.mg_avg_entry_price * (1 - self.config.martingale_sl/100)
+            triggered = best_ask <= sl_price
+            close_side = 'sell'
+            close_price = best_bid + self.config.tick_size
+        else:
+            sl_price = self.mg_avg_entry_price * (1 + self.config.martingale_sl/100)
+            triggered = best_bid >= sl_price
+            close_side = 'buy'
+            close_price = best_ask - self.config.tick_size
+
+        if triggered:
+            self.logger.log(f"Stop-loss triggered at {sl_price:.6f} based on avg {self.mg_avg_entry_price:.6f}", "WARNING")
+            try:
+                # Cancel existing close orders
+                for order in list(self.active_close_orders):
+                    try:
+                        await self.exchange_client.cancel_order(order['id'])
+                    except Exception:
+                        pass
+                self.active_close_orders = []
+                # Place an exit order for total position
+                await self.exchange_client.place_close_order(
+                    self.config.contract_id,
+                    self.mg_total_qty,
+                    close_price,
+                    close_side
+                )
+            finally:
+                # Stop further trading after stop-loss
+                self.shutdown_requested = True
+            return True
+        return False
 
     def _calculate_wait_time(self) -> Decimal:
         """Calculate wait time between orders."""
@@ -192,9 +313,10 @@ class TradingBot:
             self.order_filled_amount = 0.0
 
             # Place the order
+            open_qty = self._get_next_open_quantity()
             order_result = await self.exchange_client.place_open_order(
                 self.config.contract_id,
-                self.config.quantity,
+                open_qty,
                 self.config.direction
             )
 
@@ -225,24 +347,30 @@ class TradingBot:
 
         if self.order_filled_event.is_set() or order_result.status == 'FILLED':
             self.last_open_order_time = time.time()
-            # Place close order
-            close_side = self.config.close_order_side
-            if close_side == 'sell':
-                close_price = filled_price * (1 + self.config.take_profit/100)
+            if self.martingale_active:
+                # Update martingale position state, then (re)place aggregated close
+                self._update_martingale_on_open_fill(filled_price, order_result.size)
+                await self._place_or_update_mg_close()
+                return True
             else:
-                close_price = filled_price * (1 - self.config.take_profit/100)
+                # Grid/default behavior: place one close per open
+                close_side = self.config.close_order_side
+                if close_side == 'sell':
+                    close_price = filled_price * (1 + self.config.take_profit/100)
+                else:
+                    close_price = filled_price * (1 - self.config.take_profit/100)
 
-            close_order_result = await self.exchange_client.place_close_order(
-                self.config.contract_id,
-                self.config.quantity,
-                close_price,
-                close_side
-            )
+                close_order_result = await self.exchange_client.place_close_order(
+                    self.config.contract_id,
+                    self.config.quantity,
+                    close_price,
+                    close_side
+                )
 
-            if not close_order_result.success:
-                self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
+                if not close_order_result.success:
+                    self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
 
-            return True
+                return True
 
         else:
             self.order_canceled_event.clear()
@@ -272,22 +400,27 @@ class TradingBot:
                         self.order_filled_amount = order_info.filled_size
 
             if self.order_filled_amount > 0:
-                close_side = self.config.close_order_side
-                if close_side == 'sell':
-                    close_price = filled_price * (1 + self.config.take_profit/100)
+                if self.martingale_active:
+                    self._update_martingale_on_open_fill(filled_price, self.order_filled_amount)
+                    await self._place_or_update_mg_close()
+                    self.last_open_order_time = time.time()
                 else:
-                    close_price = filled_price * (1 - self.config.take_profit/100)
+                    close_side = self.config.close_order_side
+                    if close_side == 'sell':
+                        close_price = filled_price * (1 + self.config.take_profit/100)
+                    else:
+                        close_price = filled_price * (1 - self.config.take_profit/100)
 
-                close_order_result = await self.exchange_client.place_close_order(
-                    self.config.contract_id,
-                    self.order_filled_amount,
-                    close_price,
-                    close_side
-                )
-                self.last_open_order_time = time.time()
+                    close_order_result = await self.exchange_client.place_close_order(
+                        self.config.contract_id,
+                        self.order_filled_amount,
+                        close_price,
+                        close_side
+                    )
+                    self.last_open_order_time = time.time()
 
-                if not close_order_result.success:
-                    self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
+                    if not close_order_result.success:
+                        self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
 
             return True
 
@@ -432,6 +565,8 @@ class TradingBot:
             self.logger.log(f"Grid Step: {self.config.grid_step}%", "INFO")
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
+            if self.martingale_active:
+                self.logger.log(f"Martingale: steps={self.config.martingale_steps} multiplier={self.mg_multiplier} sl%={self.config.martingale_sl}", "INFO")
             self.logger.log("=============================", "INFO")
 
             # Capture the running event loop for thread-safe callbacks
@@ -457,6 +592,11 @@ class TradingBot:
                 # Periodic logging
                 mismatch_detected = await self._log_status_periodically()
 
+                # Martingale stop-loss check
+                if await self._check_martingale_stop_loss():
+                    await asyncio.sleep(1)
+                    continue
+
                 stop_trading, pause_trading = await self._check_price_condition()
                 if stop_trading:
                     msg = f"\n\nWARNING: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] \n"
@@ -476,10 +616,17 @@ class TradingBot:
                         await asyncio.sleep(wait_time)
                         continue
                     else:
-                        meet_grid_step_condition = await self._meet_grid_step_condition()
-                        if not meet_grid_step_condition:
-                            await asyncio.sleep(1)
-                            continue
+                        if not self.martingale_active:
+                            meet_grid_step_condition = await self._meet_grid_step_condition()
+                            if not meet_grid_step_condition:
+                                await asyncio.sleep(1)
+                                continue
+                        else:
+                            # Enforce martingale step cap: initial entry + N steps
+                            allowed_entries = 1 + max(0, int(self.config.martingale_steps))
+                            if self.mg_current_step >= allowed_entries:
+                                await asyncio.sleep(1)
+                                continue
 
                         await self._place_and_monitor_open_order()
                         self.last_close_orders += 1

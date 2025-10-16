@@ -36,3 +36,14 @@ TIMEZONE=Asia/Shanghai
 # EdgeX API Endpoints
 EDGEX_BASE_URL=https://pro.edgex.exchange
 EDGEX_WS_URL=wss://quote.edgex.exchange
+
+# --- Strategy: Martingale (optional) ---
+# Enable martingale by setting steps > 0
+# Number of martingale additions (entries) after the first
+MARTINGALE_STEPS=0
+# Take-profit percentage on the averaged entry price (overrides CLI take-profit if set)
+MARTINGALE_TP_PERCENT=0.02
+# Stop-loss percentage from averaged entry price; if hit, exit and stop
+MARTINGALE_SL_PERCENT=0
+# Size multiplier per martingale step (default 2)
+MARTINGALE_MULTIPLIER=2
