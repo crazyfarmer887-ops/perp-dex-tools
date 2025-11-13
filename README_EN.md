@@ -8,7 +8,7 @@
 
 ## Multi-Exchange Trading Bot
 
-A modular trading bot that supports multiple exchanges including EdgeX, Backpack, Paradex, Aster, Lighter, GRVT, and Extended. The bot implements an automated strategy that places orders and automatically closes them at a profit.
+A modular trading bot that supports multiple exchanges including EdgeX, Backpack, Paradex, Aster, Lighter, GRVT, BingX, and Extended. The bot implements an automated strategy that places orders and automatically closes them at a profit.
 
 ## Referral Links (Enjoy fee rebates and benefits)
 
@@ -291,13 +291,16 @@ python hedge_mode.py --exchange apex --ticker BTC --size 0.05 --iter 20
 # Run BTC hedge mode with GRVT
 python hedge_mode.py --exchange grvt --ticker BTC --size 0.05 --iter 20
 
+# Run BTC hedge mode with GRVT + BingX
+python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 20
+
 # Run BTC hedge mode with edgeX
 python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 ```
 
 ### Hedge Mode Parameters
 
-- `--exchange`: Primary exchange (supports 'backpack', 'extended', 'apex', 'grvt', 'edgex')
+- `--exchange`: Primary exchange (supports 'backpack', 'extended', 'apex', 'grvt', 'grvt_bingx', 'edgex')
 - `--ticker`: Trading pair symbol (e.g., BTC, ETH)
 - `--size`: Order quantity per trade
 - `--iter`: Number of trading cycles
@@ -351,6 +354,13 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 - `GRVT_PRIVATE_KEY`: Your GRVT private key
 - `GRVT_API_KEY`: Your GRVT API key
 
+#### BingX Configuration
+
+- `BINGX_API_KEY`: Your BingX API key
+- `BINGX_SECRET_KEY`: Your BingX API secret
+- `BINGX_SUB_ACCOUNT` (optional): Sub-account identifier for BingX API headers
+- `BINGX_DEFAULT_TYPE` (optional): Default market type for ccxt (e.g., `swap`)
+
 #### Extended Configuration
 
 - `EXTENDED_API_KEY`: Your Extended API key
@@ -379,7 +389,7 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 
 ### Command Line Arguments
 
-- `--exchange`: Exchange to use: 'edgex', 'backpack', 'paradex', 'aster', 'lighter', 'grvt', or 'extended' (default: edgex)
+- `--exchange`: Exchange to use: 'edgex', 'backpack', 'paradex', 'aster', 'lighter', 'grvt', 'bingx', or 'extended' (default: edgex)
 - `--ticker`: Base asset symbol (e.g., ETH, BTC, SOL). Contract ID is auto-resolved.
 - `--quantity`: Order quantity (default: 0.1)
 - `--take-profit`: Take profit percent (e.g., 0.02 means 0.02%)

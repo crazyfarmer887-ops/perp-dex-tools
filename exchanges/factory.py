@@ -16,6 +16,7 @@ class ExchangeFactory:
         'aster': 'exchanges.aster.AsterClient',
         'lighter': 'exchanges.lighter.LighterClient',
         'grvt': 'exchanges.grvt.GrvtClient',
+        'bingx': 'exchanges.bingx.BingxClient',
         'extended': 'exchanges.extended.ExtendedClient',
         'apex': 'exchanges.apex.ApexClient',
     }

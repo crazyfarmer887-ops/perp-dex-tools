@@ -8,5 +8,5 @@ from .factory import ExchangeFactory
 
 __all__ = [
     'BaseExchangeClient', 'EdgeXClient', 'BackpackClient', 'ParadexClient',
-    'GrvtClient', 'ExchangeFactory', 'query_retry'
+    'GrvtClient', 'BingxClient', 'ExchangeFactory', 'query_retry'
 ]

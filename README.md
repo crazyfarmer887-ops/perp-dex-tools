@@ -12,7 +12,7 @@
 
 ## 自动交易机器人
 
-一个支持多个交易所（目前包括 EdgeX, Backpack, Paradex, Aster, Lighter, grvt, Extended）的模块化交易机器人。该机器人实现了自动下单并在盈利时自动平仓的策略，主要目的是取得高交易量。
+一个支持多个交易所（目前包括 EdgeX, Backpack, Paradex, Aster, Lighter, grvt, BingX, Extended）的模块化交易机器人。该机器人实现了自动下单并在盈利时自动平仓的策略，主要目的是取得高交易量。
 
 ## 邀请链接 (获得返佣以及福利)
 
@@ -317,13 +317,16 @@ python hedge_mode.py --exchange apex --ticker BTC --size 0.05 --iter 20
 # 运行 BTC 对冲模式（GRVT）
 python hedge_mode.py --exchange grvt --ticker BTC --size 0.05 --iter 20
 
+# 运行 BTC 对冲模式（GRVT + BingX）
+python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 20
+
 # 运行 BTC 对冲模式（edgeX）
 python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 ```
 
 ### 对冲模式参数
 
-- `--exchange`: 主要交易所（支持 'backpack', 'extended', 'apex', 'grvt', 'edgex'）
+- `--exchange`: 主要交易所（支持 'backpack', 'extended', 'apex', 'grvt', 'grvt_bingx', 'edgex'）
 - `--ticker`: 交易对符号（如 BTC, ETH）
 - `--size`: 每笔订单数量
 - `--iter`: 交易循环次数
@@ -377,6 +380,13 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 - `GRVT_PRIVATE_KEY`: 您的 GRVT 私钥
 - `GRVT_API_KEY`: 您的 GRVT API 密钥
 
+#### BingX 配置
+
+- `BINGX_API_KEY`: 您的 BingX API 密钥
+- `BINGX_SECRET_KEY`: 您的 BingX API Secret
+- `BINGX_SUB_ACCOUNT`（可选）: BingX 子账户标识
+- `BINGX_DEFAULT_TYPE`（可选）: 默认市场类型（例如 `swap`）
+
 #### Extended 配置
 
 - `EXTENDED_API_KEY`: Extended API Key
@@ -405,7 +415,7 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 
 ### 命令行参数
 
-- `--exchange`: 使用的交易所：'edgex'、'backpack'、'paradex'、'aster'、'lighter'、'grvt' 或 'extended'（默认：edgex）
+- `--exchange`: 使用的交易所：'edgex'、'backpack'、'paradex'、'aster'、'lighter'、'grvt'、'bingx' 或 'extended'（默认：edgex）
 - `--ticker`: 标的资产符号（例如：ETH、BTC、SOL）。合约 ID 自动解析。
 - `--quantity`: 订单数量（默认：0.1）
 - `--take-profit`: 止盈百分比（例如 0.02 表示 0.02%）
