@@ -24,7 +24,7 @@ Cross-platform compatibility:
 import asyncio
 import sys
 import argparse
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import dotenv
 
@@ -58,6 +58,10 @@ Examples:
                         help='Sleep time in seconds after each step (default: 0)')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
+    parser.add_argument('--take-profit-roi', type=str, default=None,
+                        help='Take profit threshold as ROI percentage (e.g., 0.5 for 0.5%%)')
+    parser.add_argument('--stop-loss-roi', type=str, default=None,
+                        help='Stop loss threshold as ROI percentage (e.g., 0.5 for 0.5%%)')
     
     return parser.parse_args()
 
@@ -118,6 +122,18 @@ async def main():
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)
+
+    try:
+        take_profit_roi = Decimal(args.take_profit_roi) if args.take_profit_roi is not None else None
+    except (InvalidOperation, TypeError):
+        print(f"Error: Invalid --take-profit-roi value '{args.take_profit_roi}'. Expected decimal number.")
+        sys.exit(1)
+
+    try:
+        stop_loss_roi = Decimal(args.stop_loss_roi) if args.stop_loss_roi is not None else None
+    except (InvalidOperation, TypeError):
+        print(f"Error: Invalid --stop-loss-roi value '{args.stop_loss_roi}'. Expected decimal number.")
+        sys.exit(1)
     
     print(f"Starting hedge mode for {args.exchange} exchange...")
     print(f"Ticker: {args.ticker}, Size: {args.size}, Iterations: {args.iter}")
@@ -130,7 +146,9 @@ async def main():
             order_quantity=Decimal(args.size),
             fill_timeout=args.fill_timeout,
             iterations=args.iter,
-            sleep_time=args.sleep
+            sleep_time=args.sleep,
+            take_profit_roi=take_profit_roi,
+            stop_loss_roi=stop_loss_roi
         )
         
         # Run the bot

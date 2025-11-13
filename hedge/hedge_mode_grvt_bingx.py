@@ -33,12 +33,22 @@ class HedgeBot:
         fill_timeout: int = 10,
         iterations: int = 10,
         sleep_time: int = 0,
+        take_profit_roi: Optional[Decimal] = None,
+        stop_loss_roi: Optional[Decimal] = None,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.take_profit_roi = take_profit_roi
+        self.stop_loss_roi = stop_loss_roi
+        self.position_tracker = {
+            "long": {"size": Decimal("0"), "value": Decimal("0"), "average": None},
+            "short": {"size": Decimal("0"), "value": Decimal("0"), "average": None},
+        }
+        self.last_roi_reason: Optional[str] = None
+        self.roi_poll_interval = 1.0
 
         self.stop_flag = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -78,6 +88,8 @@ class HedgeBot:
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
 
+        self._log_roi_configuration()
+
     # ------------------------------------------------------------------ #
     # Initialization helpers
     # ------------------------------------------------------------------ #
@@ -89,6 +101,152 @@ class HedgeBot:
 
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
+
+    def _log_roi_configuration(self) -> None:
+        if self.take_profit_roi is None and self.stop_loss_roi is None:
+            return
+        tp_text = f"{self.take_profit_roi}%" if self.take_profit_roi is not None else "N/A"
+        sl_text = f"{self.stop_loss_roi}%" if self.stop_loss_roi is not None else "N/A"
+        self.logger.info(f"🎯 ROI configuration -> Take Profit: {tp_text}, Stop Loss: {sl_text}")
+
+    def _recompute_tracker_average(self, tracker_key: str) -> None:
+        tracker = self.position_tracker[tracker_key]
+        if tracker["size"] > 0:
+            tracker["average"] = tracker["value"] / tracker["size"]
+        else:
+            tracker["size"] = Decimal("0")
+            tracker["value"] = Decimal("0")
+            tracker["average"] = None
+
+    def _update_position_tracker(self, side: str, filled_size: Decimal, price: Decimal, prev_position: Decimal) -> None:
+        if filled_size <= 0:
+            return
+
+        if side == "buy":
+            if prev_position < 0:
+                tracker = self.position_tracker["short"]
+                tracker["size"] -= filled_size
+                if tracker["size"] <= 0:
+                    tracker["size"] = Decimal("0")
+                    tracker["value"] = Decimal("0")
+                    tracker["average"] = None
+                else:
+                    reference_avg = tracker["average"] if tracker["average"] is not None else price
+                    tracker["value"] = reference_avg * tracker["size"]
+                    self._recompute_tracker_average("short")
+            else:
+                tracker = self.position_tracker["long"]
+                tracker["value"] += price * filled_size
+                tracker["size"] += filled_size
+                self._recompute_tracker_average("long")
+        elif side == "sell":
+            if prev_position > 0:
+                tracker = self.position_tracker["long"]
+                tracker["size"] -= filled_size
+                if tracker["size"] <= 0:
+                    tracker["size"] = Decimal("0")
+                    tracker["value"] = Decimal("0")
+                    tracker["average"] = None
+                else:
+                    reference_avg = tracker["average"] if tracker["average"] is not None else price
+                    tracker["value"] = reference_avg * tracker["size"]
+                    self._recompute_tracker_average("long")
+            else:
+                tracker = self.position_tracker["short"]
+                tracker["value"] += price * filled_size
+                tracker["size"] += filled_size
+                self._recompute_tracker_average("short")
+
+    def _compute_roi_targets(self, position_type: str):
+        tracker = self.position_tracker[position_type]
+        if tracker["average"] is None or tracker["size"] <= 0:
+            return None, None, None
+
+        avg_price = tracker["average"]
+        tp_price = None
+        sl_price = None
+
+        if self.take_profit_roi is not None:
+            if position_type == "long":
+                tp_price = avg_price * (Decimal("1") + self.take_profit_roi / Decimal("100"))
+            else:
+                tp_price = avg_price * (Decimal("1") - self.take_profit_roi / Decimal("100"))
+        if self.stop_loss_roi is not None:
+            if position_type == "long":
+                sl_price = avg_price * (Decimal("1") - self.stop_loss_roi / Decimal("100"))
+            else:
+                sl_price = avg_price * (Decimal("1") + self.stop_loss_roi / Decimal("100"))
+
+        return avg_price, tp_price, sl_price
+
+    async def _get_best_prices(self) -> Tuple[Decimal, Decimal]:
+        if self.grvt_client is None or self.grvt_contract_id is None:
+            raise RuntimeError("GRVT client not initialized")
+        return await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+
+    async def _wait_for_roi_target(self, position_type: str) -> str:
+        avg_price, tp_price, sl_price = self._compute_roi_targets(position_type)
+        if avg_price is None:
+            return "none"
+
+        self.logger.info(
+            f"⏳ Waiting for ROI target ({position_type}) | "
+            f"avg: {avg_price}, TP: {tp_price or 'N/A'}, SL: {sl_price or 'N/A'}"
+        )
+
+        trigger = "none"
+        current_price: Optional[Decimal] = None
+
+        while not self.stop_flag:
+            try:
+                best_bid, best_ask = await self._get_best_prices()
+            except Exception as exc:
+                self.logger.warning(f"⚠️ Failed to fetch prices for ROI monitoring: {exc}")
+                await asyncio.sleep(self.roi_poll_interval)
+                continue
+
+            if position_type == "long":
+                current_price = best_bid
+                if current_price is None or current_price <= 0:
+                    await asyncio.sleep(self.roi_poll_interval)
+                    continue
+                if tp_price is not None and current_price >= tp_price:
+                    trigger = "take_profit"
+                    break
+                if sl_price is not None and current_price <= sl_price:
+                    trigger = "stop_loss"
+                    break
+            else:
+                current_price = best_ask
+                if current_price is None or current_price <= 0:
+                    await asyncio.sleep(self.roi_poll_interval)
+                    continue
+                if tp_price is not None and current_price <= tp_price:
+                    trigger = "take_profit"
+                    break
+                if sl_price is not None and current_price >= sl_price:
+                    trigger = "stop_loss"
+                    break
+
+            await asyncio.sleep(self.roi_poll_interval)
+
+        if trigger != "none" and current_price is not None:
+            self.logger.info(
+                f"🎯 ROI trigger reached ({trigger}) for {position_type} position at price {current_price}"
+            )
+        return trigger
+
+    async def _wait_for_roi_if_configured(self) -> None:
+        if self.take_profit_roi is None and self.stop_loss_roi is None:
+            self.last_roi_reason = "none"
+            return
+
+        if self.grvt_position > 0:
+            self.last_roi_reason = await self._wait_for_roi_target("long")
+        elif self.grvt_position < 0:
+            self.last_roi_reason = await self._wait_for_roi_target("short")
+        else:
+            self.last_roi_reason = "none"
 
     def _build_grvt_config(self) -> Config:
         return Config({
@@ -145,10 +303,13 @@ class HedgeBot:
         order_id = message.get('order_id')
 
         if status == 'FILLED':
+            prev_position = self.grvt_position
             if side == 'buy':
                 self.grvt_position += filled_size
             else:
                 self.grvt_position -= filled_size
+
+            self._update_position_tracker(side, filled_size, price, prev_position)
 
             self.last_grvt_fill = {
                 'order_id': order_id,
@@ -280,6 +441,12 @@ class HedgeBot:
             self.logger.info(f"----- Iteration {iteration}/{self.iterations} -----")
 
             await self.execute_cycle('buy')
+            if self.stop_flag:
+                break
+
+            await self._wait_for_roi_if_configured()
+            if self.last_roi_reason and self.last_roi_reason != "none":
+                self.logger.info(f"🎯 ROI condition met: {self.last_roi_reason}. Proceeding to close position.")
             if self.stop_flag:
                 break
 

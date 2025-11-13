@@ -10,7 +10,7 @@ import argparse
 import traceback
 import csv
 from decimal import Decimal
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 
 from lighter.signer_client import SignerClient
 from edgex_sdk import Client, OrderSide, WebSocketManager, CancelOrderParams
@@ -25,7 +25,16 @@ dotenv.load_dotenv()
 class HedgeBot:
     """Trading bot that places post-only orders on edgeX and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0):
+    def __init__(
+        self,
+        ticker: str,
+        order_quantity: Decimal,
+        fill_timeout: int = 5,
+        iterations: int = 20,
+        sleep_time: int = 0,
+        take_profit_roi: Optional[Decimal] = None,
+        stop_loss_roi: Optional[Decimal] = None,
+    ):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
@@ -34,6 +43,14 @@ class HedgeBot:
         self.edgex_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.edgex_client_order_id = ''
+        self.take_profit_roi = take_profit_roi
+        self.stop_loss_roi = stop_loss_roi
+        self.position_tracker = {
+            'long': {'size': Decimal('0'), 'value': Decimal('0'), 'average': None},
+            'short': {'size': Decimal('0'), 'value': Decimal('0'), 'average': None},
+        }
+        self.last_roi_reason: Optional[str] = None
+        self.roi_poll_interval = 1.0
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -77,6 +94,9 @@ class HedgeBot:
         
         # Prevent propagation to root logger to avoid duplicate messages
         self.logger.propagate = False
+        
+        # Log ROI configuration if provided
+        self._log_roi_configuration()
         
         # State management
         self.stop_flag = False
@@ -184,6 +204,154 @@ class HedgeBot:
             ])
         
         self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
+
+    def _log_roi_configuration(self):
+        """Log ROI configuration if provided."""
+        if self.take_profit_roi is None and self.stop_loss_roi is None:
+            return
+        tp_text = f"{self.take_profit_roi}%" if self.take_profit_roi is not None else "N/A"
+        sl_text = f"{self.stop_loss_roi}%" if self.stop_loss_roi is not None else "N/A"
+        self.logger.info(f"🎯 ROI configuration -> Take Profit: {tp_text}, Stop Loss: {sl_text}")
+
+    def _recompute_tracker_average(self, tracker_key: str):
+        tracker = self.position_tracker[tracker_key]
+        if tracker['size'] > 0:
+            tracker['average'] = tracker['value'] / tracker['size']
+        else:
+            tracker['size'] = Decimal('0')
+            tracker['value'] = Decimal('0')
+            tracker['average'] = None
+
+    def _update_position_tracker(self, side: str, filled_size: Decimal, price: Decimal, prev_position: Decimal):
+        """Update average entry prices for long/short positions."""
+        if filled_size <= 0:
+            return
+
+        if side == 'buy':
+            if prev_position < 0:
+                tracker = self.position_tracker['short']
+                tracker['size'] -= filled_size
+                if tracker['size'] <= 0:
+                    tracker['size'] = Decimal('0')
+                    tracker['value'] = Decimal('0')
+                    tracker['average'] = None
+                else:
+                    reference_avg = tracker['average'] if tracker['average'] is not None else price
+                    tracker['value'] = reference_avg * tracker['size']
+                    self._recompute_tracker_average('short')
+            else:
+                tracker = self.position_tracker['long']
+                tracker['value'] += price * filled_size
+                tracker['size'] += filled_size
+                self._recompute_tracker_average('long')
+        elif side == 'sell':
+            if prev_position > 0:
+                tracker = self.position_tracker['long']
+                tracker['size'] -= filled_size
+                if tracker['size'] <= 0:
+                    tracker['size'] = Decimal('0')
+                    tracker['value'] = Decimal('0')
+                    tracker['average'] = None
+                else:
+                    reference_avg = tracker['average'] if tracker['average'] is not None else price
+                    tracker['value'] = reference_avg * tracker['size']
+                    self._recompute_tracker_average('long')
+            else:
+                tracker = self.position_tracker['short']
+                tracker['value'] += price * filled_size
+                tracker['size'] += filled_size
+                self._recompute_tracker_average('short')
+
+    def _compute_roi_targets(self, position_type: str):
+        """Compute TP/SL target prices for a given position type."""
+        tracker = self.position_tracker[position_type]
+        if tracker['average'] is None or tracker['size'] <= 0:
+            return None, None, None
+
+        avg_price = tracker['average']
+        tp_price = None
+        sl_price = None
+        if self.take_profit_roi is not None:
+            if position_type == 'long':
+                tp_price = avg_price * (Decimal('1') + self.take_profit_roi / Decimal('100'))
+            else:
+                tp_price = avg_price * (Decimal('1') - self.take_profit_roi / Decimal('100'))
+        if self.stop_loss_roi is not None:
+            if position_type == 'long':
+                sl_price = avg_price * (Decimal('1') - self.stop_loss_roi / Decimal('100'))
+            else:
+                sl_price = avg_price * (Decimal('1') + self.stop_loss_roi / Decimal('100'))
+        return avg_price, tp_price, sl_price
+
+    async def _get_best_prices(self) -> Tuple[Decimal, Decimal]:
+        """Fetch best bid/ask prices for ROI checks."""
+        return await self.fetch_edgex_bbo_prices()
+
+    async def _wait_for_roi_target(self, position_type: str) -> str:
+        """Wait until ROI TP/SL condition is met for the given position."""
+        avg_price, tp_price, sl_price = self._compute_roi_targets(position_type)
+        if avg_price is None:
+            return 'none'
+
+        self.logger.info(
+            f"⏳ Waiting for ROI target ({position_type}) | "
+            f"avg: {avg_price}, TP: {tp_price or 'N/A'}, SL: {sl_price or 'N/A'}"
+        )
+
+        trigger = 'none'
+        current_price: Optional[Decimal] = None
+
+        while not self.stop_flag:
+            try:
+                best_bid, best_ask = await self._get_best_prices()
+            except Exception as exc:
+                self.logger.warning(f"⚠️ Failed to fetch prices for ROI monitoring: {exc}")
+                await asyncio.sleep(self.roi_poll_interval)
+                continue
+
+            if position_type == 'long':
+                current_price = best_bid
+                if current_price is None or current_price <= 0:
+                    await asyncio.sleep(self.roi_poll_interval)
+                    continue
+                if tp_price is not None and current_price >= tp_price:
+                    trigger = 'take_profit'
+                    break
+                if sl_price is not None and current_price <= sl_price:
+                    trigger = 'stop_loss'
+                    break
+            else:
+                current_price = best_ask
+                if current_price is None or current_price <= 0:
+                    await asyncio.sleep(self.roi_poll_interval)
+                    continue
+                if tp_price is not None and current_price <= tp_price:
+                    trigger = 'take_profit'
+                    break
+                if sl_price is not None and current_price >= sl_price:
+                    trigger = 'stop_loss'
+                    break
+
+            await asyncio.sleep(self.roi_poll_interval)
+
+        if trigger != 'none' and current_price is not None:
+            self.logger.info(
+                f"🎯 ROI trigger reached ({trigger}) for {position_type} position at price {current_price}"
+            )
+        return trigger
+
+    async def _wait_for_roi_if_configured(self):
+        """Wait for ROI conditions if configuration is provided."""
+        if self.take_profit_roi is None and self.stop_loss_roi is None:
+            self.last_roi_reason = 'none'
+            return
+
+        if self.edgex_position > 0:
+            self.last_roi_reason = await self._wait_for_roi_target('long')
+        elif self.edgex_position < 0:
+            self.last_roi_reason = await self._wait_for_roi_target('short')
+        else:
+            self.last_roi_reason = 'none'
 
     def setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown."""
@@ -762,33 +930,34 @@ class HedgeBot:
 
     def handle_edgex_order_update(self, order_data):
         """Handle edgeX order updates from WebSocket."""
-        order_id = order_data.get('order_id')
-        status = order_data.get('status')
         side = order_data.get('side', '').lower()
         filled_size = Decimal(order_data.get('filled_size', '0'))
-        price = Decimal(order_data.get('price', '0'))
+        price_decimal = Decimal(order_data.get('price', '0'))
 
         if side == 'buy':
-            self.edgex_position += filled_size
             lighter_side = 'sell'
         else:
-            self.edgex_position -= filled_size
             lighter_side = 'buy'
+
+        prev_position = Decimal(order_data.get('prev_position', str(self.edgex_position)))
+
+        # Update position tracking for ROI calculations
+        self._update_position_tracker(side, filled_size, price_decimal, prev_position)
         
         # Store order details for immediate execution
         self.current_lighter_side = lighter_side
         self.current_lighter_quantity = filled_size
-        self.current_lighter_price = price
+        self.current_lighter_price = price_decimal
 
         self.lighter_order_info = {
             'lighter_side': lighter_side,
             'quantity': filled_size,
-            'price': price
+            'price': price_decimal
         }
 
         self.waiting_for_lighter_fill = True
         
-        self.logger.info(f"📋 Ready to place Lighter order: {lighter_side} {filled_size} @ {price}")
+        self.logger.info(f"📋 Ready to place Lighter order: {lighter_side} {filled_size} @ {price_decimal}")
 
     async def place_lighter_limit_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
         """Place a limit order on Lighter with mid price strategy."""
@@ -957,9 +1126,10 @@ class HedgeBot:
                         for order in orders:
                             if order.get('contractId') != self.edgex_contract_id:
                                 continue
-                            
+
                             if order.get('clientOrderId') != self.edgex_client_order_id:
                                 continue
+
                             order_id = order.get('id')
                             status = order.get('status')
                             side = order.get('side', '').lower()
@@ -972,25 +1142,24 @@ class HedgeBot:
                                 else:
                                     status = 'CANCELED'
 
-                            if side == 'buy':
-                                order_type = "OPEN"
-                            else:
-                                order_type = "CLOSE"
+                            order_type = "OPEN" if side == 'buy' else "CLOSE"
 
-                            # Handle the order update
                             if status == 'FILLED' and self.edgex_order_status != 'FILLED':
+                                prev_position_snapshot = self.edgex_position
+                                if side == 'buy':
+                                    self.edgex_position += filled_size
+                                else:
+                                    self.edgex_position -= filled_size
                                 self.logger.info(f"[{order_id}] [{order_type}] [edgeX] [{status}]: {filled_size} @ {order.get('price')}")
                                 self.edgex_order_status = status
-                                
-                                # Log edgeX trade to CSV
+
                                 self.log_trade_to_csv(
                                     exchange='edgeX',
                                     side=side,
                                     price=str(order.get('price', '0')),
                                     quantity=str(filled_size)
                                 )
-                                
-                                # Call handle_edgex_order_update directly to avoid delay
+
                                 order_data = {
                                     'order_id': order_id,
                                     'side': side,
@@ -998,13 +1167,12 @@ class HedgeBot:
                                     'size': order.get('size'),
                                     'price': order.get('price'),
                                     'contract_id': order.get('contractId'),
-                                    'filled_size': filled_size
+                                    'filled_size': filled_size,
+                                    'prev_position': str(prev_position_snapshot)
                                 }
-                                
-                                # Call handle_edgex_order_update directly (now sync!)
+
                                 self.handle_edgex_order_update(order_data)
                             elif status == 'FILLED' and self.edgex_order_status == 'FILLED':
-                                # Duplicate FILLED message - ignore to prevent double processing
                                 self.logger.debug(f"[{order_id}] [{order_type}] [edgeX] Duplicate FILLED message ignored")
                             else:
                                 self.logger.info(f"[{order_id}] [{order_type}] [edgeX] [{status}]: {size} @ {order.get('price')}.")
@@ -1158,6 +1326,10 @@ class HedgeBot:
 
             if self.stop_flag:
                 break
+
+            await self._wait_for_roi_if_configured()
+            if self.last_roi_reason and self.last_roi_reason != 'none':
+                self.logger.info(f"🎯 ROI condition met: {self.last_roi_reason}. Proceeding to close position.")
 
             # Sleep after step 1
             if self.sleep_time > 0:
