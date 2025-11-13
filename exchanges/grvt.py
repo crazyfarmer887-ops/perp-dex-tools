@@ -248,9 +248,16 @@ class GrvtClient(BaseExchangeClient):
 
         return best_bid, best_ask
 
-    async def place_post_only_order(self, contract_id: str, quantity: Decimal, price: Decimal,
-                                    side: str) -> OrderResult:
-        """Place a post only order with GRVT using official SDK."""
+    async def place_post_only_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        *,
+        post_only: bool = True
+    ) -> OrderResult:
+        """Place a limit order with GRVT using official SDK."""
 
         # Place the order using GRVT SDK
         order_result = self.rest_client.create_limit_order(
@@ -259,7 +266,7 @@ class GrvtClient(BaseExchangeClient):
             amount=quantity,
             price=price,
             params={
-                'post_only': True,
+                'post_only': post_only,
                 'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
             }
         )
@@ -298,7 +305,15 @@ class GrvtClient(BaseExchangeClient):
         else:
             raise ValueError("Invalid direction")
 
-    async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
+    async def place_open_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        direction: str,
+        price: Optional[Decimal] = None,
+        *,
+        post_only: bool = True
+    ) -> OrderResult:
         """Place an open order with GRVT."""
         attempt = 0
         while True:
@@ -314,23 +329,34 @@ class GrvtClient(BaseExchangeClient):
                     self.logger.log(f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}", "ERROR")
                     raise Exception(f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}")
 
-            # Get current market prices
-            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+            if price is None:
+                # Get current market prices
+                best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
 
-            if best_bid <= 0 or best_ask <= 0:
-                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+                if best_bid <= 0 or best_ask <= 0:
+                    return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
-            # Determine order side and price
-            if direction == 'buy':
-                order_price = best_ask - self.config.tick_size
-            elif direction == 'sell':
-                order_price = best_bid + self.config.tick_size
+                # Determine order side and price
+                if direction == 'buy':
+                    order_price = best_ask - self.config.tick_size
+                elif direction == 'sell':
+                    order_price = best_bid + self.config.tick_size
+                else:
+                    raise Exception(f"[OPEN] Invalid direction: {direction}")
             else:
-                raise Exception(f"[OPEN] Invalid direction: {direction}")
+                order_price = price
+
+            order_price = self.round_to_tick(order_price)
 
             # Place the order using GRVT SDK
             try:
-                order_info = await self.place_post_only_order(contract_id, quantity, order_price, direction)
+                order_info = await self.place_post_only_order(
+                    contract_id,
+                    quantity,
+                    order_price,
+                    direction,
+                    post_only=post_only
+                )
             except Exception as e:
                 self.logger.log(f"[OPEN] Error placing order: {e}", "ERROR")
                 continue
@@ -354,7 +380,15 @@ class GrvtClient(BaseExchangeClient):
             else:
                 raise Exception(f"[OPEN] Unexpected order status: {order_status}")
 
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
+    async def place_close_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        *,
+        post_only: bool = True
+    ) -> OrderResult:
         """Place a close order with GRVT."""
         # Get current market prices
         attempt = 0
@@ -385,7 +419,13 @@ class GrvtClient(BaseExchangeClient):
 
             adjusted_price = self.round_to_tick(adjusted_price)
             try:
-                order_info = await self.place_post_only_order(contract_id, quantity, adjusted_price, side)
+                order_info = await self.place_post_only_order(
+                    contract_id,
+                    quantity,
+                    adjusted_price,
+                    side,
+                    post_only=post_only
+                )
             except Exception as e:
                 self.logger.log(f"[CLOSE] Error placing order: {e}", "ERROR")
                 continue
