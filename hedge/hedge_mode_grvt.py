@@ -33,13 +33,22 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on GRVT and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0):
+    def __init__(
+        self,
+        ticker: str,
+        order_quantity: Decimal,
+        fill_timeout: int = 5,
+        iterations: int = 20,
+        sleep_time: int = 0,
+        position_hold_time: int = 0,
+    ):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.lighter_order_filled = False
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.position_hold_time = position_hold_time
         self.grvt_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.current_order = {}
@@ -188,6 +197,17 @@ class HedgeBot:
                 self.logger.removeHandler(handler)
             except Exception:
                 pass
+
+    async def _sleep_with_stop(self, duration: int):
+        """Sleep for specified duration while respecting stop flag."""
+        if duration <= 0:
+            return
+        end_time = time.time() + duration
+        while not self.stop_flag:
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(1, remaining))
 
     def _initialize_csv_file(self):
         """Initialize CSV file with headers if it doesn't exist."""
@@ -989,9 +1009,13 @@ class HedgeBot:
                 break
 
             # Sleep after step 1
-            if self.sleep_time > 0:
+            if self.position_hold_time > 0 and not self.stop_flag:
+                self.logger.info(f"⏳ Holding position for {self.position_hold_time} seconds before STEP 2...")
+                await self._sleep_with_stop(self.position_hold_time)
+
+            if self.sleep_time > 0 and not self.stop_flag:
                 self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 1...")
-                await asyncio.sleep(self.sleep_time)
+                await self._sleep_with_stop(self.sleep_time)
 
             # Close position
             self.logger.info(f"[STEP 2] GRVT position: {self.grvt_position} | Lighter position: {self.lighter_position}")
