@@ -35,7 +35,7 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python hedge_mode.py --exchange backpack --ticker BTC --size 0.002 --iter 10
+    python hedge_mode.py --exchange backpack --ticker BTC --size 0.002 --iter 10 --hold-time 60
     python hedge_mode.py --exchange extended --ticker ETH --size 0.1 --iter 5
     python hedge_mode.py --exchange apex --ticker BTC --size 0.002 --iter 10
     python hedge_mode.py --exchange grvt --ticker BTC --size 0.05 --iter 10
@@ -56,6 +56,8 @@ Examples:
                         help='Timeout in seconds for maker order fills (default: 5)')
     parser.add_argument('--sleep', type=int, default=0,
                         help='Sleep time in seconds after each step (default: 0)')
+    parser.add_argument('--hold-time', type=int, default=0,
+                        help='Time in seconds to hold a position before closing (default: 0)')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
     
@@ -130,7 +132,8 @@ async def main():
             order_quantity=Decimal(args.size),
             fill_timeout=args.fill_timeout,
             iterations=args.iter,
-            sleep_time=args.sleep
+            sleep_time=args.sleep,
+            position_hold_time=args.hold_time
         )
         
         # Run the bot

@@ -33,12 +33,14 @@ class HedgeBot:
         fill_timeout: int = 10,
         iterations: int = 10,
         sleep_time: int = 0,
+        position_hold_time: int = 0,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.position_hold_time = position_hold_time
 
         self.stop_flag = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -89,6 +91,17 @@ class HedgeBot:
 
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
+
+    async def _sleep_with_stop(self, duration: int) -> None:
+        """Sleep for specified duration while respecting stop flag state."""
+        if duration <= 0:
+            return
+        end_time = time.time() + duration
+        while not self.stop_flag:
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(1, remaining))
 
     def _build_grvt_config(self) -> Config:
         return Config({
@@ -252,8 +265,12 @@ class HedgeBot:
 
         await self.place_bingx_hedge(fill)
 
+        if self.position_hold_time > 0 and not self.stop_flag:
+            self.logger.info(f"⏳ Holding position for {self.position_hold_time} seconds before next cycle...")
+            await self._sleep_with_stop(self.position_hold_time)
+
         if self.sleep_time > 0 and not self.stop_flag:
-            await asyncio.sleep(self.sleep_time)
+            await self._sleep_with_stop(self.sleep_time)
 
     # ------------------------------------------------------------------ #
     # Main run loop
