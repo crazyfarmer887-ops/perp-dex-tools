@@ -1,11 +1,11 @@
 import asyncio
-import logging
 import os
 import signal
 import sys
 import time
-from decimal import Decimal
-from typing import Any, Dict, Optional, Tuple
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Tuple
+import logging
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -35,6 +35,10 @@ class HedgeBot:
         sleep_time: int = 0,
         tp_roi: Optional[Decimal] = None,
         sl_roi: Optional[Decimal] = None,
+        bingx_order_type: Optional[str] = None,
+        bingx_limit_offset_ticks: Optional[Decimal] = None,
+        bingx_attach_tp_sl: Optional[bool] = None,
+        bingx_time_in_force: Optional[str] = None,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
@@ -68,6 +72,66 @@ class HedgeBot:
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
 
+        config_warnings: List[str] = []
+
+        def _coerce_decimal(value: Any, default: Decimal, label: str) -> Decimal:
+            if value is None:
+                return default
+            try:
+                return Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                config_warnings.append(f"{label}='{value}' is invalid; falling back to {default}.")
+                return default
+
+        def _parse_bool(value: Optional[str], label: str) -> Optional[bool]:
+            if value is None:
+                return None
+            normalized = value.strip().lower()
+            if normalized in {'1', 'true', 't', 'yes', 'y', 'on'}:
+                return True
+            if normalized in {'0', 'false', 'f', 'no', 'n', 'off'}:
+                return False
+            config_warnings.append(f"{label}='{value}' is invalid; ignoring.")
+            return None
+
+        order_type_source = bingx_order_type or os.getenv('BINGX_HEDGE_ORDER_TYPE') or 'market'
+        order_type_value = order_type_source.strip().lower()
+        if order_type_value not in {'market', 'limit'}:
+            config_warnings.append(
+                f"BINGX hedge order type '{order_type_source}' is not supported; using 'market'."
+            )
+            order_type_value = 'market'
+        self.bingx_hedge_order_type = order_type_value
+
+        if bingx_limit_offset_ticks is not None:
+            self.bingx_hedge_limit_offset_ticks = _coerce_decimal(
+                bingx_limit_offset_ticks, Decimal('0'), 'bingx_limit_offset_ticks'
+            )
+        else:
+            env_offset = os.getenv('BINGX_HEDGE_LIMIT_OFFSET_TICKS')
+            self.bingx_hedge_limit_offset_ticks = _coerce_decimal(
+                env_offset, Decimal('0'), 'BINGX_HEDGE_LIMIT_OFFSET_TICKS'
+            )
+
+        tif_source = bingx_time_in_force or os.getenv('BINGX_HEDGE_TIME_IN_FORCE')
+        if tif_source:
+            tif_value = tif_source.strip().upper()
+            if tif_value in {'', 'NONE'}:
+                tif_value = None
+        else:
+            tif_value = 'IOC' if self.bingx_hedge_order_type == 'limit' else None
+        self.bingx_hedge_time_in_force = tif_value
+
+        if bingx_attach_tp_sl is not None:
+            attach_value = bool(bingx_attach_tp_sl)
+        else:
+            env_attach = _parse_bool(os.getenv('BINGX_HEDGE_ATTACH_TPSL'), 'BINGX_HEDGE_ATTACH_TPSL')
+            if env_attach is None:
+                attach_value = False
+            else:
+                attach_value = env_attach
+        self.bingx_attach_tp_sl = attach_value
+
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
 
@@ -91,6 +155,17 @@ class HedgeBot:
 
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
+
+        for message in config_warnings:
+            self.logger.warning(message)
+
+        self.logger.info(
+            "BingX hedge config | type=%s | limit_offset_ticks=%s | time_in_force=%s | attach_tp_sl=%s",
+            self.bingx_hedge_order_type,
+            self.bingx_hedge_limit_offset_ticks,
+            self.bingx_hedge_time_in_force or 'DEFAULT',
+            self.bingx_attach_tp_sl,
+        )
 
     # ------------------------------------------------------------------ #
     # Initialization helpers
@@ -235,33 +310,239 @@ class HedgeBot:
         assert self.bingx_client is not None
         assert self.bingx_contract_id is not None
 
-        side = fill['side']
-        size = fill['size']
+        side = str(fill['side']).lower()
+        try:
+            size = Decimal(str(fill['size']))
+        except (InvalidOperation, ValueError, TypeError):
+            self.logger.error(f"[BINGX] Invalid hedge size from fill: {fill.get('size')}")
+            return
+        if size <= 0:
+            self.logger.warning("[BINGX] Hedge size is non-positive; skipping hedge.")
+            return
 
         hedge_side = 'sell' if side == 'buy' else 'buy'
         self.bingx_client.config.direction = hedge_side
         self.bingx_client.config.close_order_side = 'buy' if hedge_side == 'sell' else 'sell'
 
-        self.logger.info(f"[BINGX] Hedging {hedge_side} {size}")
+        entry_price: Optional[Decimal]
+        try:
+            entry_price = Decimal(str(fill.get('price')))
+        except (InvalidOperation, ValueError, TypeError):
+            entry_price = None
 
-        result = await self.bingx_client.place_market_order(
-            contract_id=self.bingx_contract_id,
-            quantity=size,
-            side=hedge_side
-        )
+        total_executed = Decimal('0')
+        executed_orders: List[Tuple[str, Any]] = []
 
-        if not result.success:
-            self.logger.error(f"[BINGX] Hedge order failed: {result.error_message}")
+        if self.bingx_hedge_order_type == 'limit':
+            limit_result = await self._place_bingx_limit_hedge(size, hedge_side, entry_price)
+            if limit_result is not None:
+                executed_orders.append(('limit', limit_result))
+                filled_limit = self._extract_filled_size(limit_result)
+                if filled_limit is None:
+                    filled_limit = Decimal('0')
+                if filled_limit > 0:
+                    total_executed += filled_limit
+                if filled_limit < size:
+                    remaining = size - filled_limit
+                    if remaining > 0:
+                        self.logger.warning(
+                            "[BINGX] Limit hedge filled %s of %s; executing market hedge for remaining %s.",
+                            filled_limit,
+                            size,
+                            remaining
+                        )
+                        market_remaining = await self._place_bingx_market_hedge(remaining, hedge_side)
+                        if market_remaining is not None:
+                            executed_orders.append(('market', market_remaining))
+                            filled_market_remaining = self._extract_filled_size(market_remaining)
+                            if filled_market_remaining is None or filled_market_remaining <= 0:
+                                filled_market_remaining = remaining
+                            total_executed += filled_market_remaining
+            else:
+                self.logger.info("[BINGX] Limit hedge unavailable; falling back to market order.")
+
+        if self.bingx_hedge_order_type != 'limit' and total_executed == 0:
+            market_result = await self._place_bingx_market_hedge(size, hedge_side)
+            if market_result is not None:
+                executed_orders.append(('market', market_result))
+                filled_market = self._extract_filled_size(market_result)
+                if filled_market is None or filled_market <= 0:
+                    filled_market = size
+                total_executed += filled_market
+        elif total_executed == 0:
+            # Limit mode but nothing executed yet (e.g., limit failed completely)
+            market_result = await self._place_bingx_market_hedge(size, hedge_side)
+            if market_result is not None:
+                executed_orders.append(('market', market_result))
+                filled_market = self._extract_filled_size(market_result)
+                if filled_market is None or filled_market <= 0:
+                    filled_market = size
+                total_executed += filled_market
+
+        if total_executed <= 0:
+            self.logger.error("[BINGX] Failed to execute hedge order for %s %s.", hedge_side, size)
             return
 
+        for order_type, order_result in executed_orders:
+            filled_size = self._extract_filled_size(order_result)
+            if filled_size is None or filled_size <= 0:
+                filled_size = order_result.size or Decimal('0')
+            self.logger.info(
+                "[BINGX] %s %s %s @ %s | status=%s",
+                order_type.upper(),
+                hedge_side.upper(),
+                filled_size,
+                order_result.price,
+                order_result.status,
+            )
+
         if hedge_side == 'buy':
-            self.bingx_position += size
+            self.bingx_position += total_executed
         else:
-            self.bingx_position -= size
+            self.bingx_position -= total_executed
 
         self.logger.info(
-            f"[BINGX] {hedge_side.upper()} {size} @ {result.price} | Position={self.bingx_position}"
+            "[BINGX] Hedge complete | side=%s | executed=%s | position=%s",
+            hedge_side.upper(),
+            total_executed,
+            self.bingx_position
         )
+
+    async def _place_bingx_market_hedge(self, quantity: Decimal, hedge_side: str):
+        assert self.bingx_client is not None
+        assert self.bingx_contract_id is not None
+
+        if quantity <= 0:
+            return None
+
+        self.logger.info("[BINGX] Hedging %s %s via market order", hedge_side, quantity)
+
+        try:
+            result = await self.bingx_client.place_market_order(
+                contract_id=self.bingx_contract_id,
+                quantity=quantity,
+                side=hedge_side
+            )
+        except Exception as exc:
+            self.logger.error(f"[BINGX] Market hedge exception: {exc}")
+            return None
+
+        if not result.success:
+            self.logger.error(f"[BINGX] Market hedge failed: {result.error_message}")
+            return None
+
+        return result
+
+    async def _place_bingx_limit_hedge(
+        self,
+        quantity: Decimal,
+        hedge_side: str,
+        entry_price: Optional[Decimal]
+    ):
+        assert self.bingx_client is not None
+        assert self.bingx_contract_id is not None
+
+        try:
+            best_bid, best_ask = await self.bingx_client.fetch_bbo_prices(self.bingx_contract_id)
+        except Exception as exc:
+            self.logger.warning(f"[BINGX] Failed to fetch BingX BBO for limit hedge: {exc}")
+            return None
+
+        tick_size = self.bingx_tick_size or getattr(self.bingx_client.config, 'tick_size', None) or Decimal('0.01')
+        offset_ticks = self.bingx_hedge_limit_offset_ticks
+        if offset_ticks < 0:
+            offset_ticks = Decimal('0')
+        price_offset = tick_size * offset_ticks
+
+        if hedge_side == 'sell':
+            if best_bid <= 0:
+                self.logger.warning("[BINGX] Best bid is unavailable; cannot place limit hedge sell.")
+                return None
+            limit_price = best_bid - price_offset
+        else:
+            if best_ask <= 0:
+                self.logger.warning("[BINGX] Best ask is unavailable; cannot place limit hedge buy.")
+                return None
+            limit_price = best_ask + price_offset
+
+        if limit_price <= 0:
+            self.logger.warning("[BINGX] Computed limit hedge price is non-positive; skipping limit hedge.")
+            return None
+
+        take_profit_price: Optional[Decimal] = None
+        stop_loss_price: Optional[Decimal] = None
+        if self.bingx_attach_tp_sl and entry_price and entry_price > 0:
+            hundred = Decimal('100')
+            if self.tp_roi is not None:
+                tp_factor = self.tp_roi / hundred
+                if hedge_side == 'sell':
+                    take_profit_price = entry_price * (Decimal('1') - tp_factor)
+                else:
+                    take_profit_price = entry_price * (Decimal('1') + tp_factor)
+            if self.sl_roi is not None:
+                sl_factor = self.sl_roi / hundred
+                if hedge_side == 'sell':
+                    stop_loss_price = entry_price * (Decimal('1') + sl_factor)
+                else:
+                    stop_loss_price = entry_price * (Decimal('1') - sl_factor)
+
+            if take_profit_price is not None and take_profit_price <= 0:
+                self.logger.warning("⚠️ Computed BingX take-profit price is non-positive; ignoring TP.")
+                take_profit_price = None
+            if stop_loss_price is not None and stop_loss_price <= 0:
+                self.logger.warning("⚠️ Computed BingX stop-loss price is non-positive; ignoring SL.")
+                stop_loss_price = None
+
+        time_in_force = self.bingx_hedge_time_in_force
+        if time_in_force and time_in_force.upper() == 'PO':
+            self.logger.warning("BingX hedge time_in_force 'PO' conflicts with non-post-only limit; forcing 'IOC'.")
+            time_in_force = 'IOC'
+
+        self.logger.info(
+            "[BINGX] Hedging %s %s via limit order @ %s (offset_ticks=%s, tif=%s, tp=%s, sl=%s)",
+            hedge_side,
+            quantity,
+            limit_price,
+            self.bingx_hedge_limit_offset_ticks,
+            time_in_force or 'DEFAULT',
+            take_profit_price,
+            stop_loss_price,
+        )
+
+        try:
+            return await self.bingx_client.place_limit_order(
+                contract_id=self.bingx_contract_id,
+                quantity=quantity,
+                side=hedge_side,
+                price=limit_price,
+                reduce_only=False,
+                post_only=False,
+                time_in_force=time_in_force,
+                take_profit_price=take_profit_price,
+                stop_loss_price=stop_loss_price
+            )
+        except Exception as exc:
+            self.logger.error(f"[BINGX] Limit hedge exception: {exc}")
+            return None
+
+    @staticmethod
+    def _extract_filled_size(result) -> Optional[Decimal]:
+        if result is None:
+            return None
+        filled = result.filled_size
+        if filled is not None and isinstance(filled, Decimal):
+            return filled
+        if filled is not None:
+            try:
+                return Decimal(str(filled))
+            except (InvalidOperation, ValueError, TypeError):
+                return None
+        if getattr(result, 'status', None) == 'FILLED' and getattr(result, 'size', None) is not None:
+            try:
+                return Decimal(str(result.size))
+            except (InvalidOperation, ValueError, TypeError):
+                return None
+        return None
 
     def _reset_entry_state(self) -> None:
         self.current_entry_price = None
