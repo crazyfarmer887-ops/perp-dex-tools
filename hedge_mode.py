@@ -56,6 +56,8 @@ Examples:
                         help='Timeout in seconds for maker order fills (default: 5)')
     parser.add_argument('--sleep', type=int, default=0,
                         help='Sleep time in seconds after each step (default: 0)')
+    parser.add_argument('--position-hold-time', type=int, default=0,
+                        help='Time in seconds to hold hedged positions before closing (default: 0)')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
     
@@ -121,6 +123,8 @@ async def main():
     
     print(f"Starting hedge mode for {args.exchange} exchange...")
     print(f"Ticker: {args.ticker}, Size: {args.size}, Iterations: {args.iter}")
+    if args.position_hold_time > 0:
+        print(f"Position hold time: {args.position_hold_time}s")
     print("-" * 50)
     
     try:
@@ -130,7 +134,8 @@ async def main():
             order_quantity=Decimal(args.size),
             fill_timeout=args.fill_timeout,
             iterations=args.iter,
-            sleep_time=args.sleep
+            sleep_time=args.sleep,
+            position_hold_time=max(0, args.position_hold_time)
         )
         
         # Run the bot

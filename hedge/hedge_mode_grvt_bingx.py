@@ -33,12 +33,14 @@ class HedgeBot:
         fill_timeout: int = 10,
         iterations: int = 10,
         sleep_time: int = 0,
+        position_hold_time: int = 0,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.position_hold_time = max(0, int(position_hold_time))
 
         self.stop_flag = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -251,6 +253,16 @@ class HedgeBot:
             return
 
         await self.place_bingx_hedge(fill)
+
+        if self.position_hold_time > 0 and not self.stop_flag:
+            self.logger.info(f"⏳ Holding position for {self.position_hold_time} seconds before next cycle...")
+            hold_start = time.time()
+            while not self.stop_flag:
+                elapsed = time.time() - hold_start
+                if elapsed >= self.position_hold_time:
+                    break
+                remaining = self.position_hold_time - elapsed
+                await asyncio.sleep(min(1, remaining))
 
         if self.sleep_time > 0 and not self.stop_flag:
             await asyncio.sleep(self.sleep_time)

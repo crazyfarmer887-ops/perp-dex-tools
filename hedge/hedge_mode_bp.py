@@ -32,13 +32,14 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on Backpack and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0):
+    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0, position_hold_time: int = 0):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.lighter_order_filled = False
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.position_hold_time = max(0, int(position_hold_time))
         self.backpack_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.current_order = {}
@@ -1098,6 +1099,15 @@ class HedgeBot:
 
             if self.stop_flag:
                 break
+
+            if self.position_hold_time > 0:
+                self.logger.info(f"⏳ Holding position for {self.position_hold_time} seconds before closing...")
+                hold_start = time.time()
+                while not self.stop_flag:
+                    elapsed = time.time() - hold_start
+                    if elapsed >= self.position_hold_time:
+                        break
+                    await asyncio.sleep(min(1, self.position_hold_time - elapsed))
 
             # Sleep after step 1
             if self.sleep_time > 0:
