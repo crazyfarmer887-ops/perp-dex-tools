@@ -10,7 +10,7 @@ import argparse
 import traceback
 import csv
 from decimal import Decimal
-from typing import Tuple
+from typing import Optional, Tuple
 
 from lighter.signer_client import SignerClient
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,7 +31,16 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on Apex and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0):
+    def __init__(
+        self,
+        ticker: str,
+        order_quantity: Decimal,
+        fill_timeout: int = 5,
+        iterations: int = 20,
+        sleep_time: int = 0,
+        tp_roi: Optional[Decimal] = None,
+        sl_roi: Optional[Decimal] = None,
+    ):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
@@ -41,6 +50,18 @@ class HedgeBot:
         self.apex_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.current_order = {}
+
+        self.tp_roi = Decimal(tp_roi) if tp_roi is not None else None
+        self.sl_roi = Decimal(sl_roi) if sl_roi is not None else None
+        self.current_entry_price: Optional[Decimal] = None
+        self.current_entry_side: Optional[str] = None
+        self.current_entry_size: Optional[Decimal] = None
+        self.current_entry_timestamp: Optional[float] = None
+        self.current_take_profit_price: Optional[Decimal] = None
+        self.current_stop_loss_price: Optional[Decimal] = None
+        self.roi_poll_interval: float = 1.0
+        self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
+        self.last_roi_reason: Optional[str] = None
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -713,8 +734,16 @@ class HedgeBot:
     def handle_apex_order_update(self, order_data):
         """Handle Apex order updates from WebSocket."""
         side = order_data.get('side', '').lower()
-        filled_size = Decimal(order_data.get('filled_size', '0'))
-        price = Decimal(order_data.get('price', '0'))
+        try:
+            filled_size = Decimal(str(order_data.get('filled_size', '0')))
+        except Exception:
+            filled_size = Decimal('0')
+        try:
+            price = Decimal(str(order_data.get('price', '0')))
+        except Exception:
+            price = Decimal('0')
+        status = str(order_data.get('status', '')).upper()
+        order_type = order_data.get('order_type')
 
         if side == 'buy':
             lighter_side = 'sell'
@@ -733,6 +762,119 @@ class HedgeBot:
         }
 
         self.waiting_for_lighter_fill = True
+
+        if status == 'FILLED':
+            if order_type == 'OPEN':
+                if price > 0:
+                    self.current_entry_price = price
+                    self.current_entry_side = side
+                    self.current_entry_size = filled_size
+                    self.current_entry_timestamp = time.time()
+                    self.last_roi_reason = None
+                    self._update_roi_targets(side, price)
+            elif order_type == 'CLOSE':
+                self.current_entry_price = None
+                self.current_entry_side = None
+                self.current_entry_size = None
+                self.current_entry_timestamp = None
+                self.current_take_profit_price = None
+                self.current_stop_loss_price = None
+                self.last_roi_reason = None
+
+    def _update_roi_targets(self, side: str, entry_price: Decimal) -> None:
+        """Calculate ROI-based take profit and stop loss target prices."""
+        self.current_take_profit_price = None
+        self.current_stop_loss_price = None
+
+        if entry_price <= 0:
+            return
+
+        hundred = Decimal('100')
+        one = Decimal('1')
+        messages = []
+
+        if self.tp_roi is not None:
+            tp_factor = self.tp_roi / hundred
+            if side == 'buy':
+                self.current_take_profit_price = entry_price * (one + tp_factor)
+            else:
+                self.current_take_profit_price = entry_price * (one - tp_factor)
+            messages.append(f"TP @ {self.current_take_profit_price} ({self.tp_roi}% ROI)")
+
+        if self.sl_roi is not None:
+            sl_factor = self.sl_roi / hundred
+            if side == 'buy':
+                self.current_stop_loss_price = entry_price * (one - sl_factor)
+            else:
+                self.current_stop_loss_price = entry_price * (one + sl_factor)
+            messages.append(f"SL @ {self.current_stop_loss_price} (-{self.sl_roi}% ROI)")
+
+        if messages:
+            self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
+
+    async def wait_for_roi(self) -> None:
+        """Wait until ROI-based take profit or stop loss is reached before proceeding."""
+        if self.stop_flag:
+            return
+
+        if self.tp_roi is None and self.sl_roi is None:
+            return
+
+        if self.current_entry_price is None or self.current_entry_side is None:
+            return
+
+        entry_price = self.current_entry_price
+        if entry_price <= 0:
+            self.logger.warning("⚠️ Cannot evaluate ROI targets because entry price is non-positive.")
+            return
+
+        start_time = time.time()
+        hundred = Decimal('100')
+        self.logger.info("⏳ Waiting for ROI targets before placing closing order...")
+
+        while not self.stop_flag:
+            try:
+                best_bid, best_ask = await self.fetch_apex_bbo_prices()
+            except Exception as exc:
+                self.logger.warning(f"⚠️ Failed to fetch Apex prices while waiting for ROI: {exc}")
+                await asyncio.sleep(self.roi_poll_interval)
+                continue
+
+            reference_price = None
+            roi = None
+
+            if self.current_entry_side == 'buy':
+                reference_price = best_bid
+                if reference_price and reference_price > 0:
+                    roi = (reference_price - entry_price) / entry_price * hundred
+            elif self.current_entry_side == 'sell':
+                reference_price = best_ask
+                if reference_price and reference_price > 0:
+                    roi = (entry_price - reference_price) / entry_price * hundred
+
+            if roi is not None:
+                roi_float = float(roi)
+
+                take_profit_hit = self.tp_roi is not None and roi >= self.tp_roi
+                stop_loss_hit = self.sl_roi is not None and roi <= -self.sl_roi
+
+                if take_profit_hit:
+                    self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
+                    self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%)")
+                    return
+
+                if stop_loss_hit:
+                    self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
+                    self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%)")
+                    return
+
+            elapsed = time.time() - start_time
+            if elapsed >= self.max_roi_wait:
+                self.last_roi_reason = f"timeout ({elapsed:.1f}s)"
+                self.logger.info(f"⏱️ ROI wait timed out after {elapsed:.1f}s; proceeding to close position.")
+                return
+
+            await asyncio.sleep(self.roi_poll_interval)
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
         if not self.lighter_client:
@@ -888,6 +1030,7 @@ class HedgeBot:
                         'order_id': order_id,
                         'side': side,
                         'status': status,
+                        'order_type': order_type,
                         'size': size,
                         'price': price,
                         'contract_id': self.apex_contract_id,
@@ -1019,6 +1162,9 @@ class HedgeBot:
             if self.sleep_time > 0:
                 self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 1...")
                 await asyncio.sleep(self.sleep_time)
+
+            if not self.stop_flag:
+                await self.wait_for_roi()
 
             # Close position
             self.logger.info(f"[STEP 2] Apex position: {self.apex_position} | Lighter position: {self.lighter_position}")

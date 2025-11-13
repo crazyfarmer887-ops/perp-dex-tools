@@ -33,12 +33,16 @@ class HedgeBot:
         fill_timeout: int = 10,
         iterations: int = 10,
         sleep_time: int = 0,
+        tp_roi: Optional[Decimal] = None,
+        sl_roi: Optional[Decimal] = None,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.tp_roi = Decimal(tp_roi) if tp_roi is not None else None
+        self.sl_roi = Decimal(sl_roi) if sl_roi is not None else None
 
         self.stop_flag = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -53,6 +57,15 @@ class HedgeBot:
 
         self.grvt_position = Decimal('0')
         self.bingx_position = Decimal('0')
+        self.current_entry_price: Optional[Decimal] = None
+        self.current_entry_side: Optional[str] = None
+        self.current_entry_size: Optional[Decimal] = None
+        self.current_entry_timestamp: Optional[float] = None
+        self.current_take_profit_price: Optional[Decimal] = None
+        self.current_stop_loss_price: Optional[Decimal] = None
+        self.roi_poll_interval: float = 1.0
+        self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
+        self.last_roi_reason: Optional[str] = None
 
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
@@ -245,11 +258,135 @@ class HedgeBot:
             f"[BINGX] {hedge_side.upper()} {size} @ {result.price} | Position={self.bingx_position}"
         )
 
+    def _reset_entry_state(self) -> None:
+        self.current_entry_price = None
+        self.current_entry_side = None
+        self.current_entry_size = None
+        self.current_entry_timestamp = None
+        self.current_take_profit_price = None
+        self.current_stop_loss_price = None
+        self.last_roi_reason = None
+
+    def _register_entry(self, fill: Dict[str, Any]) -> None:
+        try:
+            price = Decimal(str(fill.get('price')))
+        except Exception:
+            price = None
+        if price is None or price <= 0:
+            self.logger.warning("⚠️ Unable to register entry due to invalid price.")
+            self._reset_entry_state()
+            return
+
+        try:
+            size = Decimal(str(fill.get('size', '0')))
+        except Exception:
+            size = Decimal('0')
+
+        side = str(fill.get('side', '')).lower()
+        self.current_entry_price = price
+        self.current_entry_side = side
+        self.current_entry_size = size
+        self.current_entry_timestamp = time.time()
+        self.last_roi_reason = None
+        self._update_roi_targets(side, price)
+
+    def _update_roi_targets(self, side: str, entry_price: Decimal) -> None:
+        self.current_take_profit_price = None
+        self.current_stop_loss_price = None
+
+        if entry_price <= 0:
+            return
+
+        hundred = Decimal('100')
+        one = Decimal('1')
+        messages = []
+
+        if self.tp_roi is not None:
+            tp_factor = self.tp_roi / hundred
+            if side == 'buy':
+                self.current_take_profit_price = entry_price * (one + tp_factor)
+            else:
+                self.current_take_profit_price = entry_price * (one - tp_factor)
+            messages.append(f"TP @ {self.current_take_profit_price} ({self.tp_roi}% ROI)")
+
+        if self.sl_roi is not None:
+            sl_factor = self.sl_roi / hundred
+            if side == 'buy':
+                self.current_stop_loss_price = entry_price * (one - sl_factor)
+            else:
+                self.current_stop_loss_price = entry_price * (one + sl_factor)
+            messages.append(f"SL @ {self.current_stop_loss_price} (-{self.sl_roi}% ROI)")
+
+        if messages:
+            self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
+
+    async def wait_for_roi(self) -> None:
+        if self.stop_flag:
+            return
+        if self.tp_roi is None and self.sl_roi is None:
+            return
+        if self.current_entry_price is None or self.current_entry_side is None:
+            return
+        if self.grvt_client is None or self.grvt_contract_id is None:
+            self.logger.warning("⚠️ Cannot wait for ROI without GRVT client or contract id.")
+            return
+
+        entry_price = self.current_entry_price
+        if entry_price <= 0:
+            self.logger.warning("⚠️ Cannot evaluate ROI targets because entry price is non-positive.")
+            return
+
+        hundred = Decimal('100')
+        start_time = time.time()
+        self.logger.info("⏳ Waiting for ROI targets before executing opposite GRVT cycle...")
+
+        while not self.stop_flag:
+            try:
+                best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+            except Exception as exc:
+                self.logger.warning(f"⚠️ Failed to fetch GRVT prices while waiting for ROI: {exc}")
+                await asyncio.sleep(self.roi_poll_interval)
+                continue
+
+            reference_price = None
+            roi = None
+            if self.current_entry_side == 'buy' and best_bid and best_bid > 0:
+                reference_price = best_bid
+                roi = (reference_price - entry_price) / entry_price * hundred
+            elif self.current_entry_side == 'sell' and best_ask and best_ask > 0:
+                reference_price = best_ask
+                roi = (entry_price - reference_price) / entry_price * hundred
+
+            if roi is not None:
+                roi_float = float(roi)
+                take_profit_hit = self.tp_roi is not None and roi >= self.tp_roi
+                stop_loss_hit = self.sl_roi is not None and roi <= -self.sl_roi
+
+                if take_profit_hit:
+                    self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
+                    self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%)")
+                    return
+
+                if stop_loss_hit:
+                    self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
+                    self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%)")
+                    return
+
+            elapsed = time.time() - start_time
+            if elapsed >= self.max_roi_wait:
+                self.last_roi_reason = f"timeout ({elapsed:.1f}s)"
+                self.logger.info(f"⏱️ ROI wait timed out after {elapsed:.1f}s; proceeding to next cycle.")
+                return
+
+            await asyncio.sleep(self.roi_poll_interval)
+
     async def execute_cycle(self, side: str) -> None:
         fill = await self.place_grvt_order(side)
         if not fill or self.stop_flag:
+            self._reset_entry_state()
             return
 
+        self._register_entry(fill)
         await self.place_bingx_hedge(fill)
 
         if self.sleep_time > 0 and not self.stop_flag:
@@ -283,9 +420,15 @@ class HedgeBot:
             if self.stop_flag:
                 break
 
+            await self.wait_for_roi()
+            if self.stop_flag:
+                break
+
             await self.execute_cycle('sell')
             if self.stop_flag:
                 break
+
+            await self.wait_for_roi()
 
         self.logger.info("Trading loop finished")
 

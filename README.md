@@ -295,6 +295,8 @@ python runbot.py --exchange extended --ticker ETH --quantity 0.1 --take-profit 0
 3. **平仓阶段**：在选定交易所下另一个 maker 订单平仓
 4. **对冲平仓**：在对冲交易所下市价订单平仓
 
+可选参数 `--tp-roi` 和 `--sl-roi` 允许你基于平均开仓价设定 ROI 百分比的止盈/止损目标；在达到目标之前，策略会等待而不是立即进入下一步。
+
 ### 对冲模式优势
 
 - **风险降低**：通过同时持有相反头寸，降低单边市场风险
@@ -322,6 +324,9 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 20
 
 # 运行 BTC 对冲模式（edgeX）
 python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
+
+# 运行 BTC 对冲模式（Apex），并使用 ROI 止盈/止损
+python hedge_mode.py --exchange apex --ticker BTC --size 0.05 --iter 20 --tp-roi 0.4 --sl-roi 0.2
 ```
 
 ### 对冲模式参数
@@ -332,6 +337,8 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 - `--iter`: 交易循环次数
 - `--fill-timeout`: maker 订单填充超时时间（秒，默认 5）
 - `--sleep`: 每一笔交易之后的暂停时间，增加持仓时间（秒，默认 0）
+- `--tp-roi`: 基于平均开仓价的止盈 ROI 百分比（可选）
+- `--sl-roi`: 基于平均开仓价的止损 ROI 百分比（可选）
 
 ## 配置
 
