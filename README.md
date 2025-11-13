@@ -317,13 +317,16 @@ python hedge_mode.py --exchange apex --ticker BTC --size 0.05 --iter 20
 # 运行 BTC 对冲模式（GRVT）
 python hedge_mode.py --exchange grvt --ticker BTC --size 0.05 --iter 20
 
+# 运行 BTC 对冲模式（GRVT 做市 + BingX 对冲）
+python hedge_mode.py --exchange grvt-bingx --ticker BTC --size 0.05 --iter 20
+
 # 运行 BTC 对冲模式（edgeX）
 python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 ```
 
 ### 对冲模式参数
 
-- `--exchange`: 主要交易所（支持 'backpack', 'extended', 'apex', 'grvt', 'edgex'）
+- `--exchange`: 主要交易所（支持 'backpack', 'extended', 'apex', 'grvt', 'grvt-bingx', 'edgex'）
 - `--ticker`: 交易对符号（如 BTC, ETH）
 - `--size`: 每笔订单数量
 - `--iter`: 交易循环次数
@@ -377,6 +380,11 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 - `GRVT_PRIVATE_KEY`: 您的 GRVT 私钥
 - `GRVT_API_KEY`: 您的 GRVT API 密钥
 
+#### BingX 配置
+
+- `BINGX_API_KEY`: 您的 BingX API Key
+- `BINGX_SECRET_KEY`: 您的 BingX API Secret
+
 #### Extended 配置
 
 - `EXTENDED_API_KEY`: Extended API Key
@@ -405,7 +413,7 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 
 ### 命令行参数
 
-- `--exchange`: 使用的交易所：'edgex'、'backpack'、'paradex'、'aster'、'lighter'、'grvt' 或 'extended'（默认：edgex）
+- `--exchange`: 使用的交易所：'edgex'、'backpack'、'paradex'、'aster'、'lighter'、'grvt'、'bingx' 或 'extended'（默认：edgex）
 - `--ticker`: 标的资产符号（例如：ETH、BTC、SOL）。合约 ID 自动解析。
 - `--quantity`: 订单数量（默认：0.1）
 - `--take-profit`: 止盈百分比（例如 0.02 表示 0.02%）

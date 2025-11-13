@@ -4,7 +4,7 @@ This document explains how to add support for new exchanges to the modular tradi
 
 ## Overview
 
-The trading bot has been modularized to support multiple exchanges through a plugin-like architecture. Each exchange is implemented as a separate client that inherits from `BaseExchangeClient`. The bot currently supports EdgeX, Backpack, Paradex, and GRVT exchanges.
+The trading bot has been modularized to support multiple exchanges through a plugin-like architecture. Each exchange is implemented as a separate client that inherits from `BaseExchangeClient`. The bot currently supports EdgeX, Backpack, Paradex, Aster, Lighter, Extended, Apex, GRVT, and BingX exchanges.
 
 ## Architecture
 
@@ -368,6 +368,11 @@ Each exchange requires specific environment variables. Here are the current impl
 - `GRVT_API_KEY` - Your GRVT API key
 - `GRVT_ENVIRONMENT` - Environment (prod/testnet/staging/dev, defaults to prod)
 
+### BingX
+
+- `BINGX_API_KEY` - Your BingX API key
+- `BINGX_SECRET_KEY` - Your BingX API secret
+
 ## Usage
 
 Once implemented, users can select your exchange:
@@ -418,6 +423,13 @@ python runbot.py --exchange your_exchange --ticker BTC --quantity 0.01 --directi
 - REST API and WebSocket support
 - Private key authentication
 - Supports perpetual futures trading
+
+### BingX
+
+- Uses CCXT unified client (`ccxt.bingx`) for REST access
+- Polling-based order status updates with optional market hedging helpers
+- Requires standard API key/secret authentication
+- Supports USDT-margined perpetual swaps
 
 ## Example: Binance Futures
 
