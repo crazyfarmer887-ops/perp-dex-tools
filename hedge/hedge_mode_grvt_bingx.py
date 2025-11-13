@@ -69,6 +69,11 @@ class HedgeBot:
 
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
+        self.grvt_close_fill_event = asyncio.Event()
+        self.active_close_order_id: Optional[str] = None
+        self.active_close_order_reason: Optional[str] = None
+        self.active_close_order_price: Optional[Decimal] = None
+        self.active_close_order_size: Optional[Decimal] = None
 
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/grvt_bingx_{self.ticker.lower()}_hedge_log.txt"
@@ -148,32 +153,94 @@ class HedgeBot:
             return
         if message.get('contract_id') != self.grvt_contract_id:
             return
-        if message.get('order_type') != 'OPEN':
+
+        order_type = str(message.get('order_type', '')).upper()
+        if order_type not in {'OPEN', 'CLOSE'}:
             return
 
-        status = message.get('status')
-        side = message.get('side', '').lower()
-        filled_size = Decimal(str(message.get('filled_size', '0')))
-        price = Decimal(str(message.get('price', '0')))
+        status = str(message.get('status', '')).upper()
+        side = str(message.get('side', '')).lower()
         order_id = message.get('order_id')
+
+        try:
+            filled_size = Decimal(str(message.get('filled_size', '0')))
+        except Exception:
+            filled_size = Decimal('0')
+        try:
+            price = Decimal(str(message.get('price', '0')))
+        except Exception:
+            price = Decimal('0')
 
         if status == 'FILLED':
             if side == 'buy':
                 self.grvt_position += filled_size
-            else:
+            elif side == 'sell':
                 self.grvt_position -= filled_size
 
-            self.last_grvt_fill = {
-                'order_id': order_id,
-                'side': side,
-                'size': filled_size,
-                'price': price
-            }
+        if order_type == 'OPEN':
+            if status == 'FILLED':
+                self.last_grvt_fill = {
+                    'order_id': order_id,
+                    'side': side,
+                    'size': filled_size,
+                    'price': price
+                }
 
-            self.logger.info(
-                f"[GRVT] FILLED {side.upper()} {filled_size} @ {price} | Position={self.grvt_position}"
+                self.logger.info(
+                    f"[GRVT] FILLED {side.upper()} {filled_size} @ {price} | Position={self.grvt_position}"
+                )
+                self.grvt_fill_event.set()
+        else:
+            self._handle_grvt_close_order_update(
+                order_id=order_id,
+                status=status,
+                side=side,
+                filled_size=filled_size,
+                price=price
             )
-            self.grvt_fill_event.set()
+
+    def _handle_grvt_close_order_update(
+        self,
+        order_id: Optional[str],
+        status: str,
+        side: str,
+        filled_size: Decimal,
+        price: Decimal
+    ) -> None:
+        if order_id is None:
+            return
+
+        if status == 'CANCELED':
+            if order_id == self.active_close_order_id:
+                self.logger.info(f"[GRVT] Close order {order_id} cancelled")
+                self.active_close_order_id = None
+                self.active_close_order_reason = None
+                self.active_close_order_price = None
+                self.active_close_order_size = None
+            return
+
+        if status not in {'FILLED', 'PARTIALLY_FILLED'}:
+            return
+
+        # Track remaining size for informational purposes
+        if self.current_entry_size is not None and filled_size > 0:
+            remaining = self.current_entry_size - filled_size
+            self.current_entry_size = remaining if remaining > 0 else Decimal('0')
+
+        if status == 'FILLED':
+            reason = self.active_close_order_reason or self.last_roi_reason or 'manual_close'
+            self.logger.info(
+                f"[GRVT] CLOSE FILLED {side.upper()} {filled_size} @ {price} | "
+                f"Position={self.grvt_position} | reason={reason}"
+            )
+
+            self.active_close_order_id = None
+            self.active_close_order_reason = None
+            self.active_close_order_price = None
+            self.active_close_order_size = None
+
+            self.grvt_close_fill_event.set()
+            self._reset_entry_state(preserve_reason=True)
 
     async def setup_grvt_websocket(self) -> None:
         assert self.grvt_client is not None
@@ -258,14 +325,19 @@ class HedgeBot:
             f"[BINGX] {hedge_side.upper()} {size} @ {result.price} | Position={self.bingx_position}"
         )
 
-    def _reset_entry_state(self) -> None:
+    def _reset_entry_state(self, preserve_reason: bool = False) -> None:
         self.current_entry_price = None
         self.current_entry_side = None
         self.current_entry_size = None
         self.current_entry_timestamp = None
         self.current_take_profit_price = None
         self.current_stop_loss_price = None
-        self.last_roi_reason = None
+        if not preserve_reason:
+            self.last_roi_reason = None
+        self.active_close_order_id = None
+        self.active_close_order_reason = None
+        self.active_close_order_price = None
+        self.active_close_order_size = None
 
     def _register_entry(self, fill: Dict[str, Any]) -> None:
         try:
@@ -320,6 +392,111 @@ class HedgeBot:
         if messages:
             self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
 
+    def _get_close_side(self) -> Optional[str]:
+        if self.current_entry_side == 'buy':
+            return 'sell'
+        if self.current_entry_side == 'sell':
+            return 'buy'
+        return None
+
+    async def _cancel_active_close_order(self) -> None:
+        if not self.active_close_order_id or self.grvt_client is None:
+            return
+
+        order_id = self.active_close_order_id
+        try:
+            result = await self.grvt_client.cancel_order(order_id)
+            if not result.success:
+                self.logger.warning(
+                    f"[GRVT] Failed to cancel close order {order_id}: {result.error_message}"
+                )
+        except Exception as exc:
+            self.logger.warning(f"[GRVT] Error cancelling close order {order_id}: {exc}")
+        finally:
+            self.active_close_order_id = None
+            self.active_close_order_reason = None
+            self.active_close_order_price = None
+            self.active_close_order_size = None
+
+    async def _place_grvt_close_order(self, price: Decimal, reason: str) -> bool:
+        if self.grvt_client is None or self.grvt_contract_id is None:
+            self.logger.warning("⚠️ Cannot place close order without GRVT client/contract id.")
+            return False
+        if self.stop_flag:
+            return False
+
+        size = self.current_entry_size
+        close_side = self._get_close_side()
+
+        if size is None or size <= 0 or close_side is None:
+            self.logger.warning("⚠️ No active entry to close; skipping close order placement.")
+            return False
+        if price <= 0:
+            self.logger.warning("⚠️ Invalid close order price, skipping.")
+            return False
+
+        # Avoid duplicate placement for the same reason
+        if self.active_close_order_id:
+            if self.active_close_order_reason == reason:
+                self.logger.debug(f"[GRVT] Close order already active for {reason}, skipping placement.")
+                return True
+            await self._cancel_active_close_order()
+
+        try:
+            order_result = await self.grvt_client.place_close_order(
+                contract_id=self.grvt_contract_id,
+                quantity=size,
+                price=price,
+                side=close_side
+            )
+        except Exception as exc:
+            self.logger.error(f"[GRVT] Failed to place close order ({reason}): {exc}")
+            return False
+
+        if not order_result.success or not order_result.order_id:
+            self.logger.error(
+                f"[GRVT] Failed to place close order ({reason}): {order_result.error_message}"
+            )
+            return False
+
+        reason_label = "take profit" if reason == 'take_profit' else "stop loss"
+        order_price = order_result.price or price
+        self.active_close_order_id = order_result.order_id
+        self.active_close_order_reason = reason
+        self.active_close_order_price = order_price
+        self.active_close_order_size = size
+        self.grvt_close_fill_event.clear()
+
+        self.logger.info(
+            f"[GRVT] Close order placed ({reason_label}) "
+            f"{close_side.upper()} {size} @ {order_price} (id={order_result.order_id})"
+        )
+
+        if order_result.status == 'FILLED':
+            # Immediate fill - trigger handler behavior
+            self.grvt_close_fill_event.set()
+
+        return True
+
+    async def _wait_for_close_fill(self, timeout: Optional[float] = None) -> bool:
+        if self.active_close_order_id is None:
+            return True
+
+        if self.grvt_close_fill_event.is_set():
+            self.grvt_close_fill_event.clear()
+            return True
+
+        wait_timeout = timeout if timeout is not None else max(self.fill_timeout, 10)
+        try:
+            await asyncio.wait_for(self.grvt_close_fill_event.wait(), timeout=wait_timeout)
+            self.grvt_close_fill_event.clear()
+            return True
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"[GRVT] Close order {self.active_close_order_id} not filled within {wait_timeout}s"
+            )
+            return False
+
     async def wait_for_roi(self) -> None:
         if self.stop_flag:
             return
@@ -341,6 +518,11 @@ class HedgeBot:
         self.logger.info("⏳ Waiting for ROI targets before executing opposite GRVT cycle...")
 
         while not self.stop_flag:
+            if self.active_close_order_id:
+                filled = await self._wait_for_close_fill(timeout=self.roi_poll_interval * 2)
+                if filled:
+                    return
+
             try:
                 best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
             except Exception as exc:
@@ -364,13 +546,37 @@ class HedgeBot:
 
                 if take_profit_hit:
                     self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
-                    self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%)")
-                    return
+                    tp_price = self.current_take_profit_price
+                    if tp_price is not None and tp_price > 0:
+                        self.logger.info(
+                            f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%). "
+                            f"Placing close order @ {tp_price}"
+                        )
+                        placed = await self._place_grvt_close_order(tp_price, 'take_profit')
+                        if placed:
+                            filled = await self._wait_for_close_fill()
+                            if filled:
+                                self.logger.info("✅ Take profit close order filled; proceeding to next cycle.")
+                                return
+                    else:
+                        self.logger.warning("⚠️ Take profit price unavailable; skipping close order placement.")
 
                 if stop_loss_hit:
                     self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
-                    self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%)")
-                    return
+                    sl_price = self.current_stop_loss_price
+                    if sl_price is not None and sl_price > 0:
+                        self.logger.info(
+                            f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%). "
+                            f"Placing close order @ {sl_price}"
+                        )
+                        placed = await self._place_grvt_close_order(sl_price, 'stop_loss')
+                        if placed:
+                            filled = await self._wait_for_close_fill()
+                            if filled:
+                                self.logger.info("✅ Stop loss close order filled; proceeding to next cycle.")
+                                return
+                    else:
+                        self.logger.warning("⚠️ Stop loss price unavailable; skipping close order placement.")
 
             elapsed = time.time() - start_time
             if elapsed >= self.max_roi_wait:
@@ -381,6 +587,8 @@ class HedgeBot:
             await asyncio.sleep(self.roi_poll_interval)
 
     async def execute_cycle(self, side: str) -> None:
+        await self._cancel_active_close_order()
+
         fill = await self.place_grvt_order(side)
         if not fill or self.stop_flag:
             self._reset_entry_state()
