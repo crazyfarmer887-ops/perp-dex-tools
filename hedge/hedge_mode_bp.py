@@ -10,7 +10,7 @@ import argparse
 import traceback
 import csv
 from decimal import Decimal
-from typing import Tuple
+from typing import Tuple, Optional
 
 from lighter.signer_client import SignerClient
 import sys
@@ -32,13 +32,14 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on Backpack and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0):
+    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0, position_hold_time: int = 0):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.lighter_order_filled = False
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.position_hold_time = position_hold_time
         self.backpack_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.current_order = {}
@@ -145,6 +146,23 @@ class HedgeBot:
         # Backpack configuration
         self.backpack_public_key = os.getenv('BACKPACK_PUBLIC_KEY')
         self.backpack_secret_key = os.getenv('BACKPACK_SECRET_KEY')
+
+    async def _hold_position_before_hedge(self, hedge_side: Optional[str] = None):
+        """Hold the open position for the configured duration before hedging on Lighter."""
+        if self.position_hold_time <= 0:
+            return
+
+        side = hedge_side or self.current_lighter_side or "unknown"
+        self.logger.info(
+            f"⏳ Holding position for {self.position_hold_time}s before placing Lighter {side.upper()} hedge order"
+        )
+
+        deadline = time.time() + self.position_hold_time
+        while not self.stop_flag:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.5, remaining))
 
     def shutdown(self, signum=None, frame=None):
         """Graceful shutdown handler."""
@@ -1084,6 +1102,9 @@ class HedgeBot:
             while not self.order_execution_complete and not self.stop_flag:
                 # Check if Backpack order filled and we need to place Lighter order
                 if self.waiting_for_lighter_fill:
+                    await self._hold_position_before_hedge(self.current_lighter_side)
+                    if self.stop_flag:
+                        break
                     await self.place_lighter_market_order(
                         self.current_lighter_side,
                         self.current_lighter_quantity,
@@ -1120,6 +1141,9 @@ class HedgeBot:
             while not self.order_execution_complete and not self.stop_flag:
                 # Check if Backpack order filled and we need to place Lighter order
                 if self.waiting_for_lighter_fill:
+                    await self._hold_position_before_hedge(self.current_lighter_side)
+                    if self.stop_flag:
+                        break
                     await self.place_lighter_market_order(
                         self.current_lighter_side,
                         self.current_lighter_quantity,
@@ -1155,6 +1179,9 @@ class HedgeBot:
             while not self.order_execution_complete and not self.stop_flag:
                 # Check if Backpack order filled and we need to place Lighter order
                 if self.waiting_for_lighter_fill:
+                    await self._hold_position_before_hedge(self.current_lighter_side)
+                    if self.stop_flag:
+                        break
                     await self.place_lighter_market_order(
                         self.current_lighter_side,
                         self.current_lighter_quantity,
@@ -1195,5 +1222,7 @@ def parse_arguments():
                         help='Timeout in seconds for maker order fills (default: 5)')
     parser.add_argument('--sleep', type=int, default=0,
                         help='Sleep time in seconds after each step (default: 0)')
+    parser.add_argument('--position-hold-time', type=int, default=0,
+                        help='Position hold time in seconds before hedging (default: 0)')
 
     return parser.parse_args()

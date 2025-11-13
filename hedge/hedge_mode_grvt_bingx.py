@@ -33,12 +33,14 @@ class HedgeBot:
         fill_timeout: int = 10,
         iterations: int = 10,
         sleep_time: int = 0,
+        position_hold_time: int = 0,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.position_hold_time = position_hold_time
 
         self.stop_flag = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -77,6 +79,23 @@ class HedgeBot:
 
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
+
+    async def _hold_position_before_hedge(self, hedge_side: Optional[str] = None) -> None:
+        """Hold the open GRVT position for the configured duration before hedging on BingX."""
+        if self.position_hold_time <= 0:
+            return
+
+        side = hedge_side or "unknown"
+        self.logger.info(
+            f"⏳ Holding position for {self.position_hold_time}s before placing BingX {side.upper()} hedge order"
+        )
+
+        deadline = time.time() + self.position_hold_time
+        while not self.stop_flag:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.5, remaining))
 
     # ------------------------------------------------------------------ #
     # Initialization helpers
@@ -223,6 +242,10 @@ class HedgeBot:
         hedge_side = 'sell' if side == 'buy' else 'buy'
         self.bingx_client.config.direction = hedge_side
         self.bingx_client.config.close_order_side = 'buy' if hedge_side == 'sell' else 'sell'
+
+        await self._hold_position_before_hedge(hedge_side)
+        if self.stop_flag:
+            return
 
         self.logger.info(f"[BINGX] Hedging {hedge_side} {size}")
 
