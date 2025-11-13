@@ -33,6 +33,8 @@ class HedgeBot:
         fill_timeout: int = 10,
         iterations: int = 10,
         sleep_time: int = 0,
+        take_profit_roi: Optional[Decimal] = None,
+        stop_loss_roi: Optional[Decimal] = None,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
@@ -53,6 +55,10 @@ class HedgeBot:
 
         self.grvt_position = Decimal('0')
         self.bingx_position = Decimal('0')
+
+        # ROI configuration (currently informational for this bot variant)
+        self.take_profit_roi = take_profit_roi
+        self.stop_loss_roi = stop_loss_roi
 
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None

@@ -10,7 +10,7 @@ import argparse
 import traceback
 import csv
 from decimal import Decimal
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 
 from lighter.signer_client import SignerClient
 from edgex_sdk import Client, OrderSide, WebSocketManager, CancelOrderParams
@@ -25,7 +25,16 @@ dotenv.load_dotenv()
 class HedgeBot:
     """Trading bot that places post-only orders on edgeX and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0):
+    def __init__(
+        self,
+        ticker: str,
+        order_quantity: Decimal,
+        fill_timeout: int = 5,
+        iterations: int = 20,
+        sleep_time: int = 0,
+        take_profit_roi: Optional[Decimal] = None,
+        stop_loss_roi: Optional[Decimal] = None
+    ):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
@@ -34,6 +43,15 @@ class HedgeBot:
         self.edgex_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.edgex_client_order_id = ''
+
+        self.take_profit_roi = take_profit_roi
+        self.stop_loss_roi = stop_loss_roi
+        self.long_entry_price: Optional[Decimal] = None
+        self.long_entry_size = Decimal('0')
+        self.short_entry_price: Optional[Decimal] = None
+        self.short_entry_size = Decimal('0')
+        self.pending_take_profit_price: Optional[Decimal] = None
+        self.pending_stop_loss_price: Optional[Decimal] = None
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -344,29 +362,74 @@ class HedgeBot:
             return price
         return (price / self.edgex_tick_size).quantize(Decimal('1')) * self.edgex_tick_size
 
-    async def place_bbo_order(self, side: str, quantity: Decimal):
-        # Get best bid/ask prices
-        best_bid, best_ask = await self.fetch_edgex_bbo_prices()
-        data_source = "WebSocket" if self.edgex_order_book_ready else "REST API"
-        self.logger.info(f"[{data_source}] Best bid: {best_bid}, Best ask: {best_ask}, Tick size: {self.edgex_tick_size}")
-        
-        if side.lower() == 'buy':
-            # For buy orders, place slightly below best ask to ensure execution
-            order_price = best_ask - self.edgex_tick_size
-            # order_price = best_ask - Decimal('8')
-            order_side = OrderSide.BUY
+    def calculate_take_profit_price(self, close_side: str) -> Optional[Decimal]:
+        """Calculate take-profit price based on stored average entry and ROI percentage."""
+        if self.take_profit_roi is None:
+            return None
+
+        roi_factor = self.take_profit_roi / Decimal('100')
+        side = close_side.lower()
+
+        if side == 'sell':
+            if self.long_entry_price is None:
+                return None
+            target_price = self.long_entry_price * (Decimal('1') + roi_factor)
+            return self.round_to_tick(target_price)
+        elif side == 'buy':
+            if self.short_entry_price is None:
+                return None
+            target_price = self.short_entry_price * (Decimal('1') - roi_factor)
+            return self.round_to_tick(target_price)
+        return None
+
+    def calculate_stop_loss_price(self, close_side: str) -> Optional[Decimal]:
+        """Calculate stop-loss price based on stored average entry and ROI percentage."""
+        if self.stop_loss_roi is None:
+            return None
+
+        roi_factor = self.stop_loss_roi / Decimal('100')
+        side = close_side.lower()
+
+        if side == 'sell':
+            if self.long_entry_price is None:
+                return None
+            stop_price = self.long_entry_price * (Decimal('1') - roi_factor)
+            return self.round_to_tick(stop_price)
+        elif side == 'buy':
+            if self.short_entry_price is None:
+                return None
+            stop_price = self.short_entry_price * (Decimal('1') + roi_factor)
+            return self.round_to_tick(stop_price)
+        return None
+
+    async def place_bbo_order(self, side: str, quantity: Decimal, target_price: Optional[Decimal] = None):
+        """Place order at best bid/ask or a specified target price."""
+        if target_price is not None:
+            order_price = target_price
+            order_side = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
         else:
-            # For sell orders, place slightly above best bid to ensure execution
-            order_price = best_bid + self.edgex_tick_size
-            # order_price = best_bid + Decimal('8')
-            order_side = OrderSide.SELL
+            # Get best bid/ask prices
+            best_bid, best_ask = await self.fetch_edgex_bbo_prices()
+            data_source = "WebSocket" if self.edgex_order_book_ready else "REST API"
+            self.logger.info(f"[{data_source}] Best bid: {best_bid}, Best ask: {best_ask}, Tick size: {self.edgex_tick_size}")
+            
+            if side.lower() == 'buy':
+                # For buy orders, place slightly below best ask to ensure execution
+                order_price = best_ask - self.edgex_tick_size
+                order_side = OrderSide.BUY
+            else:
+                # For sell orders, place slightly above best bid to ensure execution
+                order_price = best_bid + self.edgex_tick_size
+                order_side = OrderSide.SELL
+
+        order_price = self.round_to_tick(order_price)
 
         self.edgex_client_order_id = str(int(time.time() * 1000))
         # Place the order using official SDK (post-only to ensure maker order)
         order_result = await self.edgex_client.create_limit_order(
             contract_id=self.edgex_contract_id,
             size=str(quantity),
-            price=str(self.round_to_tick(order_price)),
+            price=str(order_price),
             side=order_side,
             post_only=True,
             client_order_id=self.edgex_client_order_id
@@ -374,7 +437,7 @@ class HedgeBot:
         order_id = order_result['data'].get('orderId')
         return order_id
 
-    async def place_edgex_post_only_order(self, side: str, quantity: Decimal):
+    async def place_edgex_post_only_order(self, side: str, quantity: Decimal, target_price: Optional[Decimal] = None):
         """Place a post-only order on edgeX."""
         if not self.edgex_client:
             raise Exception("edgeX client not initialized")
@@ -385,14 +448,17 @@ class HedgeBot:
             order_type = "CLOSE"
 
         self.edgex_order_status = None
-        self.logger.info(f"[{order_type}] [edgeX] [{side}] Placing edgeX POST-ONLY order")
-        order_id = await self.place_bbo_order(side, quantity)
+        if target_price is not None:
+            self.logger.info(f"[{order_type}] [edgeX] [{side}] Placing edgeX ROI POST-ONLY order @ {target_price}")
+        else:
+            self.logger.info(f"[{order_type}] [edgeX] [{side}] Placing edgeX POST-ONLY order")
+        order_id = await self.place_bbo_order(side, quantity, target_price=target_price)
 
         start_time = time.time()
         while not self.stop_flag:
             if self.edgex_order_status == 'CANCELED':
                 self.edgex_order_status = 'NEW'
-                order_id = await self.place_bbo_order(side, quantity)
+                order_id = await self.place_bbo_order(side, quantity, target_price=target_price)
                 start_time = time.time()
                 await asyncio.sleep(1)
             elif self.edgex_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING']:
@@ -771,9 +837,17 @@ class HedgeBot:
         if side == 'buy':
             self.edgex_position += filled_size
             lighter_side = 'sell'
+            if self.edgex_position > 0:
+                self.long_entry_price = price
+                self.long_entry_size = self.edgex_position
+                self.logger.info(f"📌 Recorded long entry average price: {self.long_entry_price}")
         else:
             self.edgex_position -= filled_size
             lighter_side = 'buy'
+            if self.edgex_position < 0:
+                self.short_entry_price = price
+                self.short_entry_size = abs(self.edgex_position)
+                self.logger.info(f"📌 Recorded short entry average price: {self.short_entry_price}")
         
         # Store order details for immediate execution
         self.current_lighter_side = lighter_side
@@ -1169,9 +1243,14 @@ class HedgeBot:
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
             try:
-                # Determine side based on some logic (for now, alternate)
                 side = 'sell'
-                await self.place_edgex_post_only_order(side, self.order_quantity)
+                self.pending_take_profit_price = self.calculate_take_profit_price(side)
+                self.pending_stop_loss_price = self.calculate_stop_loss_price(side)
+                if self.pending_take_profit_price is not None:
+                    self.logger.info(f"🎯 edgeX take-profit target ({side}): {self.pending_take_profit_price}")
+                if self.pending_stop_loss_price is not None:
+                    self.logger.info(f"🛡️ edgeX stop-loss threshold ({side}): {self.pending_stop_loss_price}")
+                await self.place_edgex_post_only_order(side, self.order_quantity, target_price=self.pending_take_profit_price)
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
@@ -1205,8 +1284,15 @@ class HedgeBot:
                 side = 'buy'
 
             try:
-                # Determine side based on some logic (for now, alternate)
-                await self.place_edgex_post_only_order(side, abs(self.edgex_position))
+                target_price = self.calculate_take_profit_price(side)
+                stop_price = self.calculate_stop_loss_price(side)
+                self.pending_take_profit_price = target_price
+                self.pending_stop_loss_price = stop_price
+                if target_price is not None:
+                    self.logger.info(f"🎯 edgeX take-profit target ({side}) for remainder: {target_price}")
+                if stop_price is not None:
+                    self.logger.info(f"🛡️ edgeX stop-loss threshold ({side}) for remainder: {stop_price}")
+                await self.place_edgex_post_only_order(side, abs(self.edgex_position), target_price=target_price)
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")

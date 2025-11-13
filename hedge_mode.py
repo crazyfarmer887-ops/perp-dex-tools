@@ -56,6 +56,10 @@ Examples:
                         help='Timeout in seconds for maker order fills (default: 5)')
     parser.add_argument('--sleep', type=int, default=0,
                         help='Sleep time in seconds after each step (default: 0)')
+    parser.add_argument('--tp-roi', type=str, default=None,
+                        help='Take-profit ROI percentage (e.g., 0.5 for 0.5%%). Applies per entry average price.')
+    parser.add_argument('--sl-roi', type=str, default=None,
+                        help='Stop-loss ROI percentage (e.g., 0.5 for 0.5%%). Applies per entry average price.')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
     
@@ -125,12 +129,17 @@ async def main():
     
     try:
         # Create the hedge bot instance
+        tp_roi = Decimal(args.tp_roi) if args.tp_roi is not None else None
+        sl_roi = Decimal(args.sl_roi) if args.sl_roi is not None else None
+
         bot = HedgeBotClass(
             ticker=args.ticker.upper(),
             order_quantity=Decimal(args.size),
             fill_timeout=args.fill_timeout,
             iterations=args.iter,
-            sleep_time=args.sleep
+            sleep_time=args.sleep,
+            take_profit_roi=tp_roi,
+            stop_loss_roi=sl_roi
         )
         
         # Run the bot

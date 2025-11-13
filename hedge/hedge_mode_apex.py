@@ -10,7 +10,7 @@ import argparse
 import traceback
 import csv
 from decimal import Decimal
-from typing import Tuple
+from typing import Tuple, Optional
 
 from lighter.signer_client import SignerClient
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,7 +31,16 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on Apex and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0):
+    def __init__(
+        self,
+        ticker: str,
+        order_quantity: Decimal,
+        fill_timeout: int = 5,
+        iterations: int = 20,
+        sleep_time: int = 0,
+        take_profit_roi: Optional[Decimal] = None,
+        stop_loss_roi: Optional[Decimal] = None
+    ):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
@@ -41,6 +50,15 @@ class HedgeBot:
         self.apex_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.current_order = {}
+
+        self.take_profit_roi = take_profit_roi
+        self.stop_loss_roi = stop_loss_roi
+        self.long_entry_price: Optional[Decimal] = None
+        self.long_entry_size = Decimal('0')
+        self.short_entry_price: Optional[Decimal] = None
+        self.short_entry_size = Decimal('0')
+        self.pending_take_profit_price: Optional[Decimal] = None
+        self.pending_stop_loss_price: Optional[Decimal] = None
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -604,36 +622,89 @@ class HedgeBot:
             return price
         return (price / self.apex_tick_size).quantize(Decimal('1')) * self.apex_tick_size
 
-    async def place_bbo_order(self, side: str, quantity: Decimal):
-        # Get best bid/ask prices
-        best_bid, best_ask = await self.fetch_apex_bbo_prices()
+    def calculate_take_profit_price(self, close_side: str) -> Optional[Decimal]:
+        """Calculate take-profit price based on stored average entry and ROI percentage."""
+        if self.take_profit_roi is None:
+            return None
 
-        # Place the order using Apex client
-        order_result = await self.apex_client.place_open_order(
-            contract_id=self.apex_contract_id,
-            quantity=quantity,
-            direction=side.lower()
-        )
+        roi_factor = self.take_profit_roi / Decimal('100')
+        side = close_side.lower()
+
+        if side == 'sell':
+            if self.long_entry_price is None:
+                return None
+            target_price = self.long_entry_price * (Decimal('1') + roi_factor)
+            return self.round_to_tick(target_price)
+        elif side == 'buy':
+            if self.short_entry_price is None:
+                return None
+            target_price = self.short_entry_price * (Decimal('1') - roi_factor)
+            return self.round_to_tick(target_price)
+        return None
+
+    def calculate_stop_loss_price(self, close_side: str) -> Optional[Decimal]:
+        """Calculate stop-loss price based on stored average entry and ROI percentage."""
+        if self.stop_loss_roi is None:
+            return None
+
+        roi_factor = self.stop_loss_roi / Decimal('100')
+        side = close_side.lower()
+
+        if side == 'sell':
+            if self.long_entry_price is None:
+                return None
+            stop_price = self.long_entry_price * (Decimal('1') - roi_factor)
+            return self.round_to_tick(stop_price)
+        elif side == 'buy':
+            if self.short_entry_price is None:
+                return None
+            stop_price = self.short_entry_price * (Decimal('1') + roi_factor)
+            return self.round_to_tick(stop_price)
+        return None
+
+    async def place_bbo_order(self, side: str, quantity: Decimal, target_price: Optional[Decimal] = None):
+        """Place order at best bid/ask or a specified target price."""
+        if target_price is not None:
+            adjusted_price = self.round_to_tick(target_price)
+            order_result = await self.apex_client.place_close_order(
+                contract_id=self.apex_contract_id,
+                quantity=quantity,
+                price=adjusted_price,
+                side=side.lower()
+            )
+        else:
+            # Get best bid/ask prices
+            best_bid, best_ask = await self.fetch_apex_bbo_prices()
+
+            # Place the order using Apex client
+            order_result = await self.apex_client.place_open_order(
+                contract_id=self.apex_contract_id,
+                quantity=quantity,
+                direction=side.lower()
+            )
 
         if order_result.success:
             return order_result.order_id
         else:
             raise Exception(f"Failed to place order: {order_result.error_message}")
 
-    async def place_apex_post_only_order(self, side: str, quantity: Decimal):
+    async def place_apex_post_only_order(self, side: str, quantity: Decimal, target_price: Optional[Decimal] = None):
         """Place a post-only order on Apex."""
         if not self.apex_client:
             raise Exception("Apex client not initialized")
 
         self.apex_order_status = None
-        self.logger.info(f"[OPEN] [Apex] [{side}] Placing Apex POST-ONLY order")
-        order_id = await self.place_bbo_order(side, quantity)
+        if target_price is not None:
+            self.logger.info(f"[OPEN] [Apex] [{side}] Placing Apex ROI POST-ONLY order @ {target_price}")
+        else:
+            self.logger.info(f"[OPEN] [Apex] [{side}] Placing Apex POST-ONLY order")
+        order_id = await self.place_bbo_order(side, quantity, target_price=target_price)
 
         start_time = time.time()
         while not self.stop_flag:
             if self.apex_order_status == 'CANCELED':
                 self.apex_order_status = 'NEW'
-                order_id = await self.place_bbo_order(side, quantity)
+                order_id = await self.place_bbo_order(side, quantity, target_price=target_price)
                 start_time = time.time()
                 await asyncio.sleep(0.5)
             elif self.apex_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
@@ -876,6 +947,15 @@ class HedgeBot:
                     self.logger.info(f"[{order_id}] [{order_type}] [Apex] [{status}]: {filled_size} @ {price}")
                     self.apex_order_status = status
 
+                    if side == 'buy' and self.apex_position > 0:
+                        self.long_entry_price = price
+                        self.long_entry_size = self.apex_position
+                        self.logger.info(f"📌 Recorded long entry average price: {self.long_entry_price}")
+                    elif side == 'sell' and self.apex_position < 0:
+                        self.short_entry_price = price
+                        self.short_entry_size = abs(self.apex_position)
+                        self.logger.info(f"📌 Recorded short entry average price: {self.short_entry_price}")
+
                     # Log Apex trade to CSV
                     self.log_trade_to_csv(
                         exchange='Apex',
@@ -1025,9 +1105,14 @@ class HedgeBot:
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
             try:
-                # Determine side based on some logic (for now, alternate)
                 side = 'sell'
-                await self.place_apex_post_only_order(side, self.order_quantity)
+                self.pending_take_profit_price = self.calculate_take_profit_price(side)
+                self.pending_stop_loss_price = self.calculate_stop_loss_price(side)
+                if self.pending_take_profit_price is not None:
+                    self.logger.info(f"🎯 Apex take-profit target ({side}): {self.pending_take_profit_price}")
+                if self.pending_stop_loss_price is not None:
+                    self.logger.info(f"🛡️ Apex stop-loss threshold ({side}): {self.pending_stop_loss_price}")
+                await self.place_apex_post_only_order(side, self.order_quantity, target_price=self.pending_take_profit_price)
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
@@ -1060,8 +1145,15 @@ class HedgeBot:
                 side = 'buy'
 
             try:
-                # Determine side based on some logic (for now, alternate)
-                await self.place_apex_post_only_order(side, abs(self.apex_position))
+                target_price = self.calculate_take_profit_price(side)
+                stop_price = self.calculate_stop_loss_price(side)
+                self.pending_take_profit_price = target_price
+                self.pending_stop_loss_price = stop_price
+                if target_price is not None:
+                    self.logger.info(f"🎯 Apex take-profit target ({side}) for remainder: {target_price}")
+                if stop_price is not None:
+                    self.logger.info(f"🛡️ Apex stop-loss threshold ({side}) for remainder: {stop_price}")
+                await self.place_apex_post_only_order(side, abs(self.apex_position), target_price=target_price)
             except Exception as e:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")

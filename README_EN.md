@@ -306,6 +306,8 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 - `--iter`: Number of trading cycles
 - `--fill-timeout`: Maker order fill timeout in seconds (default: 5)
 - `--sleep`: Sleep time in seconds after each step (default: 0)
+- `--tp-roi`: Optional take-profit ROI percentage (e.g., 0.5 for 0.5%). Targets computed from average fill price per entry.
+- `--sl-roi`: Optional stop-loss ROI percentage (positive value). Threshold computed from average fill price per entry. (Stop-loss currently logged for manual intervention.)
 
 ## Configuration
 

@@ -332,6 +332,8 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 - `--iter`: 交易循环次数
 - `--fill-timeout`: maker 订单填充超时时间（秒，默认 5）
 - `--sleep`: 每一笔交易之后的暂停时间，增加持仓时间（秒，默认 0）
+- `--tp-roi`: 可选的止盈 ROI 百分比（例如 0.5 表示 0.5%），基于每次成交的平均价格计算目标价。
+- `--sl-roi`: 可选的止损 ROI 百分比（正值），基于平均成交价计算阈值（目前仅记录日志，供手动干预）。
 
 ## 配置
 
