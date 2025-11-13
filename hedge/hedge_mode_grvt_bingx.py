@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -184,7 +184,14 @@ class HedgeBot:
         assert self.bingx_client is not None
         await self.bingx_client.connect()
 
-    async def place_grvt_order(self, side: str) -> Optional[Dict[str, Any]]:
+    async def place_grvt_order(
+        self,
+        side: str,
+        *,
+        limit_price: Optional[Decimal] = None,
+        post_only: bool = True,
+        roi_reason: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         assert self.grvt_client is not None
         assert self.grvt_contract_id is not None
 
@@ -194,17 +201,38 @@ class HedgeBot:
         self.grvt_fill_event.clear()
         self.last_grvt_fill = None
 
-        order_result = await self.grvt_client.place_open_order(
-            contract_id=self.grvt_contract_id,
-            quantity=self.order_quantity,
-            direction=side
-        )
+        if limit_price is not None:
+            if isinstance(limit_price, Decimal):
+                target_price = limit_price
+            else:
+                try:
+                    target_price = Decimal(str(limit_price))
+                except Exception:
+                    self.logger.warning(f"[GRVT] Unable to parse limit_price={limit_price}, using raw value.")
+                    target_price = Decimal(str(self.current_take_profit_price or self.current_stop_loss_price or limit_price))
+            order_result = await self.grvt_client.place_open_order_with_price(
+                contract_id=self.grvt_contract_id,
+                quantity=self.order_quantity,
+                direction=side,
+                price=target_price,
+                post_only=post_only,
+            )
+        else:
+            order_result = await self.grvt_client.place_open_order(
+                contract_id=self.grvt_contract_id,
+                quantity=self.order_quantity,
+                direction=side
+            )
 
         if not order_result.success or not order_result.order_id:
             self.logger.error(f"[GRVT] Failed to place {side} order: {order_result.error_message}")
             return None
 
-        self.logger.info(f"[GRVT] Order placed {order_result.order_id} ({side}) @ {order_result.price}")
+        reason_suffix = f" | roi={roi_reason}" if roi_reason else ""
+        price_suffix = f" @ {order_result.price}" if order_result.price is not None else ""
+        self.logger.info(
+            f"[GRVT] Order placed {order_result.order_id} ({side}){price_suffix} | post_only={post_only}{reason_suffix}"
+        )
 
         if order_result.status == 'FILLED':
             self.last_grvt_fill = {
@@ -320,21 +348,21 @@ class HedgeBot:
         if messages:
             self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
 
-    async def wait_for_roi(self) -> None:
+    async def wait_for_roi(self) -> Tuple[Optional[str], Optional[Decimal]]:
         if self.stop_flag:
-            return
+            return None, None
         if self.tp_roi is None and self.sl_roi is None:
-            return
+            return None, None
         if self.current_entry_price is None or self.current_entry_side is None:
-            return
+            return None, None
         if self.grvt_client is None or self.grvt_contract_id is None:
             self.logger.warning("⚠️ Cannot wait for ROI without GRVT client or contract id.")
-            return
+            return None, None
 
         entry_price = self.current_entry_price
         if entry_price <= 0:
             self.logger.warning("⚠️ Cannot evaluate ROI targets because entry price is non-positive.")
-            return
+            return None, None
 
         hundred = Decimal('100')
         start_time = time.time()
@@ -365,23 +393,38 @@ class HedgeBot:
                 if take_profit_hit:
                     self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
                     self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%)")
-                    return
+                    tp_price = self.current_take_profit_price if self.current_take_profit_price is not None else entry_price
+                    return "take_profit", tp_price
 
                 if stop_loss_hit:
                     self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
                     self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%)")
-                    return
+                    sl_price = self.current_stop_loss_price if self.current_stop_loss_price is not None else entry_price
+                    return "stop_loss", sl_price
 
             elapsed = time.time() - start_time
             if elapsed >= self.max_roi_wait:
                 self.last_roi_reason = f"timeout ({elapsed:.1f}s)"
                 self.logger.info(f"⏱️ ROI wait timed out after {elapsed:.1f}s; proceeding to next cycle.")
-                return
+                return "timeout", None
 
             await asyncio.sleep(self.roi_poll_interval)
+        return None, None
 
-    async def execute_cycle(self, side: str) -> None:
-        fill = await self.place_grvt_order(side)
+    async def execute_cycle(
+        self,
+        side: str,
+        *,
+        limit_price: Optional[Decimal] = None,
+        post_only: bool = True,
+        roi_reason: Optional[str] = None
+    ) -> None:
+        fill = await self.place_grvt_order(
+            side,
+            limit_price=limit_price,
+            post_only=post_only,
+            roi_reason=roi_reason
+        )
         if not fill or self.stop_flag:
             self._reset_entry_state()
             return
@@ -420,15 +463,31 @@ class HedgeBot:
             if self.stop_flag:
                 break
 
-            await self.wait_for_roi()
+            roi_reason, roi_price = await self.wait_for_roi()
             if self.stop_flag:
                 break
 
-            await self.execute_cycle('sell')
+            sell_post_only = not (roi_price is not None and roi_reason in ('take_profit', 'stop_loss'))
+            await self.execute_cycle(
+                'sell',
+                limit_price=roi_price,
+                post_only=sell_post_only,
+                roi_reason=roi_reason
+            )
             if self.stop_flag:
                 break
 
-            await self.wait_for_roi()
+            roi_reason, roi_price = await self.wait_for_roi()
+            if self.stop_flag:
+                break
+
+            buy_post_only = not (roi_price is not None and roi_reason in ('take_profit', 'stop_loss'))
+            await self.execute_cycle(
+                'buy',
+                limit_price=roi_price,
+                post_only=buy_post_only,
+                roi_reason=roi_reason
+            )
 
         self.logger.info("Trading loop finished")
 

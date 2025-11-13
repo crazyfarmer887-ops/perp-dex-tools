@@ -248,9 +248,16 @@ class GrvtClient(BaseExchangeClient):
 
         return best_bid, best_ask
 
-    async def place_post_only_order(self, contract_id: str, quantity: Decimal, price: Decimal,
-                                    side: str) -> OrderResult:
-        """Place a post only order with GRVT using official SDK."""
+    async def place_post_only_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        *,
+        post_only: bool = True,
+    ) -> OrderResult:
+        """Place a (post-only by default) limit order with GRVT using the official SDK."""
 
         # Place the order using GRVT SDK
         order_result = self.rest_client.create_limit_order(
@@ -259,7 +266,7 @@ class GrvtClient(BaseExchangeClient):
             amount=quantity,
             price=price,
             params={
-                'post_only': True,
+                'post_only': post_only,
                 'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
             }
         )
@@ -339,6 +346,97 @@ class GrvtClient(BaseExchangeClient):
             order_id = order_info.order_id
 
             if order_status == 'REJECTED':
+                continue
+            if order_status in ['OPEN', 'FILLED']:
+                return OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    side=direction,
+                    size=quantity,
+                    price=order_price,
+                    status=order_status
+                )
+            elif order_status == 'PENDING':
+                raise Exception("[OPEN] Order not processed after 10 seconds")
+            else:
+                raise Exception(f"[OPEN] Unexpected order status: {order_status}")
+
+    async def place_open_order_with_price(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        direction: str,
+        price: Decimal,
+        *,
+        post_only: bool = True,
+    ) -> OrderResult:
+        """Place an open order using a caller-provided limit price."""
+        attempt = 0
+        while True:
+            attempt += 1
+            if attempt % 5 == 0:
+                self.logger.log(f"[OPEN] Attempt {attempt} to place custom priced order", "INFO")
+                active_orders = await self.get_active_orders(contract_id)
+                active_open_orders = sum(
+                    1 for order in active_orders if order.side == self.config.direction
+                )
+                if active_open_orders > 1:
+                    self.logger.log(
+                        f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}",
+                        "ERROR"
+                    )
+                    raise Exception(f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}")
+
+            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+            if best_bid <= 0 or best_ask <= 0:
+                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+
+            tick = self.config.tick_size
+            order_price = self.round_to_tick(price)
+
+            if post_only:
+                if direction == 'buy':
+                    lower_bound = best_bid + tick
+                    upper_bound = best_ask - tick
+                    if upper_bound <= lower_bound:
+                        order_price = self.round_to_tick(best_ask - tick)
+                    else:
+                        order_price = min(max(order_price, lower_bound), upper_bound)
+                elif direction == 'sell':
+                    lower_bound = best_bid + tick
+                    upper_bound = best_ask - tick
+                    if upper_bound <= lower_bound:
+                        order_price = self.round_to_tick(best_bid + tick)
+                    else:
+                        order_price = max(min(order_price, upper_bound), lower_bound)
+                else:
+                    raise Exception(f"[OPEN] Invalid direction: {direction}")
+            else:
+                if order_price <= 0:
+                    return OrderResult(success=False, error_message='Invalid order price')
+
+            try:
+                order_info = await self.place_post_only_order(
+                    contract_id,
+                    quantity,
+                    order_price,
+                    direction,
+                    post_only=post_only
+                )
+            except Exception as e:
+                self.logger.log(f"[OPEN] Error placing custom priced order: {e}", "ERROR")
+                if attempt >= 5:
+                    return OrderResult(success=False, error_message=str(e))
+                await asyncio.sleep(0.1)
+                continue
+
+            order_status = order_info.status
+            order_id = order_info.order_id
+
+            if order_status == 'REJECTED':
+                if attempt >= 5:
+                    return OrderResult(success=False, error_message="Order rejected")
+                await asyncio.sleep(0.1)
                 continue
             if order_status in ['OPEN', 'FILLED']:
                 return OrderResult(
