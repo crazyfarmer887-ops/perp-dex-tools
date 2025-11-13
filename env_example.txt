@@ -25,6 +25,12 @@ GRVT_PRIVATE_KEY=your_private_key_here
 GRVT_API_KEY=your_api_key_here
 GRVT_ENVIRONMENT=prod # or testnet/staging/dev 
 
+# BingX Configuration
+# Create API keys under API Management
+BINGX_API_KEY=your_bingx_api_key
+BINGX_API_SECRET=your_bingx_api_secret
+BINGX_ENVIRONMENT=prod # or testnet
+
 # Aster Configuration
 ASTER_API_KEY=your_aster_api_key
 ASTER_SECRET_KEY=your_aster_secret_key
