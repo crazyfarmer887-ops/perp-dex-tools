@@ -5,12 +5,14 @@ import signal
 import sys
 import time
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exchanges.grvt import GrvtClient
 from exchanges.bingx import BingxClient
+
+from hedge.roi_utils import wait_for_roi_threshold
 
 
 class Config:
@@ -33,12 +35,20 @@ class HedgeBot:
         fill_timeout: int = 10,
         iterations: int = 10,
         sleep_time: int = 0,
+        tp_roi: Optional[Decimal] = None,
+        sl_roi: Optional[Decimal] = None,
+        roi_check_interval: float = 1.0,
+        roi_timeout: Optional[float] = None,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.tp_roi = tp_roi
+        self.sl_roi = sl_roi
+        self.roi_check_interval = roi_check_interval
+        self.roi_timeout = roi_timeout
 
         self.stop_flag = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -56,6 +66,9 @@ class HedgeBot:
 
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
+        self.last_fill_event = asyncio.Event()
+        self.last_fill_price: Optional[Decimal] = None
+        self.last_fill_side: Optional[str] = None
 
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/grvt_bingx_{self.ticker.lower()}_hedge_log.txt"
@@ -130,6 +143,11 @@ class HedgeBot:
     # Order handling
     # ------------------------------------------------------------------ #
 
+    async def fetch_grvt_bbo_prices(self) -> Tuple[Decimal, Decimal]:
+        assert self.grvt_client is not None
+        assert self.grvt_contract_id is not None
+        return await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+
     def _handle_grvt_order_update(self, message: Dict[str, Any]) -> None:
         if self.grvt_contract_id is None:
             return
@@ -200,6 +218,10 @@ class HedgeBot:
                 'size': order_result.size,
                 'price': order_result.price
             }
+            self.last_fill_price = order_result.price
+            self.last_fill_side = side
+            if not self.last_fill_event.is_set():
+                self.last_fill_event.set()
             return self.last_grvt_fill
 
         try:
@@ -211,7 +233,31 @@ class HedgeBot:
                 self.logger.error(f"[GRVT] Failed to cancel order {order_result.order_id}: {cancel_result.error_message}")
             return None
 
+        if self.last_grvt_fill:
+            self.last_fill_price = self.last_grvt_fill.get('price')
+            self.last_fill_side = self.last_grvt_fill.get('side')
+            if not self.last_fill_event.is_set():
+                self.last_fill_event.set()
+
         return self.last_grvt_fill
+
+    async def wait_for_last_fill(self, expected_side: Optional[str], timeout: Optional[float] = None) -> Optional[Decimal]:
+        """Wait for the latest GRVT fill captured by websocket."""
+        if timeout is None:
+            timeout = float(self.fill_timeout)
+        try:
+            await asyncio.wait_for(self.last_fill_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            self.logger.warning("Timeout waiting for GRVT fill confirmation")
+            return None
+
+        price = Decimal(str(self.last_fill_price)) if self.last_fill_price is not None else None
+        side = self.last_fill_side
+        self.last_fill_event.clear()
+
+        if expected_side and side != expected_side:
+            self.logger.warning(f"Expected fill side {expected_side}, but received {side}")
+        return price
 
     async def place_bingx_hedge(self, fill: Dict[str, Any]) -> None:
         assert self.bingx_client is not None
@@ -245,15 +291,17 @@ class HedgeBot:
             f"[BINGX] {hedge_side.upper()} {size} @ {result.price} | Position={self.bingx_position}"
         )
 
-    async def execute_cycle(self, side: str) -> None:
+    async def execute_cycle(self, side: str) -> Optional[Dict[str, Any]]:
         fill = await self.place_grvt_order(side)
         if not fill or self.stop_flag:
-            return
+            return None
 
         await self.place_bingx_hedge(fill)
 
         if self.sleep_time > 0 and not self.stop_flag:
             await asyncio.sleep(self.sleep_time)
+
+        return fill
 
     # ------------------------------------------------------------------ #
     # Main run loop
@@ -279,11 +327,33 @@ class HedgeBot:
             iteration += 1
             self.logger.info(f"----- Iteration {iteration}/{self.iterations} -----")
 
-            await self.execute_cycle('buy')
+            fill_buy = await self.execute_cycle('buy')
+            if self.stop_flag:
+                break
+
+            entry_avg_price = await self.wait_for_last_fill(expected_side='buy')
+
+            if fill_buy and entry_avg_price is not None and (self.tp_roi is not None or self.sl_roi is not None):
+                self.logger.info(f"Waiting for ROI thresholds based on entry price {entry_avg_price} before sell cycle")
+                trigger_reason = await wait_for_roi_threshold(
+                    tp_roi=self.tp_roi,
+                    sl_roi=self.sl_roi,
+                    entry_side='buy',
+                    avg_entry_price=entry_avg_price,
+                    fetch_bbo_prices=self.fetch_grvt_bbo_prices,
+                    logger=self.logger,
+                    check_interval=self.roi_check_interval,
+                    timeout=self.roi_timeout,
+                    stop_condition=lambda: self.stop_flag
+                )
+                if trigger_reason:
+                    self.logger.info(f"ROI wait finished due to: {trigger_reason}")
+
             if self.stop_flag:
                 break
 
             await self.execute_cycle('sell')
+            await self.wait_for_last_fill(expected_side='sell')
             if self.stop_flag:
                 break
 

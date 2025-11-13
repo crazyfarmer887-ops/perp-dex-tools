@@ -56,6 +56,10 @@ Examples:
                         help='Timeout in seconds for maker order fills (default: 5)')
     parser.add_argument('--sleep', type=int, default=0,
                         help='Sleep time in seconds after each step (default: 0)')
+    parser.add_argument('--tp-roi', type=Decimal, default=None,
+                        help='Target ROI percentage (e.g., 0.5 for 0.5%) to trigger take-profit before closing a hedge leg')
+    parser.add_argument('--sl-roi', type=Decimal, default=None,
+                        help='Negative ROI percentage threshold (positive number) to trigger stop-loss before closing a hedge leg')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
     
@@ -130,7 +134,9 @@ async def main():
             order_quantity=Decimal(args.size),
             fill_timeout=args.fill_timeout,
             iterations=args.iter,
-            sleep_time=args.sleep
+            sleep_time=args.sleep,
+            tp_roi=args.tp_roi,
+            sl_roi=args.sl_roi
         )
         
         # Run the bot

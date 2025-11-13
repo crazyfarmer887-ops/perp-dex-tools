@@ -10,7 +10,7 @@ import argparse
 import traceback
 import csv
 from decimal import Decimal
-from typing import Tuple
+from typing import Optional, Tuple
 
 from lighter.signer_client import SignerClient
 import sys
@@ -21,6 +21,8 @@ from exchanges.extended import ExtendedClient
 import websockets
 from datetime import datetime
 import pytz
+
+from hedge.roi_utils import wait_for_roi_threshold
 
 
 class Config:
@@ -33,16 +35,34 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on Extended and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0):
+    def __init__(
+        self,
+        ticker: str,
+        order_quantity: Decimal,
+        fill_timeout: int = 5,
+        iterations: int = 20,
+        sleep_time: int = 0,
+        tp_roi: Optional[Decimal] = None,
+        sl_roi: Optional[Decimal] = None,
+        roi_check_interval: float = 1.0,
+        roi_timeout: Optional[float] = None,
+    ):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.lighter_order_filled = False
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.tp_roi = tp_roi
+        self.sl_roi = sl_roi
+        self.roi_check_interval = roi_check_interval
+        self.roi_timeout = roi_timeout
         self.extended_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.current_order = {}
+        self.last_fill_event = asyncio.Event()
+        self.last_fill_price: Optional[Decimal] = None
+        self.last_fill_side: Optional[str] = None
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -783,8 +803,30 @@ class HedgeBot:
         }
 
         self.waiting_for_lighter_fill = True
+        self.last_fill_price = price
+        self.last_fill_side = side
+        if not self.last_fill_event.is_set():
+            self.last_fill_event.set()
 
         self.logger.info(f"📋 Ready to place Lighter order: {lighter_side} {filled_size} @ {price}")
+
+    async def wait_for_last_fill(self, expected_side: Optional[str], timeout: Optional[float] = None) -> Optional[Decimal]:
+        """Wait until the latest Extended fill is available via websocket."""
+        if timeout is None:
+            timeout = float(self.fill_timeout)
+        try:
+            await asyncio.wait_for(self.last_fill_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            self.logger.warning("Timeout waiting for Extended fill confirmation")
+            return None
+
+        price = self.last_fill_price
+        side = self.last_fill_side
+        self.last_fill_event.clear()
+
+        if expected_side and side != expected_side:
+            self.logger.warning(f"Expected fill side {expected_side}, but received {side}")
+        return price
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
         if not self.lighter_client:
@@ -1117,6 +1159,9 @@ class HedgeBot:
 
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
+            self.last_fill_event.clear()
+            self.last_fill_price = None
+            self.last_fill_side = None
             try:
                 # Determine side based on some logic (for now, alternate)
                 side = 'buy'
@@ -1126,6 +1171,7 @@ class HedgeBot:
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                 break
 
+            entry_avg_price = await self.wait_for_last_fill(expected_side='buy')
             start_time = time.time()
             while not self.order_execution_complete and not self.stop_flag:
                 # Check if Extended order filled and we need to place Lighter order
@@ -1145,6 +1191,25 @@ class HedgeBot:
             if self.stop_flag:
                 break
 
+            if entry_avg_price is not None and (self.tp_roi is not None or self.sl_roi is not None):
+                self.logger.info(f"Waiting for ROI thresholds based on entry price {entry_avg_price} before closing leg")
+                trigger_reason = await wait_for_roi_threshold(
+                    tp_roi=self.tp_roi,
+                    sl_roi=self.sl_roi,
+                    entry_side='buy',
+                    avg_entry_price=entry_avg_price,
+                    fetch_bbo_prices=self.fetch_extended_bbo_prices,
+                    logger=self.logger,
+                    check_interval=self.roi_check_interval,
+                    timeout=self.roi_timeout,
+                    stop_condition=lambda: self.stop_flag
+                )
+                if trigger_reason:
+                    self.logger.info(f"ROI wait finished due to: {trigger_reason}")
+
+            if self.stop_flag:
+                break
+
             # Sleep after step 1
             if self.sleep_time > 0:
                 self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 1...")
@@ -1154,6 +1219,9 @@ class HedgeBot:
             self.logger.info(f"[STEP 2] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
+            self.last_fill_event.clear()
+            self.last_fill_price = None
+            self.last_fill_side = None
             try:
                 # Determine side based on some logic (for now, alternate)
                 side = 'sell'
@@ -1162,6 +1230,8 @@ class HedgeBot:
                 self.logger.error(f"⚠️ Error in trading loop: {e}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                 break
+
+            await self.wait_for_last_fill(expected_side='sell')
 
             while not self.order_execution_complete and not self.stop_flag:
                 # Check if Extended order filled and we need to place Lighter order
@@ -1182,6 +1252,9 @@ class HedgeBot:
             self.logger.info(f"[STEP 3] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
+            self.last_fill_event.clear()
+            self.last_fill_price = None
+            self.last_fill_side = None
             if self.extended_position == 0:
                 continue
             elif self.extended_position > 0:
@@ -1198,6 +1271,7 @@ class HedgeBot:
                 break
 
             # Wait for order to be filled via WebSocket
+            await self.wait_for_last_fill(expected_side=side)
             while not self.order_execution_complete and not self.stop_flag:
                 # Check if Extended order filled and we need to place Lighter order
                 if self.waiting_for_lighter_fill:
@@ -1241,5 +1315,9 @@ def parse_arguments():
                         help='Timeout in seconds for maker order fills (default: 5)')
     parser.add_argument('--sleep', type=int, default=0,
                         help='Sleep time in seconds after each step (default: 0)')
+    parser.add_argument('--tp-roi', type=Decimal, default=None,
+                        help='Target ROI percentage (e.g., 0.5 for 0.5%) to trigger take-profit before closing a hedge leg')
+    parser.add_argument('--sl-roi', type=Decimal, default=None,
+                        help='Negative ROI percentage threshold (positive number) to trigger stop-loss before closing a hedge leg')
 
     return parser.parse_args()

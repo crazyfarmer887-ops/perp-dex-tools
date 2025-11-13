@@ -276,6 +276,8 @@ The new Hedge Mode (`hedge_mode.py`) is an trading strategy that reduces risk by
 3. **Closing Phase**: Place another maker order at selected exchange to close position
 4. **Hedge Closing**: Place market order at the hedge venue to close hedge position
 
+> **ROI-based exit**: Supplying `--tp-roi` and/or `--sl-roi` makes the bot wait for the configured ROI (relative to the weighted average entry price on the primary venue) before moving from the open leg to the closing leg of each cycle.
+
 ### Hedge Mode Usage Examples
 
 ```bash
@@ -306,6 +308,8 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 - `--iter`: Number of trading cycles
 - `--fill-timeout`: Maker order fill timeout in seconds (default: 5)
 - `--sleep`: Sleep time in seconds after each step (default: 0)
+- `--tp-roi`: Optional take-profit ROI percentage (e.g., `0.5` for +0.5%). When set, the bot waits for the primary venue to reach this ROI (relative to the average entry price) before proceeding to the closing leg.
+- `--sl-roi`: Optional stop-loss ROI percentage (positive number). When set, the bot waits for the ROI to drop to `-sl-roi`% before proceeding to the closing leg, allowing you to cap downside on each hedge cycle.
 
 ## Configuration
 
