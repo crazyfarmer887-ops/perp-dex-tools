@@ -8,7 +8,7 @@
 
 ## Multi-Exchange Trading Bot
 
-A modular trading bot that supports multiple exchanges including EdgeX, Backpack, Paradex, Aster, Lighter, GRVT, and Extended. The bot implements an automated strategy that places orders and automatically closes them at a profit.
+A modular trading bot that supports multiple exchanges including EdgeX, Backpack, Paradex, Aster, Lighter, GRVT, Extended, and BingX. The bot implements an automated strategy that places orders and automatically closes them at a profit.
 
 ## Referral Links (Enjoy fee rebates and benefits)
 
@@ -272,9 +272,9 @@ The new Hedge Mode (`hedge_mode.py`) is an trading strategy that reduces risk by
 ### How Hedge Mode Works
 
 1. **Opening Phase**: Place maker order at selected exchange (e.g., Backpack)
-2. **Hedging Phase**: After order fills, immediately place market order at Lighter to hedge
+2. **Hedging Phase**: After order fills, immediately place a market order on the hedging venue (Lighter or BingX) to offset exposure
 3. **Closing Phase**: Place another maker order at selected exchange to close position
-4. **Hedge Closing**: Place market order at Lighter to close hedge position
+4. **Hedge Closing**: Place market order at the hedging venue to close the offsetting position
 
 ### Hedge Mode Usage Examples
 
@@ -293,11 +293,14 @@ python hedge_mode.py --exchange grvt --ticker BTC --size 0.05 --iter 20
 
 # Run BTC hedge mode with edgeX
 python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
+
+# Run BTC hedge mode with GRVT + BingX
+python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 20
 ```
 
 ### Hedge Mode Parameters
 
-- `--exchange`: Primary exchange (supports 'backpack', 'extended', 'apex', 'grvt', 'edgex')
+- `--exchange`: Primary exchange (supports 'backpack', 'extended', 'apex', 'grvt', 'edgex', 'grvt_bingx')
 - `--ticker`: Trading pair symbol (e.g., BTC, ETH)
 - `--size`: Order quantity per trade
 - `--iter`: Number of trading cycles
@@ -350,6 +353,14 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 - `GRVT_TRADING_ACCOUNT_ID`: Your GRVT trading account ID
 - `GRVT_PRIVATE_KEY`: Your GRVT private key
 - `GRVT_API_KEY`: Your GRVT API key
+
+#### BingX Configuration
+
+- `BINGX_API_KEY`: Your BingX API key
+- `BINGX_SECRET_KEY`: Your BingX API secret
+- `BINGX_TESTNET`: Optional flag (`true`/`false`) to enable BingX sandbox mode (default: `false`)
+- `BINGX_RECV_WINDOW`: Optional recvWindow value in milliseconds (default: `5000`)
+- `BINGX_ORDER_POLL_INTERVAL`: Optional order polling interval in seconds for status updates (default: `1`)
 
 #### Extended Configuration
 

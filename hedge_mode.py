@@ -14,6 +14,7 @@ Supported exchanges:
     - apex: Uses HedgeBot from hedge_mode_apex.py (Apex + Lighter)
     - grvt: Uses HedgeBot from hedge_mode_grvt.py (GRVT + Lighter)
     - edgex: Uses HedgeBot from hedge_mode_edgex.py (edgeX + Lighter)
+    - grvt_bingx: Uses HedgeBot from hedge_mode_grvt_bingx.py (GRVT + BingX)
 
 Cross-platform compatibility:
     - Works on Linux, macOS, and Windows
@@ -39,11 +40,12 @@ Examples:
     python hedge_mode.py --exchange apex --ticker BTC --size 0.002 --iter 10
     python hedge_mode.py --exchange grvt --ticker BTC --size 0.05 --iter 10
     python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
+    python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 10
         """
     )
     
     parser.add_argument('--exchange', type=str, required=True,
-                        help='Exchange to use (backpack, extended, apex, grvt, or edgex)')
+                        help='Exchange to use (backpack, extended, apex, grvt, edgex, grvt_bingx)')
     parser.add_argument('--ticker', type=str, default='BTC',
                         help='Ticker symbol (default: BTC)')
     parser.add_argument('--size', type=str, required=True,
@@ -62,7 +64,7 @@ Examples:
 
 def validate_exchange(exchange):
     """Validate that the exchange is supported."""
-    supported_exchanges = ['backpack', 'extended', 'apex', 'grvt', 'edgex']
+    supported_exchanges = ['backpack', 'extended', 'apex', 'grvt', 'edgex', 'grvt_bingx']
     if exchange.lower() not in supported_exchanges:
         print(f"Error: Unsupported exchange '{exchange}'")
         print(f"Supported exchanges: {', '.join(supported_exchanges)}")
@@ -86,6 +88,9 @@ def get_hedge_bot_class(exchange):
             return HedgeBot
         elif exchange.lower() == 'edgex':
             from hedge.hedge_mode_edgex import HedgeBot
+            return HedgeBot
+        elif exchange.lower() == 'grvt_bingx':
+            from hedge.hedge_mode_grvt_bingx import HedgeBot
             return HedgeBot
         else:
             raise ValueError(f"Unsupported exchange: {exchange}")

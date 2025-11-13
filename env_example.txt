@@ -25,6 +25,15 @@ GRVT_PRIVATE_KEY=your_private_key_here
 GRVT_API_KEY=your_api_key_here
 GRVT_ENVIRONMENT=prod # or testnet/staging/dev 
 
+# BingX Configuration
+# Find these in your BingX account API management
+BINGX_API_KEY=your_bingx_api_key
+BINGX_SECRET_KEY=your_bingx_api_secret
+# Optional BingX settings
+BINGX_TESTNET=false
+BINGX_RECV_WINDOW=5000
+BINGX_ORDER_POLL_INTERVAL=1
+
 # Aster Configuration
 ASTER_API_KEY=your_aster_api_key
 ASTER_SECRET_KEY=your_aster_secret_key

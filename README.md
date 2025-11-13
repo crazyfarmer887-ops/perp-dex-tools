@@ -12,7 +12,7 @@
 
 ## 自动交易机器人
 
-一个支持多个交易所（目前包括 EdgeX, Backpack, Paradex, Aster, Lighter, grvt, Extended）的模块化交易机器人。该机器人实现了自动下单并在盈利时自动平仓的策略，主要目的是取得高交易量。
+一个支持多个交易所（目前包括 EdgeX, Backpack, Paradex, Aster, Lighter, grvt, Extended, BingX）的模块化交易机器人。该机器人实现了自动下单并在盈利时自动平仓的策略，主要目的是取得高交易量。
 
 ## 邀请链接 (获得返佣以及福利)
 
@@ -291,9 +291,9 @@ python runbot.py --exchange extended --ticker ETH --quantity 0.1 --take-profit 0
 ### 对冲模式工作原理
 
 1. **开仓阶段**：在选定交易所（如 Backpack）下 maker 订单
-2. **对冲阶段**：订单成交后，立即在 Lighter 下市价订单进行对冲
+2. **对冲阶段**：订单成交后，立即在对冲交易所（Lighter 或 BingX）下市价单进行对冲
 3. **平仓阶段**：在选定交易所下另一个 maker 订单平仓
-4. **对冲平仓**：在 Lighter 下市价订单平仓
+4. **对冲平仓**：在对冲交易所下市价订单平掉对冲头寸
 
 ### 对冲模式优势
 
@@ -319,11 +319,14 @@ python hedge_mode.py --exchange grvt --ticker BTC --size 0.05 --iter 20
 
 # 运行 BTC 对冲模式（edgeX）
 python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
+
+# 运行 BTC 对冲模式（GRVT + BingX）
+python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 20
 ```
 
 ### 对冲模式参数
 
-- `--exchange`: 主要交易所（支持 'backpack', 'extended', 'apex', 'grvt', 'edgex'）
+- `--exchange`: 主要交易所（支持 'backpack', 'extended', 'apex', 'grvt', 'edgex', 'grvt_bingx'）
 - `--ticker`: 交易对符号（如 BTC, ETH）
 - `--size`: 每笔订单数量
 - `--iter`: 交易循环次数
@@ -376,6 +379,14 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 - `GRVT_TRADING_ACCOUNT_ID`: 您的 GRVT 交易账户 ID
 - `GRVT_PRIVATE_KEY`: 您的 GRVT 私钥
 - `GRVT_API_KEY`: 您的 GRVT API 密钥
+
+#### BingX 配置
+
+- `BINGX_API_KEY`: 您的 BingX API Key
+- `BINGX_SECRET_KEY`: 您的 BingX API Secret
+- `BINGX_TESTNET`: 可选，设置为 `true`/`false` 启用 BingX 测试网（默认 `false`）
+- `BINGX_RECV_WINDOW`: 可选，自定义 recvWindow 数值（毫秒，默认 `5000`）
+- `BINGX_ORDER_POLL_INTERVAL`: 可选，订单状态轮询间隔（秒，默认 `1`）
 
 #### Extended 配置
 
