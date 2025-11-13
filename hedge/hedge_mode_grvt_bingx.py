@@ -33,12 +33,14 @@ class HedgeBot:
         fill_timeout: int = 10,
         iterations: int = 10,
         sleep_time: int = 0,
+        position_hold_time: int = 0,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.position_hold_time = position_hold_time
 
         self.stop_flag = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -282,6 +284,12 @@ class HedgeBot:
             await self.execute_cycle('buy')
             if self.stop_flag:
                 break
+
+            if self.position_hold_time > 0 and not self.stop_flag:
+                self.logger.info(f"⏳ Holding position for {self.position_hold_time} seconds before reversing side...")
+                await asyncio.sleep(self.position_hold_time)
+                if self.stop_flag:
+                    break
 
             await self.execute_cycle('sell')
             if self.stop_flag:

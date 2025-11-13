@@ -25,12 +25,13 @@ dotenv.load_dotenv()
 class HedgeBot:
     """Trading bot that places post-only orders on edgeX and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0):
+    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, iterations: int = 20, sleep_time: int = 0, position_hold_time: int = 0):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
         self.iterations = iterations
         self.sleep_time = sleep_time
+        self.position_hold_time = position_hold_time
         self.edgex_position = Decimal('0')
         self.lighter_position = Decimal('0')
         self.edgex_client_order_id = ''
@@ -1159,10 +1160,18 @@ class HedgeBot:
             if self.stop_flag:
                 break
 
+            if self.position_hold_time > 0:
+                self.logger.info(f"⏳ Holding position for {self.position_hold_time} seconds before closing...")
+                await asyncio.sleep(self.position_hold_time)
+                if self.stop_flag:
+                    break
+
             # Sleep after step 1
             if self.sleep_time > 0:
                 self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 1...")
                 await asyncio.sleep(self.sleep_time)
+                if self.stop_flag:
+                    break
 
             # Close position
             self.logger.info(f"[STEP 2] EdgeX position: {self.edgex_position} | Lighter position: {self.lighter_position}")
@@ -1253,6 +1262,8 @@ def parse_arguments():
                         help='Timeout in seconds for maker order fills (default: 5)')
     parser.add_argument('--sleep', type=int, default=0,
                         help='Sleep time in seconds after each step (default: 0)')
+    parser.add_argument('--hold-time', type=int, default=0,
+                        help='Time in seconds to hold positions before closing (default: 0)')
 
     return parser.parse_args()
 
@@ -1267,7 +1278,8 @@ async def main():
         order_quantity=Decimal(args.size),
         fill_timeout=args.fill_timeout,
         iterations=args.iter,
-        sleep_time=args.sleep
+        sleep_time=args.sleep,
+        position_hold_time=args.hold_time
     )
 
     await bot.run()
