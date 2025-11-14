@@ -148,13 +148,22 @@ class BingxClient(BaseExchangeClient):
         side: str,
         price: Decimal,
         *,
-        reduce_only: bool = False
+        reduce_only: bool = False,
+        post_only: Optional[bool] = True,
+        time_in_force: Optional[str] = None,
+        extra_params: Optional[Dict[str, Any]] = None
     ) -> OrderResult:
-        params = {
-            'timeInForce': 'PO',  # post-only if supported
-            'postOnly': True,
-            'reduceOnly': reduce_only
-        }
+        params: Dict[str, Any] = {'reduceOnly': reduce_only}
+
+        if post_only is not None:
+            params['postOnly'] = post_only
+            if post_only and not time_in_force:
+                time_in_force = 'PO'
+        if time_in_force:
+            params['timeInForce'] = time_in_force
+
+        if extra_params:
+            params.update({k: v for k, v in extra_params.items() if v is not None})
 
         order_price = self.round_to_tick(price)
         amount_str = self._quantize_amount(quantity)
@@ -175,6 +184,7 @@ class BingxClient(BaseExchangeClient):
 
         order_id = order.get('id')
         status = self._normalize_status(order.get('status', 'OPEN'))
+        filled_amount = _to_decimal(order.get('filled', 0))
 
         if not order_id:
             return OrderResult(success=False, error_message="No order id returned from BingX")
@@ -183,7 +193,7 @@ class BingxClient(BaseExchangeClient):
             'status': status,
             'symbol': contract_id,
             'side': side,
-            'last_filled': _to_decimal(order.get('filled', 0))
+            'last_filled': filled_amount
         }
 
         return OrderResult(
@@ -192,7 +202,8 @@ class BingxClient(BaseExchangeClient):
             side=side,
             size=quantity,
             price=order_price,
-            status=status
+            status=status,
+            filled_size=filled_amount
         )
 
     @query_retry(default_return=(Decimal('0'), Decimal('0')))
@@ -238,7 +249,9 @@ class BingxClient(BaseExchangeClient):
             quantity=quantity,
             side=direction,
             price=order_price,
-            reduce_only=False
+            reduce_only=False,
+            post_only=True,
+            time_in_force='PO'
         )
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
@@ -259,7 +272,40 @@ class BingxClient(BaseExchangeClient):
             quantity=quantity,
             side=side.lower(),
             price=adjusted_price,
-            reduce_only=True
+            reduce_only=True,
+            post_only=True,
+            time_in_force='PO'
+        )
+
+    async def place_limit_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        side: str,
+        price: Decimal,
+        *,
+        reduce_only: bool = False,
+        post_only: bool = False,
+        time_in_force: Optional[str] = None,
+        take_profit_price: Optional[Decimal] = None,
+        stop_loss_price: Optional[Decimal] = None
+    ) -> OrderResult:
+        extra_params: Dict[str, Any] = {}
+
+        if take_profit_price is not None:
+            extra_params['takeProfitPrice'] = str(self.round_to_tick(take_profit_price))
+        if stop_loss_price is not None:
+            extra_params['stopLossPrice'] = str(self.round_to_tick(stop_loss_price))
+
+        return await self._create_limit_order(
+            contract_id=contract_id,
+            quantity=quantity,
+            side=side,
+            price=price,
+            reduce_only=reduce_only,
+            post_only=post_only,
+            time_in_force=time_in_force,
+            extra_params=extra_params
         )
 
     async def place_market_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
