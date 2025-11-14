@@ -351,7 +351,11 @@ class HedgeBot:
                             size,
                             remaining
                         )
-                        market_remaining = await self._place_bingx_market_hedge(remaining, hedge_side)
+                        market_remaining = await self._place_bingx_market_hedge(
+                            remaining,
+                            hedge_side,
+                            entry_price
+                        )
                         if market_remaining is not None:
                             executed_orders.append(('market', market_remaining))
                             filled_market_remaining = self._extract_filled_size(market_remaining)
@@ -362,7 +366,7 @@ class HedgeBot:
                 self.logger.info("[BINGX] Limit hedge unavailable; falling back to market order.")
 
         if self.bingx_hedge_order_type != 'limit' and total_executed == 0:
-            market_result = await self._place_bingx_market_hedge(size, hedge_side)
+            market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
             if market_result is not None:
                 executed_orders.append(('market', market_result))
                 filled_market = self._extract_filled_size(market_result)
@@ -371,7 +375,7 @@ class HedgeBot:
                 total_executed += filled_market
         elif total_executed == 0:
             # Limit mode but nothing executed yet (e.g., limit failed completely)
-            market_result = await self._place_bingx_market_hedge(size, hedge_side)
+            market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
             if market_result is not None:
                 executed_orders.append(('market', market_result))
                 filled_market = self._extract_filled_size(market_result)
@@ -408,20 +412,35 @@ class HedgeBot:
             self.bingx_position
         )
 
-    async def _place_bingx_market_hedge(self, quantity: Decimal, hedge_side: str):
+    async def _place_bingx_market_hedge(
+        self,
+        quantity: Decimal,
+        hedge_side: str,
+        entry_price: Optional[Decimal]
+    ):
         assert self.bingx_client is not None
         assert self.bingx_contract_id is not None
 
         if quantity <= 0:
             return None
 
-        self.logger.info("[BINGX] Hedging %s %s via market order", hedge_side, quantity)
+        take_profit_price, stop_loss_price = self._compute_tp_sl_targets(hedge_side, entry_price)
+        self.logger.info(
+            "[BINGX] Hedging %s %s via market order (tp=%s, sl=%s)",
+            hedge_side,
+            quantity,
+            take_profit_price,
+            stop_loss_price
+        )
 
         try:
             result = await self.bingx_client.place_market_order(
                 contract_id=self.bingx_contract_id,
                 quantity=quantity,
-                side=hedge_side
+                side=hedge_side,
+                take_profit_price=take_profit_price,
+                stop_loss_price=stop_loss_price,
+                tp_sl_order_type='limit'
             )
         except Exception as exc:
             self.logger.error(f"[BINGX] Market hedge exception: {exc}")
@@ -432,6 +451,45 @@ class HedgeBot:
             return None
 
         return result
+
+    def _compute_tp_sl_targets(
+        self,
+        hedge_side: str,
+        entry_price: Optional[Decimal]
+    ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        if not self.bingx_attach_tp_sl:
+            return None, None
+
+        if entry_price is None or entry_price <= 0:
+            self.logger.warning("⚠️ Cannot compute BingX TP/SL due to invalid entry price.")
+            return None, None
+
+        hundred = Decimal('100')
+        take_profit_price: Optional[Decimal] = None
+        stop_loss_price: Optional[Decimal] = None
+
+        if self.tp_roi is not None:
+            tp_factor = self.tp_roi / hundred
+            if hedge_side == 'sell':
+                take_profit_price = entry_price * (Decimal('1') - tp_factor)
+            else:
+                take_profit_price = entry_price * (Decimal('1') + tp_factor)
+
+        if self.sl_roi is not None:
+            sl_factor = self.sl_roi / hundred
+            if hedge_side == 'sell':
+                stop_loss_price = entry_price * (Decimal('1') + sl_factor)
+            else:
+                stop_loss_price = entry_price * (Decimal('1') - sl_factor)
+
+        if take_profit_price is not None and take_profit_price <= 0:
+            self.logger.warning("⚠️ Computed BingX take-profit price is non-positive; ignoring TP.")
+            take_profit_price = None
+        if stop_loss_price is not None and stop_loss_price <= 0:
+            self.logger.warning("⚠️ Computed BingX stop-loss price is non-positive; ignoring SL.")
+            stop_loss_price = None
+
+        return take_profit_price, stop_loss_price
 
     async def _place_bingx_limit_hedge(
         self,
@@ -469,29 +527,7 @@ class HedgeBot:
             self.logger.warning("[BINGX] Computed limit hedge price is non-positive; skipping limit hedge.")
             return None
 
-        take_profit_price: Optional[Decimal] = None
-        stop_loss_price: Optional[Decimal] = None
-        if self.bingx_attach_tp_sl and entry_price and entry_price > 0:
-            hundred = Decimal('100')
-            if self.tp_roi is not None:
-                tp_factor = self.tp_roi / hundred
-                if hedge_side == 'sell':
-                    take_profit_price = entry_price * (Decimal('1') - tp_factor)
-                else:
-                    take_profit_price = entry_price * (Decimal('1') + tp_factor)
-            if self.sl_roi is not None:
-                sl_factor = self.sl_roi / hundred
-                if hedge_side == 'sell':
-                    stop_loss_price = entry_price * (Decimal('1') + sl_factor)
-                else:
-                    stop_loss_price = entry_price * (Decimal('1') - sl_factor)
-
-            if take_profit_price is not None and take_profit_price <= 0:
-                self.logger.warning("⚠️ Computed BingX take-profit price is non-positive; ignoring TP.")
-                take_profit_price = None
-            if stop_loss_price is not None and stop_loss_price <= 0:
-                self.logger.warning("⚠️ Computed BingX stop-loss price is non-positive; ignoring SL.")
-                stop_loss_price = None
+        take_profit_price, stop_loss_price = self._compute_tp_sl_targets(hedge_side, entry_price)
 
         time_in_force = self.bingx_hedge_time_in_force
         if time_in_force and time_in_force.upper() == 'PO':
@@ -519,7 +555,8 @@ class HedgeBot:
                 post_only=False,
                 time_in_force=time_in_force,
                 take_profit_price=take_profit_price,
-                stop_loss_price=stop_loss_price
+                stop_loss_price=stop_loss_price,
+                tp_sl_order_type='limit'
             )
         except Exception as exc:
             self.logger.error(f"[BINGX] Limit hedge exception: {exc}")

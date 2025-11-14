@@ -125,6 +125,48 @@ class BingxClient(BaseExchangeClient):
         step = Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
         return str(amount.quantize(step, rounding=ROUND_HALF_UP))
 
+    def _build_tp_sl_payload(
+        self,
+        order_kind: str,
+        quantity: Decimal,
+        price: Decimal,
+        order_type: str
+    ) -> Dict[str, Any]:
+        """
+        Build BingX-attached TP/SL payloads for ccxt create_order params.
+        """
+        normalized_kind = order_kind.strip().lower()
+        normalized_type = (order_type or 'market').strip().lower()
+
+        if normalized_kind not in {'take_profit', 'stop_loss'}:
+            raise ValueError(f"Unsupported order_kind '{order_kind}' for TP/SL payload.")
+        if normalized_type not in {'limit', 'market'}:
+            raise ValueError(f"Unsupported TP/SL order_type '{order_type}'.")
+
+        rounded_price = self.round_to_tick(price)
+        price_str = str(rounded_price)
+        quantity_str = self._quantize_amount(quantity)
+
+        type_mapping = {
+            ('take_profit', 'limit'): 'TAKE_PROFIT',
+            ('take_profit', 'market'): 'TAKE_PROFIT_MARKET',
+            ('stop_loss', 'limit'): 'STOP',
+            ('stop_loss', 'market'): 'STOP_MARKET',
+        }
+        payload_type = type_mapping[(normalized_kind, normalized_type)]
+
+        payload: Dict[str, Any] = {
+            'stopPrice': price_str,
+            'type': payload_type,
+            'quantity': quantity_str,
+            'workingType': 'MARK_PRICE'
+        }
+
+        if normalized_type == 'limit':
+            payload['price'] = price_str
+
+        return payload
+
     def _normalize_status(self, status: Optional[str]) -> str:
         if not status:
             return "UNKNOWN"
@@ -288,14 +330,26 @@ class BingxClient(BaseExchangeClient):
         post_only: bool = False,
         time_in_force: Optional[str] = None,
         take_profit_price: Optional[Decimal] = None,
-        stop_loss_price: Optional[Decimal] = None
+        stop_loss_price: Optional[Decimal] = None,
+        tp_sl_order_type: str = 'market'
     ) -> OrderResult:
         extra_params: Dict[str, Any] = {}
+        tp_sl_mode = 'limit' if (tp_sl_order_type or '').strip().lower() == 'limit' else 'market'
 
         if take_profit_price is not None:
-            extra_params['takeProfitPrice'] = str(self.round_to_tick(take_profit_price))
+            extra_params['takeProfit'] = self._build_tp_sl_payload(
+                'take_profit',
+                quantity,
+                take_profit_price,
+                tp_sl_mode
+            )
         if stop_loss_price is not None:
-            extra_params['stopLossPrice'] = str(self.round_to_tick(stop_loss_price))
+            extra_params['stopLoss'] = self._build_tp_sl_payload(
+                'stop_loss',
+                quantity,
+                stop_loss_price,
+                tp_sl_mode
+            )
 
         return await self._create_limit_order(
             contract_id=contract_id,
@@ -308,9 +362,34 @@ class BingxClient(BaseExchangeClient):
             extra_params=extra_params
         )
 
-    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
+    async def place_market_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        side: str,
+        *,
+        take_profit_price: Optional[Decimal] = None,
+        stop_loss_price: Optional[Decimal] = None,
+        tp_sl_order_type: str = 'market'
+    ) -> OrderResult:
         amount_str = self._quantize_amount(quantity)
-        params = {'reduceOnly': side.lower() == self.config.close_order_side}
+        params: Dict[str, Any] = {'reduceOnly': side.lower() == self.config.close_order_side}
+        tp_sl_mode = 'limit' if (tp_sl_order_type or '').strip().lower() == 'limit' else 'market'
+
+        if take_profit_price is not None:
+            params['takeProfit'] = self._build_tp_sl_payload(
+                'take_profit',
+                quantity,
+                take_profit_price,
+                tp_sl_mode
+            )
+        if stop_loss_price is not None:
+            params['stopLoss'] = self._build_tp_sl_payload(
+                'stop_loss',
+                quantity,
+                stop_loss_price,
+                tp_sl_mode
+            )
 
         try:
             order = await self.exchange.create_order(
