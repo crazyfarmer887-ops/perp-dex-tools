@@ -94,6 +94,24 @@ class HedgeBot:
             config_warnings.append(f"{label}='{value}' is invalid; ignoring.")
             return None
 
+        def _coerce_int(value: Any, default: int, label: str) -> int:
+            if value is None:
+                return default
+            try:
+                return int(str(value))
+            except (ValueError, TypeError):
+                config_warnings.append(f"{label}='{value}' is invalid; falling back to {default}.")
+                return default
+
+        def _coerce_float(value: Any, default: float, label: str) -> float:
+            if value is None:
+                return default
+            try:
+                return float(str(value))
+            except (ValueError, TypeError):
+                config_warnings.append(f"{label}='{value}' is invalid; falling back to {default}.")
+                return default
+
         order_type_source = bingx_order_type or os.getenv('BINGX_HEDGE_ORDER_TYPE') or 'market'
         order_type_value = order_type_source.strip().lower()
         if order_type_value not in {'market', 'limit'}:
@@ -131,6 +149,51 @@ class HedgeBot:
             else:
                 attach_value = env_attach
         self.bingx_attach_tp_sl = attach_value
+
+        default_cycle_retry_delay = float(self.sleep_time) if self.sleep_time > 0 else 3.0
+        self.cycle_retry_delay = max(
+            0.5,
+            _coerce_float(
+                os.getenv('GRVT_BINGX_CYCLE_RETRY_DELAY'),
+                default_cycle_retry_delay,
+                'GRVT_BINGX_CYCLE_RETRY_DELAY'
+            )
+        )
+        self.max_cycle_retries = _coerce_int(
+            os.getenv('GRVT_BINGX_MAX_CYCLE_RETRIES'),
+            3,
+            'GRVT_BINGX_MAX_CYCLE_RETRIES'
+        )
+        if self.max_cycle_retries < 0:
+            config_warnings.append(
+                f"GRVT_BINGX_MAX_CYCLE_RETRIES='{self.max_cycle_retries}' is invalid; using 0 (no limit)."
+            )
+            self.max_cycle_retries = 0
+
+        self.hedge_retry_delay = max(
+            0.5,
+            _coerce_float(
+                os.getenv('GRVT_BINGX_HEDGE_RETRY_DELAY'),
+                1.0,
+                'GRVT_BINGX_HEDGE_RETRY_DELAY'
+            )
+        )
+        self.max_hedge_retries = _coerce_int(
+            os.getenv('GRVT_BINGX_MAX_HEDGE_RETRIES'),
+            3,
+            'GRVT_BINGX_MAX_HEDGE_RETRIES'
+        )
+        if self.max_hedge_retries < 0:
+            config_warnings.append(
+                f"GRVT_BINGX_MAX_HEDGE_RETRIES='{self.max_hedge_retries}' is invalid; using 0 (no limit)."
+            )
+            self.max_hedge_retries = 0
+
+        self.position_tolerance = _coerce_decimal(
+            os.getenv('GRVT_BINGX_POSITION_TOLERANCE'),
+            Decimal('0'),
+            'GRVT_BINGX_POSITION_TOLERANCE'
+        )
 
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
@@ -306,7 +369,7 @@ class HedgeBot:
 
         return self.last_grvt_fill
 
-    async def place_bingx_hedge(self, fill: Dict[str, Any]) -> None:
+    async def place_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
         assert self.bingx_client is not None
         assert self.bingx_contract_id is not None
 
@@ -315,10 +378,10 @@ class HedgeBot:
             size = Decimal(str(fill['size']))
         except (InvalidOperation, ValueError, TypeError):
             self.logger.error(f"[BINGX] Invalid hedge size from fill: {fill.get('size')}")
-            return
+            return False
         if size <= 0:
             self.logger.warning("[BINGX] Hedge size is non-positive; skipping hedge.")
-            return
+            return False
 
         hedge_side = 'sell' if side == 'buy' else 'buy'
         self.bingx_client.config.direction = hedge_side
@@ -385,7 +448,7 @@ class HedgeBot:
 
         if total_executed <= 0:
             self.logger.error("[BINGX] Failed to execute hedge order for %s %s.", hedge_side, size)
-            return
+            return False
 
         for order_type, order_result in executed_orders:
             filled_size = self._extract_filled_size(order_result)
@@ -411,6 +474,37 @@ class HedgeBot:
             total_executed,
             self.bingx_position
         )
+        return True
+
+    async def _ensure_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
+        attempts = 0
+        while not self.stop_flag:
+            attempts += 1
+
+            hedge_success = await self.place_bingx_hedge(fill)
+            if hedge_success:
+                return True
+
+            self.logger.warning(
+                "[BINGX] Hedge attempt %s failed for %s %s. GRVT position=%s | BingX position=%s",
+                attempts,
+                fill.get('side'),
+                fill.get('size'),
+                self.grvt_position,
+                self.bingx_position
+            )
+
+            if self.max_hedge_retries > 0 and attempts >= self.max_hedge_retries:
+                self.logger.error(
+                    "Exceeded max BingX hedge retries (%s); stopping to avoid unhedged exposure.",
+                    self.max_hedge_retries
+                )
+                self.stop_flag = True
+                return False
+
+            await asyncio.sleep(self.hedge_retry_delay)
+
+        return False
 
     async def _place_bingx_market_hedge(
         self,
@@ -677,6 +771,13 @@ class HedgeBot:
             f"📌 Scheduling next GRVT {side.upper()} order @ {rounded_price} due to {trigger.replace('_', ' ')}"
         )
 
+    def _positions_are_flat(self) -> bool:
+        tolerance = self.position_tolerance
+        return (
+            abs(self.grvt_position) <= tolerance and
+            abs(self.bingx_position) <= tolerance
+        )
+
     async def wait_for_roi(self) -> None:
         if self.stop_flag:
             return
@@ -740,7 +841,7 @@ class HedgeBot:
 
             await asyncio.sleep(self.roi_poll_interval)
 
-    async def execute_cycle(self, side: str) -> None:
+    async def execute_cycle(self, side: str) -> bool:
         price_override = None
         if self.pending_grvt_price and self.pending_grvt_price[0] == side:
             price_override = self.pending_grvt_price[1]
@@ -748,16 +849,54 @@ class HedgeBot:
         fill = await self.place_grvt_order(side, price_override=price_override)
         if not fill or self.stop_flag:
             self._reset_entry_state()
-            return
+            return False
 
         if price_override is not None and self.pending_grvt_price and self.pending_grvt_price[0] == side:
             self.pending_grvt_price = None
 
         self._register_entry(fill)
-        await self.place_bingx_hedge(fill)
+        hedge_success = await self._ensure_bingx_hedge(fill)
+        if not hedge_success:
+            self.logger.error(
+                "Unable to complete BingX hedge for GRVT %s fill; halting cycle to avoid exposure.",
+                side.upper()
+            )
+            self._reset_entry_state()
+            return False
 
         if self.sleep_time > 0 and not self.stop_flag:
             await asyncio.sleep(self.sleep_time)
+
+        return True
+
+    async def _run_cycle_phase(self, side: str) -> bool:
+        attempt = 0
+        while not self.stop_flag:
+            attempt += 1
+            success = await self.execute_cycle(side)
+            if success:
+                return True
+
+            self.logger.warning(
+                "Cycle %s attempt %s failed; GRVT position=%s | BingX position=%s",
+                side.upper(),
+                attempt,
+                self.grvt_position,
+                self.bingx_position
+            )
+
+            if self.max_cycle_retries > 0 and attempt >= self.max_cycle_retries:
+                self.logger.error(
+                    "Exceeded max retries (%s) for %s cycle; stopping to prevent compounding positions.",
+                    self.max_cycle_retries,
+                    side.upper()
+                )
+                self.stop_flag = True
+                return False
+
+            await asyncio.sleep(self.cycle_retry_delay)
+
+        return False
 
     # ------------------------------------------------------------------ #
     # Main run loop
@@ -783,19 +922,31 @@ class HedgeBot:
             iteration += 1
             self.logger.info(f"----- Iteration {iteration}/{self.iterations} -----")
 
-            await self.execute_cycle('buy')
-            if self.stop_flag:
+            buy_completed = await self._run_cycle_phase('buy')
+            if self.stop_flag or not buy_completed:
                 break
 
             await self.wait_for_roi()
             if self.stop_flag:
                 break
 
-            await self.execute_cycle('sell')
-            if self.stop_flag:
+            sell_completed = await self._run_cycle_phase('sell')
+            if self.stop_flag or not sell_completed:
                 break
 
             await self.wait_for_roi()
+            if self.stop_flag:
+                break
+
+            if not self._positions_are_flat():
+                self.logger.error(
+                    "Residual positions detected after iteration %s | GRVT=%s | BingX=%s. Halting to prevent compounding.",
+                    iteration,
+                    self.grvt_position,
+                    self.bingx_position
+                )
+                self.stop_flag = True
+                break
 
         self.logger.info("Trading loop finished")
 
