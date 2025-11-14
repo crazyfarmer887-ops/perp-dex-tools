@@ -194,6 +194,12 @@ class HedgeBot:
             Decimal('0'),
             'GRVT_BINGX_POSITION_TOLERANCE'
         )
+        if self.position_tolerance < 0:
+            self.logger.warning(
+                "GRVT_BINGX_POSITION_TOLERANCE='%s' is negative; using 0.",
+                self.position_tolerance
+            )
+            self.position_tolerance = Decimal('0')
 
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
@@ -323,7 +329,12 @@ class HedgeBot:
         assert self.bingx_client is not None
         await self.bingx_client.connect()
 
-    async def place_grvt_order(self, side: str, price_override: Optional[Decimal] = None) -> Optional[Dict[str, Any]]:
+    async def place_grvt_order(
+        self,
+        side: str,
+        quantity: Optional[Decimal] = None,
+        price_override: Optional[Decimal] = None
+    ) -> Optional[Dict[str, Any]]:
         assert self.grvt_client is not None
         assert self.grvt_contract_id is not None
 
@@ -336,9 +347,20 @@ class HedgeBot:
         if price_override is not None:
             self.logger.info(f"[GRVT] Using override price {price_override} for {side} order")
 
+        order_quantity = quantity if quantity is not None else self.order_quantity
+        if order_quantity is None or order_quantity <= 0:
+            self.logger.warning(
+                "[GRVT] Invalid %s order quantity=%s; skipping order placement.",
+                side,
+                order_quantity
+            )
+            return None
+
+        self.grvt_client.config.quantity = order_quantity
+
         order_result = await self.grvt_client.place_open_order(
             contract_id=self.grvt_contract_id,
-            quantity=self.order_quantity,
+            quantity=order_quantity,
             direction=side,
             price=price_override
         )
@@ -347,15 +369,27 @@ class HedgeBot:
             self.logger.error(f"[GRVT] Failed to place {side} order: {order_result.error_message}")
             return None
 
-        self.logger.info(f"[GRVT] Order placed {order_result.order_id} ({side}) @ {order_result.price}")
+        self.logger.info(
+            "[GRVT] Order placed %s (%s) qty=%s @ %s",
+            order_result.order_id,
+            side,
+            order_quantity,
+            order_result.price
+        )
 
         if order_result.status == 'FILLED':
+            if order_result.size is not None:
+                if side == 'buy':
+                    self.grvt_position += order_result.size
+                else:
+                    self.grvt_position -= order_result.size
             self.last_grvt_fill = {
                 'order_id': order_result.order_id,
                 'side': side,
                 'size': order_result.size,
                 'price': order_result.price
             }
+            self.grvt_fill_event.set()
             return self.last_grvt_fill
 
         try:
@@ -685,28 +719,50 @@ class HedgeBot:
         self.last_roi_reason = None
         self.pending_grvt_price = None
 
-    def _register_entry(self, fill: Dict[str, Any]) -> None:
-        try:
-            price = Decimal(str(fill.get('price')))
-        except Exception:
-            price = None
-        if price is None or price <= 0:
-            self.logger.warning("⚠️ Unable to register entry due to invalid price.")
+    def _register_entry(self, fill: Dict[str, Any], previous_position: Decimal) -> None:
+        tolerance = self.position_tolerance
+        net_position = self.grvt_position
+
+        if abs(net_position) <= tolerance:
+            self.logger.info(
+                "GRVT position flattened after %s fill; clearing ROI tracking.",
+                str(fill.get('side', '')).upper()
+            )
             self._reset_entry_state()
             return
 
         try:
-            size = Decimal(str(fill.get('size', '0')))
+            price = Decimal(str(fill.get('price')))
         except Exception:
-            size = Decimal('0')
+            price = None
 
-        side = str(fill.get('side', '')).lower()
-        self.current_entry_price = price
+        side = 'buy' if net_position > 0 else 'sell'
+        size = abs(net_position)
+
+        flip_detected = (
+            abs(previous_position) <= tolerance or
+            (previous_position > 0 and net_position < 0) or
+            (previous_position < 0 and net_position > 0)
+        )
+
+        if flip_detected:
+            if price is None or price <= 0:
+                self.logger.warning("⚠️ Unable to register new %s entry due to invalid fill price.", side.upper())
+                self._reset_entry_state()
+                return
+            self.current_entry_price = price
+        elif self.current_entry_price is None and price is not None and price > 0:
+            self.current_entry_price = price
+
         self.current_entry_side = side
         self.current_entry_size = size
         self.current_entry_timestamp = time.time()
         self.last_roi_reason = None
-        self._update_roi_targets(side, price)
+
+        if self.current_entry_price is not None:
+            self._update_roi_targets(side, self.current_entry_price)
+        else:
+            self.logger.warning("⚠️ ROI targets disabled due to missing entry price for %s position.", side.upper())
 
     def _update_roi_targets(self, side: str, entry_price: Decimal) -> None:
         self.current_take_profit_price = None
@@ -737,6 +793,16 @@ class HedgeBot:
 
         if messages:
             self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
+
+    def _target_position_for_side(self, side: str) -> Decimal:
+        normalized = side.strip().lower()
+        if normalized == 'buy':
+            return self.order_quantity
+        return -self.order_quantity
+
+    def _compute_trade_delta(self, target_side: str) -> Decimal:
+        target = self._target_position_for_side(target_side)
+        return target - self.grvt_position
 
     def _schedule_next_grvt_order_price(self, trigger: str) -> None:
         if self.current_entry_side is None:
@@ -773,10 +839,8 @@ class HedgeBot:
 
     def _positions_are_flat(self) -> bool:
         tolerance = self.position_tolerance
-        return (
-            abs(self.grvt_position) <= tolerance and
-            abs(self.bingx_position) <= tolerance
-        )
+        net_exposure = self.grvt_position + self.bingx_position
+        return abs(net_exposure) <= tolerance
 
     async def wait_for_roi(self) -> None:
         if self.stop_flag:
@@ -784,6 +848,9 @@ class HedgeBot:
         if self.tp_roi is None and self.sl_roi is None:
             return
         if self.current_entry_price is None or self.current_entry_side is None:
+            return
+        if abs(self.grvt_position) <= self.position_tolerance:
+            self.logger.info("No active GRVT position to monitor for ROI; skipping.")
             return
         if self.grvt_client is None or self.grvt_contract_id is None:
             self.logger.warning("⚠️ Cannot wait for ROI without GRVT client or contract id.")
@@ -846,20 +913,56 @@ class HedgeBot:
         if self.pending_grvt_price and self.pending_grvt_price[0] == side:
             price_override = self.pending_grvt_price[1]
 
-        fill = await self.place_grvt_order(side, price_override=price_override)
+        trade_delta = self._compute_trade_delta(side)
+        if trade_delta == 0:
+            self.logger.info(
+                "Skipping %s cycle; GRVT position already at target (position=%s).",
+                side.upper(),
+                self.grvt_position
+            )
+            if self.pending_grvt_price and self.pending_grvt_price[0] == side:
+                self.pending_grvt_price = None
+            return True
+
+        trade_side = 'buy' if trade_delta > 0 else 'sell'
+        trade_quantity = abs(trade_delta)
+
+        if trade_quantity <= 0:
+            self.logger.warning("Computed non-positive trade quantity for %s cycle; aborting.", side.upper())
+            return False
+
+        if trade_side != side:
+            self.logger.warning(
+                "Target side %s requires executing %s to rebalance positions (delta=%s).",
+                side.upper(),
+                trade_side.upper(),
+                trade_delta
+            )
+
+        if price_override is not None and self.pending_grvt_price and self.pending_grvt_price[0] != trade_side:
+            self.logger.warning(
+                "Pending GRVT price scheduled for %s but actual trade side is %s; ignoring override.",
+                self.pending_grvt_price[0].upper(),
+                trade_side.upper()
+            )
+            price_override = None
+
+        previous_position = self.grvt_position
+
+        fill = await self.place_grvt_order(trade_side, quantity=trade_quantity, price_override=price_override)
         if not fill or self.stop_flag:
             self._reset_entry_state()
             return False
 
-        if price_override is not None and self.pending_grvt_price and self.pending_grvt_price[0] == side:
+        if price_override is not None and self.pending_grvt_price and self.pending_grvt_price[0] == trade_side:
             self.pending_grvt_price = None
 
-        self._register_entry(fill)
+        self._register_entry(fill, previous_position)
         hedge_success = await self._ensure_bingx_hedge(fill)
         if not hedge_success:
             self.logger.error(
                 "Unable to complete BingX hedge for GRVT %s fill; halting cycle to avoid exposure.",
-                side.upper()
+                trade_side.upper()
             )
             self._reset_entry_state()
             return False
