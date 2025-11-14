@@ -49,6 +49,16 @@ def parse_arguments():
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
     parser.add_argument('--boost', action='store_true',
                         help='Use the Boost mode for volume boosting')
+    parser.add_argument('--dual-sided', action='store_true',
+                        help='Enable simultaneous buy & sell limit grids (BingX and GRVT only)')
+    parser.add_argument('--tp-roi', type=Decimal, default=None,
+                        help='ROI percentage relative to average fill required before placing take-profit orders')
+    parser.add_argument('--sl-roi', type=Decimal, default=None,
+                        help='ROI percentage relative to average fill that triggers stop-loss handling')
+    parser.add_argument('--roi-poll-interval', type=float, default=2.0,
+                        help='Seconds between ROI checks when ROI targets are enabled (default: 2.0)')
+    parser.add_argument('--roi-max-wait', type=int, default=0,
+                        help='Maximum seconds to wait for ROI targets (0 disables the timeout)')
 
     return parser.parse_args()
 
@@ -90,10 +100,32 @@ async def main():
     # Setup logging first
     setup_logging("WARNING")
 
+    exchange_name = args.exchange.lower()
+
     # Validate boost-mode can only be used with aster and backpack exchange
-    if args.boost and args.exchange.lower() != 'aster' and args.exchange.lower() != 'backpack':
+    if args.boost and exchange_name not in {'aster', 'backpack'}:
         print(f"Error: --boost can only be used when --exchange is 'aster' or 'backpack'. "
               f"Current exchange: {args.exchange}")
+        sys.exit(1)
+
+    if args.dual_sided and exchange_name not in {'bingx', 'grvt'}:
+        print("Error: --dual-sided is currently supported only for BingX or GRVT exchanges.")
+        sys.exit(1)
+
+    if args.dual_sided and args.boost:
+        print("Error: --dual-sided cannot be combined with --boost mode.")
+        sys.exit(1)
+
+    if args.tp_roi is not None and args.tp_roi <= 0:
+        print("Error: --tp-roi must be a positive decimal percentage.")
+        sys.exit(1)
+
+    if args.sl_roi is not None and args.sl_roi <= 0:
+        print("Error: --sl-roi must be a positive decimal percentage.")
+        sys.exit(1)
+
+    if args.roi_poll_interval <= 0:
+        print("Error: --roi-poll-interval must be positive.")
         sys.exit(1)
 
     env_path = Path(args.env_file)
@@ -102,27 +134,36 @@ async def main():
         sys.exit(1)
     dotenv.load_dotenv(args.env_file)
 
-    # Create configuration
-    config = TradingConfig(
-        ticker=args.ticker.upper(),
-        contract_id='',  # will be set in the bot's run method
-        tick_size=Decimal(0),
-        quantity=args.quantity,
-        take_profit=args.take_profit,
-        direction=args.direction.lower(),
-        max_orders=args.max_orders,
-        wait_time=args.wait_time,
-        exchange=args.exchange.lower(),
-        grid_step=Decimal(args.grid_step),
-        stop_price=Decimal(args.stop_price),
-        pause_price=Decimal(args.pause_price),
-        boost_mode=args.boost
-    )
+    roi_max_wait = args.roi_max_wait if args.roi_max_wait > 0 else None
+    directions = ['buy', 'sell'] if args.dual_sided else [args.direction.lower()]
+    bots = []
 
-    # Create and run the bot
-    bot = TradingBot(config)
+    for direction in directions:
+        config = TradingConfig(
+            ticker=args.ticker.upper(),
+            contract_id='',  # will be set in the bot's run method
+            tick_size=Decimal(0),
+            quantity=args.quantity,
+            take_profit=args.take_profit,
+            direction=direction,
+            max_orders=args.max_orders,
+            wait_time=args.wait_time,
+            exchange=exchange_name,
+            grid_step=Decimal(args.grid_step),
+            stop_price=Decimal(args.stop_price),
+            pause_price=Decimal(args.pause_price),
+            boost_mode=args.boost,
+            dual_sided=args.dual_sided,
+            tp_roi=args.tp_roi,
+            sl_roi=args.sl_roi,
+            roi_poll_interval=args.roi_poll_interval,
+            roi_max_wait=roi_max_wait
+        )
+        bots.append(TradingBot(config))
+
+    # Create and run the bot(s)
     try:
-        await bot.run()
+        await asyncio.gather(*(bot.run() for bot in bots))
     except Exception as e:
         print(f"Bot execution failed: {e}")
         # The bot's run method already handles graceful shutdown

@@ -257,6 +257,26 @@ BTC:
 python runbot.py --exchange grvt --ticker BTC --quantity 0.05 --take-profit 0.02 --max-orders 40 --wait-time 450
 ```
 
+### Dual-Sided Limit Mode (BingX & GRVT)
+
+You can run simultaneous long + short maker grids on BingX or GRVT via `--dual-sided`. The flag automatically spins up two bots (buy & sell) sharing the same settings, while each exchange client sends the proper `positionSide` so both books stay isolated. Dual-sided mode cannot be combined with `--boost`.
+
+```bash
+# Run mirrored BTC grids on BingX
+python runbot.py --exchange bingx --ticker BTC --quantity 0.03 \
+  --take-profit 0.04 --max-orders 30 --wait-time 300 --dual-sided
+```
+
+### ROI-Based Closing Targets
+
+Use `--tp-roi` / `--sl-roi` to wait for a desired ROI (relative to the **average fill price**) before placing the closing limit order. The bot polls the book every `--roi-poll-interval` seconds (default 2s) until the ROI threshold is met or `--roi-max-wait` elapses (0 disables the timeout). Once triggered, the close order is priced off the ROI target rather than the static `--take-profit`.
+
+```bash
+python runbot.py --exchange grvt --ticker ETH --quantity 0.2 \
+  --take-profit 0.03 --tp-roi 0.6 --sl-roi 0.25 \
+  --roi-max-wait 900 --roi-poll-interval 1.5
+```
+
 ### Extended Exchange:
 
 ETH:

@@ -125,6 +125,16 @@ class BingxClient(BaseExchangeClient):
         step = Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
         return str(amount.quantize(step, rounding=ROUND_HALF_UP))
 
+    def _get_position_side(self, side: str, reduce_only: bool) -> Optional[str]:
+        """Determine BingX positionSide when dual-sided mode is enabled."""
+        if not getattr(self.config, 'dual_sided', False):
+            return None
+
+        normalized = (side or '').lower()
+        if reduce_only:
+            return 'LONG' if normalized == 'sell' else 'SHORT'
+        return 'LONG' if normalized == 'buy' else 'SHORT'
+
     def _build_tp_sl_payload(
         self,
         order_kind: str,
@@ -196,6 +206,10 @@ class BingxClient(BaseExchangeClient):
         extra_params: Optional[Dict[str, Any]] = None
     ) -> OrderResult:
         params: Dict[str, Any] = {'reduceOnly': reduce_only}
+
+        position_side = self._get_position_side(side, reduce_only)
+        if position_side:
+            params['positionSide'] = position_side
 
         if post_only is not None:
             params['postOnly'] = post_only
@@ -373,7 +387,11 @@ class BingxClient(BaseExchangeClient):
         tp_sl_order_type: str = 'market'
     ) -> OrderResult:
         amount_str = self._quantize_amount(quantity)
-        params: Dict[str, Any] = {'reduceOnly': side.lower() == self.config.close_order_side}
+        reduce_only = side.lower() == self.config.close_order_side
+        params: Dict[str, Any] = {'reduceOnly': reduce_only}
+        position_side = self._get_position_side(side, reduce_only)
+        if position_side:
+            params['positionSide'] = position_side
         tp_sl_mode = 'limit' if (tp_sl_order_type or '').strip().lower() == 'limit' else 'market'
 
         if take_profit_price is not None:
@@ -487,9 +505,20 @@ class BingxClient(BaseExchangeClient):
         except (ExchangeError, NetworkError):
             return Decimal('0')
 
+        target_side = None
+        if getattr(self.config, 'dual_sided', False):
+            target_side = 'long' if self.config.direction == 'buy' else 'short'
+
         for position in positions:
             if position.get('symbol') != self.config.contract_id:
                 continue
+
+            if target_side:
+                info_side = (position.get('info', {}) or {}).get('positionSide', '')
+                explicit_side = position.get('side', '')
+                normalized_side = (info_side or explicit_side or '').lower()
+                if normalized_side and normalized_side != target_side:
+                    continue
 
             for key in ('contracts', 'size', 'positionAmt', 'contractSize'):
                 value = position.get(key)

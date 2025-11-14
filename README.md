@@ -276,6 +276,26 @@ BTC：
 python runbot.py --exchange grvt --ticker BTC --quantity 0.05 --take-profit 0.02 --max-orders 40 --wait-time 450
 ```
 
+### BingX / GRVT 双向挂单模式
+
+在 BingX 或 GRVT 上使用 `--dual-sided` 参数即可同时运行买入与卖出两个 Maker 网格，程序会自动为每个方向设置正确的 `positionSide`，从而真正实现双向持仓。注意：该模式无法与 `--boost` 同时使用。
+
+```bash
+# BingX 上跑 BTC 双向网格
+python runbot.py --exchange bingx --ticker BTC --quantity 0.03 \
+  --take-profit 0.04 --max-orders 30 --wait-time 300 --dual-sided
+```
+
+### 基于平均开仓价的 ROI 目标
+
+`--tp-roi` / `--sl-roi` 允许在价格相对于**平均成交价**达到指定 ROI 之前延迟平仓。机器人会按照 `--roi-poll-interval`（默认 2 秒）轮询行情，直到命中 ROI 或超过 `--roi-max-wait`（0 表示无限等待）。触发后，平仓委托会根据 ROI 目标重新定价，而不是使用固定的 `--take-profit`。
+
+```bash
+python runbot.py --exchange grvt --ticker ETH --quantity 0.2 \
+  --take-profit 0.03 --tp-roi 0.6 --sl-roi 0.25 \
+  --roi-max-wait 900 --roi-poll-interval 1.5
+```
+
 ### Extended 交易所：
 
 ETH：

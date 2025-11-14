@@ -8,7 +8,7 @@ import asyncio
 import traceback
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Tuple
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
@@ -31,7 +31,12 @@ class TradingConfig:
     grid_step: Decimal
     stop_price: Decimal
     pause_price: Decimal
-    boost_mode: bool
+    boost_mode: bool = False
+    dual_sided: bool = False
+    tp_roi: Optional[Decimal] = None
+    sl_roi: Optional[Decimal] = None
+    roi_poll_interval: float = 2.0
+    roi_max_wait: Optional[int] = None
 
     @property
     def close_order_side(self) -> str:
@@ -81,6 +86,7 @@ class TradingBot:
         self.order_canceled_event = asyncio.Event()
         self.shutdown_requested = False
         self.loop = None
+        self.last_roi_reason: Optional[str] = None
 
         # Register order callback
         self._setup_websocket_handlers()
@@ -190,13 +196,198 @@ class TradingBot:
         else:
             return 1
 
+    def _roi_enabled(self) -> bool:
+        """Check whether ROI gating is enabled."""
+        return self.config.tp_roi is not None or self.config.sl_roi is not None
+
+    @staticmethod
+    def _to_decimal(value: Optional[Decimal]) -> Decimal:
+        if isinstance(value, Decimal):
+            return value
+        if value is None:
+            return Decimal('0')
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return Decimal('0')
+
+    async def _resolve_entry_price(self, order_result) -> Decimal:
+        """Resolve the best available fill price for ROI calculations."""
+        filled_price = self._to_decimal(order_result.price)
+        if not self._roi_enabled() or not order_result.order_id:
+            return filled_price
+
+        try:
+            order_info = await self.exchange_client.get_order_info(order_result.order_id)
+        except Exception as exc:
+            self.logger.log(f"Failed to fetch order info for ROI calculation: {exc}", "WARNING")
+            return filled_price
+
+        if order_info and getattr(order_info, 'price', None):
+            price_value = self._to_decimal(order_info.price)
+            if price_value > 0:
+                return price_value
+
+        return filled_price
+
+    def _determine_close_price(self, entry_price: Decimal, roi_reason: Optional[str]) -> Decimal:
+        """Determine the close price based on ROI settings or static take profit."""
+        entry_price = self._to_decimal(entry_price)
+        if entry_price <= 0:
+            return entry_price
+
+        hundred = Decimal('100')
+        one = Decimal('1')
+        direction = self.config.direction
+
+        def apply_percent(percent: Decimal, invert: bool = False) -> Decimal:
+            factor = percent / hundred
+            if direction == 'buy':
+                return entry_price * ((one - factor) if invert else (one + factor))
+            else:
+                return entry_price * ((one + factor) if invert else (one - factor))
+
+        if roi_reason == 'take_profit' and self.config.tp_roi is not None:
+            return apply_percent(self.config.tp_roi, invert=False)
+
+        if roi_reason == 'stop_loss' and self.config.sl_roi is not None:
+            return apply_percent(self.config.sl_roi, invert=True)
+
+        if self.config.tp_roi is not None and roi_reason in {None, 'timeout'} and self._roi_enabled():
+            return apply_percent(self.config.tp_roi, invert=False)
+
+        take_profit = self.config.take_profit
+        if take_profit <= 0:
+            return entry_price
+
+        return apply_percent(take_profit, invert=False)
+
+    async def _wait_for_roi_targets(self, entry_price: Decimal) -> Tuple[Optional[str], Optional[Decimal]]:
+        """Wait until ROI targets are reached before placing closing orders."""
+        if not self._roi_enabled():
+            return None, None
+
+        entry_price = self._to_decimal(entry_price)
+        if entry_price <= 0:
+            self.logger.log("Cannot evaluate ROI targets because entry price is non-positive.", "WARNING")
+            return None, None
+
+        self.logger.log("Waiting for ROI targets before placing close order...", "INFO")
+        hundred = Decimal('100')
+        poll_interval = max(self.config.roi_poll_interval, 0.1)
+        start_time = time.time()
+        last_reference: Optional[Decimal] = None
+
+        while not self.shutdown_requested:
+            try:
+                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+            except Exception as exc:
+                self.logger.log(f"Failed to fetch bid/ask while waiting for ROI: {exc}", "WARNING")
+                await asyncio.sleep(poll_interval)
+                continue
+
+            reference_price = best_bid if self.config.direction == 'buy' else best_ask
+            last_reference = reference_price
+            roi = None
+
+            if reference_price and reference_price > 0:
+                if self.config.direction == 'buy':
+                    roi = (reference_price - entry_price) / entry_price * hundred
+                else:
+                    roi = (entry_price - reference_price) / entry_price * hundred
+
+            if roi is not None:
+                roi_float = float(roi)
+                if self.config.tp_roi is not None and roi >= self.config.tp_roi:
+                    self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
+                    self.logger.log(
+                        f"ROI take profit reached: {roi_float:.4f}% (target {self.config.tp_roi}%)",
+                        "INFO"
+                    )
+                    return "take_profit", reference_price
+
+                if self.config.sl_roi is not None and roi <= -self.config.sl_roi:
+                    self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
+                    self.logger.log(
+                        f"ROI stop loss reached: {roi_float:.4f}% (threshold -{self.config.sl_roi}%)",
+                        "WARNING"
+                    )
+                    return "stop_loss", reference_price
+
+            if self.config.roi_max_wait is not None:
+                elapsed = time.time() - start_time
+                if elapsed >= self.config.roi_max_wait:
+                    self.last_roi_reason = f"timeout ({elapsed:.1f}s)"
+                    self.logger.log(
+                        f"ROI wait timed out after {elapsed:.1f}s; proceeding with close order.",
+                        "INFO"
+                    )
+                    return "timeout", last_reference
+
+            await asyncio.sleep(poll_interval)
+
+        return None, last_reference
+
+    async def _execute_close_flow(self, quantity: Decimal, entry_price: Decimal) -> bool:
+        """Place the appropriate close order, respecting ROI settings when enabled."""
+        quantity = self._to_decimal(quantity)
+        if quantity <= 0:
+            self.logger.log("Skip closing flow because quantity is non-positive.", "WARNING")
+            return False
+
+        close_side = self.config.close_order_side
+
+        if self.config.boost_mode:
+            close_order_result = await self.exchange_client.place_market_order(
+                self.config.contract_id,
+                quantity,
+                close_side
+            )
+            if not close_order_result.success:
+                msg = f"[CLOSE] Failed to place boost-mode market order: {close_order_result.error_message}"
+                self.logger.log(msg, "ERROR")
+                raise Exception(msg)
+            return True
+
+        roi_reason = None
+        if self._roi_enabled():
+            roi_reason, _ = await self._wait_for_roi_targets(entry_price)
+
+        close_price = self._determine_close_price(entry_price, roi_reason)
+        if close_price <= 0:
+            # Fallback to current best levels if ROI/entry data is invalid
+            try:
+                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                close_price = best_bid if close_side == 'buy' else best_ask
+            except Exception:
+                close_price = entry_price if entry_price > 0 else self._to_decimal(self.config.tick_size)
+
+        close_order_result = await self.exchange_client.place_close_order(
+            self.config.contract_id,
+            quantity,
+            close_price,
+            close_side
+        )
+
+        if self.config.exchange == "lighter":
+            await asyncio.sleep(1)
+
+        self.last_open_order_time = time.time()
+
+        if not close_order_result.success:
+            msg = f"[CLOSE] Failed to place close order: {close_order_result.error_message}"
+            self.logger.log(msg, "ERROR")
+            raise Exception(msg)
+
+        return True
+
     async def _place_and_monitor_open_order(self) -> bool:
         """Place an order and monitor its execution."""
         try:
             # Reset state before placing order
             self.order_filled_event.clear()
             self.current_order_status = 'OPEN'
-            self.order_filled_amount = 0.0
+            self.order_filled_amount = Decimal('0')
 
             # Place the order
             order_result = await self.exchange_client.place_open_order(
@@ -227,138 +418,90 @@ class TradingBot:
     async def _handle_order_result(self, order_result) -> bool:
         """Handle the result of an order placement."""
         order_id = order_result.order_id
-        filled_price = order_result.price
+        initial_order_price = self._to_decimal(order_result.price)
+        entry_price = await self._resolve_entry_price(order_result)
 
         if self.order_filled_event.is_set() or order_result.status == 'FILLED':
-            if self.config.boost_mode:
-                close_order_result = await self.exchange_client.place_market_order(
-                    self.config.contract_id,
-                    self.config.quantity,
-                    self.config.close_order_side
-                )
-            else:
-                self.last_open_order_time = time.time()
-                # Place close order
-                close_side = self.config.close_order_side
-                if close_side == 'sell':
-                    close_price = filled_price * (1 + self.config.take_profit/100)
-                else:
-                    close_price = filled_price * (1 - self.config.take_profit/100)
+            filled_qty = self._to_decimal(getattr(self, 'order_filled_amount', Decimal('0')))
+            if filled_qty <= 0:
+                filled_qty = self._to_decimal(order_result.size)
+            if filled_qty <= 0:
+                filled_qty = self.config.quantity
 
-                close_order_result = await self.exchange_client.place_close_order(
-                    self.config.contract_id,
-                    self.config.quantity,
-                    close_price,
-                    close_side
-                )
-                if self.config.exchange == "lighter":
-                    await asyncio.sleep(1)
+            await self._execute_close_flow(filled_qty, entry_price)
+            return True
 
-                if not close_order_result.success:
-                    self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
-                    raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
+        new_order_price = await self.exchange_client.get_order_price(self.config.direction)
 
-                return True
+        def should_wait(direction: str, latest_price: Decimal, placed_price: Decimal) -> bool:
+            if direction == "buy":
+                return latest_price <= placed_price
+            elif direction == "sell":
+                return latest_price >= placed_price
+            return False
 
+        if self.config.exchange == "lighter":
+            current_order_status = self.exchange_client.current_order.status
         else:
-            new_order_price = await self.exchange_client.get_order_price(self.config.direction)
+            order_info = await self.exchange_client.get_order_info(order_id)
+            current_order_status = order_info.status
 
-            def should_wait(direction: str, new_order_price: Decimal, order_result_price: Decimal) -> bool:
-                if direction == "buy":
-                    return new_order_price <= order_result_price
-                elif direction == "sell":
-                    return new_order_price >= order_result_price
-                return False
-
+        while (
+            should_wait(self.config.direction, new_order_price, initial_order_price)
+            and current_order_status == "OPEN"
+        ):
+            self.logger.log(f"[OPEN] [{order_id}] Waiting for order to be filled @ {initial_order_price}", "INFO")
+            await asyncio.sleep(5)
             if self.config.exchange == "lighter":
                 current_order_status = self.exchange_client.current_order.status
             else:
                 order_info = await self.exchange_client.get_order_info(order_id)
-                current_order_status = order_info.status
+                if order_info is not None:
+                    current_order_status = order_info.status
+            new_order_price = await self.exchange_client.get_order_price(self.config.direction)
 
-            while (
-                should_wait(self.config.direction, new_order_price, order_result.price)
-                and current_order_status == "OPEN"
-            ):
-                self.logger.log(f"[OPEN] [{order_id}] Waiting for order to be filled @ {order_result.price}", "INFO")
-                await asyncio.sleep(5)
-                if self.config.exchange == "lighter":
-                    current_order_status = self.exchange_client.current_order.status
-                else:
-                    order_info = await self.exchange_client.get_order_info(order_id)
-                    if order_info is not None:
-                        current_order_status = order_info.status
-                new_order_price = await self.exchange_client.get_order_price(self.config.direction)
+        self.order_canceled_event.clear()
+        self.logger.log(f"[OPEN] [{order_id}] Cancelling order and placing a new order", "INFO")
 
-            self.order_canceled_event.clear()
-            # Cancel the order if it's still open
-            self.logger.log(f"[OPEN] [{order_id}] Cancelling order and placing a new order", "INFO")
-            if self.config.exchange == "lighter":
-                cancel_result = await self.exchange_client.cancel_order(order_id)
-                start_time = time.time()
-                while (time.time() - start_time < 10 and self.exchange_client.current_order.status != 'CANCELED' and
-                        self.exchange_client.current_order.status != 'FILLED'):
-                    await asyncio.sleep(0.1)
+        if self.config.exchange == "lighter":
+            cancel_result = await self.exchange_client.cancel_order(order_id)
+            start_time = time.time()
+            while (time.time() - start_time < 10 and self.exchange_client.current_order.status != 'CANCELED' and
+                    self.exchange_client.current_order.status != 'FILLED'):
+                await asyncio.sleep(0.1)
 
-                if self.exchange_client.current_order.status not in ['CANCELED', 'FILLED']:
-                    raise Exception(f"[OPEN] Error cancelling order: {self.exchange_client.current_order.status}")
-                else:
-                    self.order_filled_amount = self.exchange_client.current_order.filled_size
+            if self.exchange_client.current_order.status not in ['CANCELED', 'FILLED']:
+                raise Exception(f"[OPEN] Error cancelling order: {self.exchange_client.current_order.status}")
             else:
-                try:
-                    cancel_result = await self.exchange_client.cancel_order(order_id)
-                    if not cancel_result.success:
-                        self.order_canceled_event.set()
-                        self.logger.log(f"[CLOSE] Failed to cancel order {order_id}: {cancel_result.error_message}", "WARNING")
-                    else:
-                        self.current_order_status = "CANCELED"
-
-                except Exception as e:
+                self.order_filled_amount = self.exchange_client.current_order.filled_size
+        else:
+            try:
+                cancel_result = await self.exchange_client.cancel_order(order_id)
+                if not cancel_result.success:
                     self.order_canceled_event.set()
-                    self.logger.log(f"[CLOSE] Error canceling order {order_id}: {e}", "ERROR")
-
-                if self.config.exchange == "backpack" or self.config.exchange == "extended":
-                    self.order_filled_amount = cancel_result.filled_size
+                    self.logger.log(f"[CLOSE] Failed to cancel order {order_id}: {cancel_result.error_message}", "WARNING")
                 else:
-                    # Wait for cancel event or timeout
-                    if not self.order_canceled_event.is_set():
-                        try:
-                            await asyncio.wait_for(self.order_canceled_event.wait(), timeout=5)
-                        except asyncio.TimeoutError:
-                            order_info = await self.exchange_client.get_order_info(order_id)
-                            self.order_filled_amount = order_info.filled_size
+                    self.current_order_status = "CANCELED"
 
-            if self.order_filled_amount > 0:
-                close_side = self.config.close_order_side
-                if self.config.boost_mode:
-                    close_order_result = await self.exchange_client.place_close_order(
-                        self.config.contract_id,
-                        self.order_filled_amount,
-                        filled_price,
-                        close_side
-                    )
-                else:
-                    if close_side == 'sell':
-                        close_price = filled_price * (1 + self.config.take_profit/100)
-                    else:
-                        close_price = filled_price * (1 - self.config.take_profit/100)
+            except Exception as e:
+                self.order_canceled_event.set()
+                self.logger.log(f"[CLOSE] Error canceling order {order_id}: {e}", "ERROR")
 
-                    close_order_result = await self.exchange_client.place_close_order(
-                        self.config.contract_id,
-                        self.order_filled_amount,
-                        close_price,
-                        close_side
-                    )
-                    if self.config.exchange == "lighter":
-                        await asyncio.sleep(1)
+            if self.config.exchange in {"backpack", "extended"}:
+                self.order_filled_amount = cancel_result.filled_size
+            else:
+                if not self.order_canceled_event.is_set():
+                    try:
+                        await asyncio.wait_for(self.order_canceled_event.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        order_info = await self.exchange_client.get_order_info(order_id)
+                        self.order_filled_amount = order_info.filled_size
 
-                self.last_open_order_time = time.time()
-                if not close_order_result.success:
-                    self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
+        if self.order_filled_amount > 0:
+            filled_amount = self._to_decimal(self.order_filled_amount)
+            await self._execute_close_flow(filled_amount, entry_price)
 
-            return True
-
-        return False
+        return True
 
     async def _log_status_periodically(self):
         """Log status information periodically, including positions."""
@@ -506,6 +649,15 @@ class TradingBot:
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
             self.logger.log(f"Boost Mode: {self.config.boost_mode}", "INFO")
+            self.logger.log(f"Dual-Sided Mode: {self.config.dual_sided}", "INFO")
+            if self._roi_enabled():
+                if self.config.tp_roi is not None:
+                    self.logger.log(f"TP ROI: {self.config.tp_roi}%", "INFO")
+                if self.config.sl_roi is not None:
+                    self.logger.log(f"SL ROI: {self.config.sl_roi}%", "INFO")
+                self.logger.log(f"ROI Poll Interval: {self.config.roi_poll_interval}s", "INFO")
+                if self.config.roi_max_wait is not None:
+                    self.logger.log(f"ROI Max Wait: {self.config.roi_max_wait}s", "INFO")
             self.logger.log("=============================", "INFO")
 
             # Capture the running event loop for thread-safe callbacks

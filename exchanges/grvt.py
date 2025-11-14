@@ -530,8 +530,28 @@ class GrvtClient(BaseExchangeClient):
         # Get positions using GRVT SDK
         positions = self.rest_client.fetch_positions()
 
+        target_side = None
+        if getattr(self.config, 'dual_sided', False):
+            target_side = 'buy' if self.config.direction == 'buy' else 'sell'
+
         for position in positions:
             if position.get('instrument') == self.config.contract_id:
+                if target_side:
+                    if 'is_buying_asset' in position:
+                        position_side = 'buy' if position.get('is_buying_asset') else 'sell'
+                    else:
+                        position_side = (position.get('side') or '').lower()
+                        if not position_side and position.get('size') is not None:
+                            try:
+                                size_val = Decimal(position.get('size', 0))
+                                if size_val > 0:
+                                    position_side = 'buy'
+                                elif size_val < 0:
+                                    position_side = 'sell'
+                            except Exception:
+                                position_side = ''
+                    if position_side and position_side != target_side:
+                        continue
                 return abs(Decimal(position.get('size', 0)))
 
         return Decimal(0)
