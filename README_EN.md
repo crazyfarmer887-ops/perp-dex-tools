@@ -187,6 +187,27 @@ Assuming current ETH price is $2000 with take-profit set to 0.02%:
 - **Real-time Monitoring**: Continuously monitors positions and order status
 - **⚠️ No Stop Loss**: This strategy does not include stop-loss functionality and may face significant losses in adverse market conditions
 
+#### ⚖️ Dual-Side Limit Mode (BingX & GRVT)
+
+- Enable with `--dual-side` to run *both* buy and sell bots concurrently
+- Works on `bingx` and `grvt`; other exchanges will reject the flag
+- BingX accounts must be switched to **Dual-Position (Hedge) Mode** as documented by BingX: <https://bingx-api.github.io/docs/>
+- Each side maintains its own limit orders, cooldowns, and ROI/take-profit settings
+
+Example:
+
+```bash
+python runbot.py --exchange bingx --ticker ETH --quantity 0.2 --max-orders 40 \
+  --wait-time 300 --dual-side --tp-roi 0.25
+```
+
+#### 🎯 ROI-Based Take Profit
+
+- Use `--tp-roi` to express the desired take-profit as a percentage of the filled average price (e.g. `0.25` = 0.25%)
+- When provided, `tp-roi` overrides the legacy `--take-profit` percentage for all close orders
+- Works in both single-direction and dual-side modes
+- Combine with `--dual-side` to keep symmetric ROI spacing on both sides of the book
+
 ## Sample commands:
 
 ### EdgeX Exchange:

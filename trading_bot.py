@@ -32,6 +32,8 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    dual_side_mode: bool = False
+    tp_roi: Optional[Decimal] = None
 
     @property
     def close_order_side(self) -> str:
@@ -190,6 +192,24 @@ class TradingBot:
         else:
             return 1
 
+    def _calculate_close_price(self, entry_price: Decimal, close_side: str) -> Decimal:
+        """Derive the close order price based on ROI or take-profit percentage."""
+        if entry_price is None:
+            raise ValueError("Entry price is required to calculate close price.")
+
+        target_percent = self.config.tp_roi if self.config.tp_roi is not None else self.config.take_profit
+        hundred = Decimal('100')
+        multiplier = Decimal('1')
+
+        if close_side == 'sell':
+            multiplier += target_percent / hundred
+        elif close_side == 'buy':
+            multiplier -= target_percent / hundred
+        else:
+            raise ValueError(f"Unsupported close side: {close_side}")
+
+        return entry_price * multiplier
+
     async def _place_and_monitor_open_order(self) -> bool:
         """Place an order and monitor its execution."""
         try:
@@ -240,10 +260,7 @@ class TradingBot:
                 self.last_open_order_time = time.time()
                 # Place close order
                 close_side = self.config.close_order_side
-                if close_side == 'sell':
-                    close_price = filled_price * (1 + self.config.take_profit/100)
-                else:
-                    close_price = filled_price * (1 - self.config.take_profit/100)
+                close_price = self._calculate_close_price(filled_price, close_side)
 
                 close_order_result = await self.exchange_client.place_close_order(
                     self.config.contract_id,
@@ -338,10 +355,7 @@ class TradingBot:
                         close_side
                     )
                 else:
-                    if close_side == 'sell':
-                        close_price = filled_price * (1 + self.config.take_profit/100)
-                    else:
-                        close_price = filled_price * (1 - self.config.take_profit/100)
+                    close_price = self._calculate_close_price(filled_price, close_side)
 
                     close_order_result = await self.exchange_client.place_close_order(
                         self.config.contract_id,
@@ -497,7 +511,6 @@ class TradingBot:
             self.logger.log(f"Ticker: {self.config.ticker}", "INFO")
             self.logger.log(f"Contract ID: {self.config.contract_id}", "INFO")
             self.logger.log(f"Quantity: {self.config.quantity}", "INFO")
-            self.logger.log(f"Take Profit: {self.config.take_profit}%", "INFO")
             self.logger.log(f"Direction: {self.config.direction}", "INFO")
             self.logger.log(f"Max Orders: {self.config.max_orders}", "INFO")
             self.logger.log(f"Wait Time: {self.config.wait_time}s", "INFO")
@@ -506,6 +519,11 @@ class TradingBot:
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
             self.logger.log(f"Boost Mode: {self.config.boost_mode}", "INFO")
+            if self.config.tp_roi is not None:
+                self.logger.log(f"Take Profit ROI: {self.config.tp_roi}%", "INFO")
+            else:
+                self.logger.log(f"Take Profit: {self.config.take_profit}%", "INFO")
+            self.logger.log(f"Dual Side Mode: {self.config.dual_side_mode}", "INFO")
             self.logger.log("=============================", "INFO")
 
             # Capture the running event loop for thread-safe callbacks

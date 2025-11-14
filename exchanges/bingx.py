@@ -116,6 +116,24 @@ class BingxClient(BaseExchangeClient):
                 return Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
         return getattr(self.config, 'tick_size', Decimal('0.01'))
 
+    def _resolve_position_side(self, side: str, reduce_only: bool) -> Optional[str]:
+        """Map order side to BingX positionSide flag when dual-side mode is enabled."""
+        if not getattr(self.config, 'dual_side_mode', False):
+            return None
+
+        normalized = (side or '').lower()
+        if reduce_only:
+            if normalized == 'sell':
+                return 'LONG'
+            if normalized == 'buy':
+                return 'SHORT'
+        else:
+            if normalized == 'buy':
+                return 'LONG'
+            if normalized == 'sell':
+                return 'SHORT'
+        return None
+
     def _quantize_amount(self, amount: Decimal) -> str:
         if not self._market:
             return str(amount)
@@ -196,6 +214,9 @@ class BingxClient(BaseExchangeClient):
         extra_params: Optional[Dict[str, Any]] = None
     ) -> OrderResult:
         params: Dict[str, Any] = {'reduceOnly': reduce_only}
+        position_side = self._resolve_position_side(side, reduce_only)
+        if position_side:
+            params['positionSide'] = position_side
 
         if post_only is not None:
             params['postOnly'] = post_only
@@ -374,6 +395,9 @@ class BingxClient(BaseExchangeClient):
     ) -> OrderResult:
         amount_str = self._quantize_amount(quantity)
         params: Dict[str, Any] = {'reduceOnly': side.lower() == self.config.close_order_side}
+        position_side = self._resolve_position_side(side, params['reduceOnly'])
+        if position_side:
+            params['positionSide'] = position_side
         tp_sl_mode = 'limit' if (tp_sl_order_type or '').strip().lower() == 'limit' else 'market'
 
         if take_profit_price is not None:
@@ -487,15 +511,24 @@ class BingxClient(BaseExchangeClient):
         except (ExchangeError, NetworkError):
             return Decimal('0')
 
+        total_position = Decimal('0')
         for position in positions:
             if position.get('symbol') != self.config.contract_id:
                 continue
 
+            amount_value: Optional[Decimal] = None
             for key in ('contracts', 'size', 'positionAmt', 'contractSize'):
                 value = position.get(key)
                 if value not in (None, ''):
-                    return abs(_to_decimal(value))
-        return Decimal('0')
+                    amount_value = _to_decimal(value)
+                    break
+
+            if amount_value is None:
+                continue
+
+            total_position += abs(amount_value)
+
+        return total_position
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         await self.exchange.load_markets()

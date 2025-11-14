@@ -49,6 +49,11 @@ def parse_arguments():
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
     parser.add_argument('--boost', action='store_true',
                         help='Use the Boost mode for volume boosting')
+    parser.add_argument('--dual-side', action='store_true',
+                        help='Enable dual-sided limit trading (runs buy and sell bots concurrently). '
+                             'Supported on bingx and grvt only.')
+    parser.add_argument('--tp-roi', type=Decimal, default=None,
+                        help='Override take-profit with ROI percentage relative to the filled average price.')
 
     return parser.parse_args()
 
@@ -95,6 +100,9 @@ async def main():
         print(f"Error: --boost can only be used when --exchange is 'aster' or 'backpack'. "
               f"Current exchange: {args.exchange}")
         sys.exit(1)
+    if args.dual_side and args.exchange.lower() not in {'bingx', 'grvt'}:
+        print("Error: --dual-side is currently supported only for bingx and grvt exchanges.")
+        sys.exit(1)
 
     env_path = Path(args.env_file)
     if not env_path.exists():
@@ -103,29 +111,37 @@ async def main():
     dotenv.load_dotenv(args.env_file)
 
     # Create configuration
-    config = TradingConfig(
-        ticker=args.ticker.upper(),
-        contract_id='',  # will be set in the bot's run method
-        tick_size=Decimal(0),
-        quantity=args.quantity,
-        take_profit=args.take_profit,
-        direction=args.direction.lower(),
-        max_orders=args.max_orders,
-        wait_time=args.wait_time,
-        exchange=args.exchange.lower(),
-        grid_step=Decimal(args.grid_step),
-        stop_price=Decimal(args.stop_price),
-        pause_price=Decimal(args.pause_price),
-        boost_mode=args.boost
-    )
+    def build_config(direction: str) -> TradingConfig:
+        return TradingConfig(
+            ticker=args.ticker.upper(),
+            contract_id='',  # will be set in the bot's run method
+            tick_size=Decimal(0),
+            quantity=args.quantity,
+            take_profit=args.take_profit,
+            direction=direction,
+            max_orders=args.max_orders,
+            wait_time=args.wait_time,
+            exchange=args.exchange.lower(),
+            grid_step=Decimal(args.grid_step),
+            stop_price=Decimal(args.stop_price),
+            pause_price=Decimal(args.pause_price),
+            boost_mode=args.boost,
+            dual_side_mode=args.dual_side,
+            tp_roi=args.tp_roi if args.tp_roi is not None else None
+        )
 
-    # Create and run the bot
-    bot = TradingBot(config)
     try:
-        await bot.run()
+        if args.dual_side:
+            print("Dual-side mode enabled: launching buy and sell bots concurrently.")
+            configs = [build_config('buy'), build_config('sell')]
+            bots = [TradingBot(cfg) for cfg in configs]
+            await asyncio.gather(*(bot.run() for bot in bots))
+        else:
+            config = build_config(args.direction.lower())
+            bot = TradingBot(config)
+            await bot.run()
     except Exception as e:
         print(f"Bot execution failed: {e}")
-        # The bot's run method already handles graceful shutdown
         return
 
 

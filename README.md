@@ -206,6 +206,27 @@ Python 版本要求（最佳选项是 Python 3.10 - 3.12）：
 - **实时监控**：持续监控持仓和订单状态
 - **⚠️ 无止损机制**：此策略不包含止损功能，在不利市场条件下可能面临较大损失
 
+#### ⚖️ 双向挂单模式（BingX & GRVT）
+
+- 使用 `--dual-side` 可以同时运行做多与做空两个机器人
+- 目前仅支持 `bingx` 与 `grvt`，其它交易所会提示错误
+- BingX 账户需按照官方文档开启 **双向持仓（Hedge Mode）**：<https://bingx-api.github.io/docs/>
+- 每个方向拥有独立的限价单、冷却时间与 ROI / 止盈配置
+
+示例：
+
+```bash
+python runbot.py --exchange bingx --ticker ETH --quantity 0.2 --max-orders 40 \
+  --wait-time 300 --dual-side --tp-roi 0.25
+```
+
+#### 🎯 基于均价的 ROI 止盈
+
+- 使用 `--tp-roi` 指定相对于成交均价的止盈百分比（如 `0.25` 表示 0.25%）
+- 设置后会覆盖原来的 `--take-profit` 百分比
+- 单向模式与双向模式都可以使用
+- 与 `--dual-side` 搭配，可在买卖两侧维持对称的 ROI 间距
+
 ## 示例命令：
 
 ### EdgeX 交易所：
