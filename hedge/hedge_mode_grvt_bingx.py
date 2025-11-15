@@ -90,6 +90,12 @@ class HedgeBot:
         file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(file_formatter)
 
+        self.error_log_filename = f"logs/grvt_bingx_{self.ticker.lower()}_hedge_errors.txt"
+        error_handler = logging.FileHandler(self.error_log_filename)
+        error_handler.setLevel(logging.ERROR)
+        error_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        error_handler.setFormatter(error_formatter)
+
         rich_handler = RichHandler(
             console=self.console,
             show_time=False,
@@ -100,6 +106,7 @@ class HedgeBot:
         rich_handler.setLevel(logging.INFO)
 
         self.logger.addHandler(file_handler)
+        self.logger.addHandler(error_handler)
         self.logger.addHandler(rich_handler)
 
         self.live: Optional[Live] = None
