@@ -118,6 +118,7 @@ class HedgeBot:
         self.total_bingx_volume = Decimal('0')
         self.position_tolerance = Decimal('0.0001')
         self.max_bingx_retries = 5
+        self.max_rebalance_attempts = 2
 
         self.bingx_fill_event = asyncio.Event()
         self.last_bingx_fill: Optional[Dict[str, Any]] = None
@@ -534,6 +535,9 @@ class HedgeBot:
                 avg_entry_price=avg_entry_price
             )
 
+        if not await self._ensure_positions_balanced():
+            return False
+
         return True
 
     async def execute_cycle(self, side: str) -> Optional[Dict[str, Any]]:
@@ -756,6 +760,85 @@ class HedgeBot:
                         if not group:
                             self.bingx_exit_groups.pop(group_id, None)
 
+    async def _rebalance_bingx_position(self, diff: Decimal) -> bool:
+        assert self.bingx_client is not None
+        assert self.bingx_contract_id is not None
+
+        quantity = diff.copy_abs()
+        if quantity <= self.position_tolerance:
+            return True
+
+        hedge_side = 'buy' if diff > 0 else 'sell'
+        self.bingx_client.config.direction = hedge_side
+        self.bingx_client.config.close_order_side = 'buy' if hedge_side == 'sell' else 'sell'
+
+        self.logger.warning(
+            f"[BINGX] Rebalancing positions via MARKET {hedge_side} {quantity}"
+        )
+        result = await self.bingx_client.place_market_order(
+            contract_id=self.bingx_contract_id,
+            quantity=quantity,
+            side=hedge_side
+        )
+        if not result.success:
+            self.logger.error(f"[BINGX] Rebalance failed: {result.error_message}")
+            return False
+
+        filled = result.filled_size or quantity
+        price = result.price or Decimal('0')
+        price = Decimal(str(price))
+
+        if hedge_side == 'buy':
+            self.bingx_position += filled
+        else:
+            self.bingx_position -= filled
+        self.total_bingx_volume += filled
+
+        self._update_ui(
+            bingx_position=self.bingx_position,
+            bingx_volume=self.total_bingx_volume,
+            last_action="BINGX rebalanced",
+            last_message=f"{hedge_side} {filled} @ {price}",
+            status="Hedging"
+        )
+        return True
+
+    async def _ensure_positions_balanced(self, *, allow_rebalance: bool = True) -> bool:
+        assert self.grvt_client is not None
+        assert self.bingx_client is not None
+
+        grvt_pos = await self.grvt_client.get_account_positions()
+        bingx_pos = await self.bingx_client.get_account_positions()
+
+        self.grvt_position = grvt_pos
+        self.bingx_position = bingx_pos
+
+        diff = grvt_pos - bingx_pos
+        if diff.copy_abs() <= self.position_tolerance:
+            self._update_ui(
+                grvt_position=self.grvt_position,
+                bingx_position=self.bingx_position,
+                last_action="Positions balanced",
+                last_message=f"Δ={diff}",
+                status="Flat"
+            )
+            return True
+
+        self.logger.warning(f"Position imbalance detected Δ={diff}")
+        if allow_rebalance:
+            success = await self._rebalance_bingx_position(diff)
+            if success:
+                return await self._ensure_positions_balanced(allow_rebalance=False)
+
+        self.logger.error("Unable to rebalance positions; stopping bot")
+        self.stop_flag = True
+        self._update_ui(
+            last_action="Imbalance halt",
+            last_message=f"Δ={diff}",
+            status="Halted"
+        )
+        return False
+
     # ------------------------------------------------------------------ #
     # Main run loop
     # ------------------------------------------------------------------ #
@@ -802,6 +885,8 @@ class HedgeBot:
                         self.logger.warning("Exit orders did not fill within timeout; cancelling")
                     await self._cancel_pending_exit_orders()
                     await self._cancel_bingx_exit_orders()
+                    if not await self._ensure_positions_balanced():
+                        break
                     continue
 
             entry_avg_price = Decimal(str(fill_buy.get('price'))) if fill_buy.get('price') is not None else await self.wait_for_last_fill(expected_side='buy')
@@ -838,6 +923,8 @@ class HedgeBot:
                 break
 
             await self.wait_for_last_fill(expected_side='sell')
+            if not await self._ensure_positions_balanced():
+                break
 
         self.logger.info("Trading loop finished")
 
