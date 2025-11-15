@@ -403,7 +403,7 @@ class HedgeBot:
 
         return self.last_grvt_fill
 
-    async def place_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
+    async def place_bingx_hedge(self, fill: Dict[str, Any], is_closing_position: bool = False) -> bool:
         assert self.bingx_client is not None
         assert self.bingx_contract_id is not None
 
@@ -427,10 +427,18 @@ class HedgeBot:
         except (InvalidOperation, ValueError, TypeError):
             entry_price = None
 
+        # When closing positions, always use limit orders on both exchanges
+        use_limit_order = is_closing_position or self.bingx_hedge_order_type == 'limit'
+
+        if is_closing_position:
+            self.logger.info(
+                "[BINGX] Position close detected - will use limit orders only (no market orders)"
+            )
+
         total_executed = Decimal('0')
         executed_orders: List[Tuple[str, Any]] = []
 
-        if self.bingx_hedge_order_type == 'limit':
+        if use_limit_order:
             limit_result = await self._place_bingx_limit_hedge(size, hedge_side, entry_price)
             if limit_result is not None:
                 executed_orders.append(('limit', limit_result))
@@ -460,9 +468,42 @@ class HedgeBot:
                                 filled_market_remaining = remaining
                             total_executed += filled_market_remaining
             else:
-                self.logger.info("[BINGX] Limit hedge unavailable; falling back to market order.")
+                if is_closing_position:
+                    self.logger.warning("[BINGX] Limit hedge unavailable for position close; retrying limit order.")
+                    # Retry limit order for position close
+                    limit_retry = await self._place_bingx_limit_hedge(size, hedge_side, entry_price)
+                    if limit_retry is not None:
+                        executed_orders.append(('limit', limit_retry))
+                        filled_limit_retry = self._extract_filled_size(limit_retry)
+                        if filled_limit_retry is None:
+                            filled_limit_retry = Decimal('0')
+                        if filled_limit_retry > 0:
+                            total_executed += filled_limit_retry
+                        if filled_limit_retry < size:
+                            remaining = size - filled_limit_retry
+                            if remaining > 0:
+                                self.logger.warning(
+                                    "[BINGX] Limit hedge retry filled %s of %s; placing another limit order for remaining %s.",
+                                    filled_limit_retry,
+                                    size,
+                                    remaining
+                                )
+                                # For position close, keep trying limit orders instead of market
+                                limit_remaining = await self._place_bingx_limit_hedge(
+                                    remaining,
+                                    hedge_side,
+                                    entry_price
+                                )
+                                if limit_remaining is not None:
+                                    executed_orders.append(('limit', limit_remaining))
+                                    filled_limit_remaining = self._extract_filled_size(limit_remaining)
+                                    if filled_limit_remaining is None or filled_limit_remaining <= 0:
+                                        filled_limit_remaining = remaining
+                                    total_executed += filled_limit_remaining
+                else:
+                    self.logger.info("[BINGX] Limit hedge unavailable; falling back to market order.")
 
-        if self.bingx_hedge_order_type != 'limit' and total_executed == 0:
+        if not use_limit_order and total_executed == 0:
             market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
             if market_result is not None:
                 executed_orders.append(('market', market_result))
@@ -472,13 +513,26 @@ class HedgeBot:
                 total_executed += filled_market
         elif total_executed == 0:
             # Limit mode but nothing executed yet (e.g., limit failed completely)
-            market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
-            if market_result is not None:
-                executed_orders.append(('market', market_result))
-                filled_market = self._extract_filled_size(market_result)
-                if filled_market is None or filled_market <= 0:
-                    filled_market = size
-                total_executed += filled_market
+            if is_closing_position:
+                # For position close, keep trying limit orders
+                self.logger.warning("[BINGX] Retrying limit order for position close.")
+                limit_retry = await self._place_bingx_limit_hedge(size, hedge_side, entry_price)
+                if limit_retry is not None:
+                    executed_orders.append(('limit', limit_retry))
+                    filled_limit_retry = self._extract_filled_size(limit_retry)
+                    if filled_limit_retry is None or filled_limit_retry <= 0:
+                        filled_limit_retry = size
+                    total_executed += filled_limit_retry
+                else:
+                    self.logger.error("[BINGX] Failed to place limit order for position close.")
+            else:
+                market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
+                if market_result is not None:
+                    executed_orders.append(('market', market_result))
+                    filled_market = self._extract_filled_size(market_result)
+                    if filled_market is None or filled_market <= 0:
+                        filled_market = size
+                    total_executed += filled_market
 
         if total_executed <= 0:
             self.logger.error("[BINGX] Failed to execute hedge order for %s %s.", hedge_side, size)
@@ -510,12 +564,12 @@ class HedgeBot:
         )
         return True
 
-    async def _ensure_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
+    async def _ensure_bingx_hedge(self, fill: Dict[str, Any], is_closing_position: bool = False) -> bool:
         attempts = 0
         while not self.stop_flag:
             attempts += 1
 
-            hedge_success = await self.place_bingx_hedge(fill)
+            hedge_success = await self.place_bingx_hedge(fill, is_closing_position=is_closing_position)
             if hedge_success:
                 return True
 
@@ -949,6 +1003,20 @@ class HedgeBot:
 
         previous_position = self.grvt_position
 
+        # Detect if we're closing a position (have a position and placing opposite order)
+        is_closing = abs(previous_position) > self.position_tolerance and (
+            (previous_position > 0 and trade_side == 'sell') or
+            (previous_position < 0 and trade_side == 'buy')
+        )
+
+        if is_closing:
+            self.logger.info(
+                "[POSITION CLOSE] Closing position: GRVT position=%s, placing %s order for %s (will use limit orders on both exchanges)",
+                previous_position,
+                trade_side.upper(),
+                trade_quantity
+            )
+
         fill = await self.place_grvt_order(trade_side, quantity=trade_quantity, price_override=price_override)
         if not fill or self.stop_flag:
             self._reset_entry_state()
@@ -958,7 +1026,7 @@ class HedgeBot:
             self.pending_grvt_price = None
 
         self._register_entry(fill, previous_position)
-        hedge_success = await self._ensure_bingx_hedge(fill)
+        hedge_success = await self._ensure_bingx_hedge(fill, is_closing_position=is_closing)
         if not hedge_success:
             self.logger.error(
                 "Unable to complete BingX hedge for GRVT %s fill; halting cycle to avoid exposure.",
