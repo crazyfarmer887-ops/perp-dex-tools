@@ -23,6 +23,43 @@ def _to_decimal(value: Any) -> Decimal:
 class BingxClient(BaseExchangeClient):
     """BingX exchange client implementation based on ccxt async support."""
 
+    def round_to_tick(self, price) -> Decimal:
+        """
+        Override base round_to_tick to handle InvalidOperation gracefully.
+        """
+        try:
+            price_decimal = Decimal(str(price))
+            tick = self.config.tick_size
+            
+            # Validate tick size
+            if tick is None or tick <= 0:
+                return price_decimal
+            
+            # Try quantize, but handle InvalidOperation
+            try:
+                return price_decimal.quantize(tick, rounding=ROUND_HALF_UP)
+            except InvalidOperation:
+                # If quantize fails, try to normalize tick size
+                # Convert tick to a reasonable precision (max 8 decimal places)
+                tick_str = str(tick)
+                if '.' in tick_str:
+                    # Count decimal places and limit to 8
+                    decimal_places = len(tick_str.split('.')[1])
+                    if decimal_places > 8:
+                        # Use precision-based rounding instead
+                        precision = min(8, decimal_places)
+                        step = Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
+                        return price_decimal.quantize(step, rounding=ROUND_HALF_UP)
+                # Fallback: round to 8 decimal places
+                return price_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            # Final fallback: return price as-is
+            self.logger.log(f"round_to_tick error for {price}: {exc}, returning as-is", "WARNING")
+            try:
+                return Decimal(str(price))
+            except (InvalidOperation, ValueError, TypeError):
+                return Decimal('0')
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
 
@@ -107,13 +144,22 @@ class BingxClient(BaseExchangeClient):
         if self._market:
             tick = self._market.get('limits', {}).get('price', {}).get('min')
             if tick:
-                return _to_decimal(tick)
+                tick_decimal = _to_decimal(tick)
+                if tick_decimal > 0:
+                    return tick_decimal
             tick = self._market.get('info', {}).get('tickSize')
             if tick:
-                return _to_decimal(tick)
+                tick_decimal = _to_decimal(tick)
+                if tick_decimal > 0:
+                    return tick_decimal
             precision = self._market.get('precision', {}).get('price')
             if precision is not None:
-                return Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
+                try:
+                    precision_value = int(precision)
+                    if precision_value > 0:
+                        return Decimal('1') / (Decimal(10) ** Decimal(str(precision_value)))
+                except (ValueError, TypeError, InvalidOperation):
+                    pass
         return getattr(self.config, 'tick_size', Decimal('0.01'))
 
     def _quantize_amount(self, amount: Decimal) -> str:
@@ -122,8 +168,14 @@ class BingxClient(BaseExchangeClient):
         precision = self._market.get('precision', {}).get('amount')
         if precision is None:
             return str(amount)
-        step = Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
-        return str(amount.quantize(step, rounding=ROUND_HALF_UP))
+        try:
+            precision_value = int(precision)
+            if precision_value <= 0:
+                return str(amount)
+            step = Decimal('1') / (Decimal(10) ** Decimal(str(precision_value)))
+            return str(amount.quantize(step, rounding=ROUND_HALF_UP))
+        except (ValueError, TypeError, InvalidOperation):
+            return str(amount)
 
     def _build_tp_sl_payload(
         self,
@@ -143,7 +195,16 @@ class BingxClient(BaseExchangeClient):
         if normalized_type not in {'limit', 'market'}:
             raise ValueError(f"Unsupported TP/SL order_type '{order_type}'.")
 
-        rounded_price = self.round_to_tick(price)
+        try:
+            rounded_price = self.round_to_tick(price)
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            # Fallback to simple rounding if quantize fails
+            self.logger.log(f"round_to_tick failed for price {price}, using direct conversion: {exc}", "WARNING")
+            try:
+                rounded_price = Decimal(str(price))
+            except (InvalidOperation, ValueError, TypeError):
+                rounded_price = price
+        
         price_str = str(rounded_price)
         quantity_str = self._quantize_amount(quantity)
 
@@ -555,6 +616,30 @@ class BingxClient(BaseExchangeClient):
             tick_size = self._get_tick_size()
             if tick_size <= 0:
                 tick_size = Decimal('0.01')
+            
+            # Validate tick size - if it's unreasonably large or has too many decimal places, normalize it
+            tick_str = str(tick_size)
+            if '.' in tick_str:
+                decimal_places = len(tick_str.split('.')[1])
+                # If tick size has more than 8 decimal places or is > 1, it's likely incorrect
+                if decimal_places > 8 or tick_size > Decimal('1'):
+                    # Try to get precision from market data instead
+                    precision = market.get('precision', {}).get('price')
+                    if precision is not None:
+                        try:
+                            precision_value = int(precision)
+                            if 0 < precision_value <= 8:
+                                tick_size = Decimal('1') / (Decimal(10) ** Decimal(str(precision_value)))
+                            else:
+                                tick_size = Decimal('0.01')  # Default fallback
+                        except (ValueError, TypeError, InvalidOperation):
+                            tick_size = Decimal('0.01')
+                    else:
+                        tick_size = Decimal('0.01')  # Default fallback
+                    self.logger.log(
+                        f"Normalized invalid tick size to {tick_size} for {symbol}",
+                        "WARNING"
+                    )
 
             self.config.tick_size = tick_size
 
