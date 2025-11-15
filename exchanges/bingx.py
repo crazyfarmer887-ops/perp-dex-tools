@@ -113,7 +113,12 @@ class BingxClient(BaseExchangeClient):
                 return _to_decimal(tick)
             precision = self._market.get('precision', {}).get('price')
             if precision is not None:
-                return Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
+                try:
+                    precision_int = int(precision)
+                    if precision_int >= 0:
+                        return Decimal('1').scaleb(-precision_int)
+                except (ValueError, TypeError):
+                    pass
         return getattr(self.config, 'tick_size', Decimal('0.01'))
 
     def _quantize_amount(self, amount: Decimal) -> str:
