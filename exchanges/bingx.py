@@ -262,6 +262,32 @@ class BingxClient(BaseExchangeClient):
             reduce_only=True
         )
 
+    async def place_bbo_close_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
+        """
+        Place a reduce-only limit order at the current BBO price to close/open hedge exposure.
+        Unlike place_close_order, this method intentionally joins/takes the top of book instead of
+        shifting the price to guarantee maker-only behavior.
+        """
+        best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+        if best_bid <= 0 or best_ask <= 0:
+            return OrderResult(success=False, error_message='Invalid bid/ask prices')
+
+        side_lower = side.lower()
+        if side_lower == 'sell':
+            target_price = best_bid
+        elif side_lower == 'buy':
+            target_price = best_ask
+        else:
+            raise ValueError(f"Unsupported side for BBO close order: {side}")
+
+        return await self._create_limit_order(
+            contract_id=contract_id,
+            quantity=quantity,
+            side=side_lower,
+            price=target_price,
+            reduce_only=True
+        )
+
     async def place_market_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
         amount_str = self._quantize_amount(quantity)
         params = {'reduceOnly': side.lower() == self.config.close_order_side}
