@@ -842,6 +842,198 @@ class HedgeBot:
         net_exposure = self.grvt_position + self.bingx_position
         return abs(net_exposure) <= tolerance
 
+    @staticmethod
+    def _compute_limit_close_price(
+        side: str,
+        best_bid: Decimal,
+        best_ask: Decimal,
+        tick_size: Decimal
+    ) -> Optional[Decimal]:
+        """
+        Compute a maker-friendly limit price for closing a position.
+        """
+        normalized_side = side.strip().lower()
+        price: Optional[Decimal] = None
+
+        if normalized_side == 'sell':
+            if best_bid > 0:
+                price = best_bid + tick_size
+            elif best_ask > 0:
+                price = best_ask
+        elif normalized_side == 'buy':
+            if best_ask > 0:
+                tentative = best_ask - tick_size
+                price = tentative if tentative > 0 else best_ask
+            elif best_bid > 0:
+                price = best_bid
+
+        if price is not None and price > 0:
+            return price
+        return None
+
+    async def _place_grvt_limit_close_order(self, quantity: Decimal, side: str) -> None:
+        if self.grvt_client is None or self.grvt_contract_id is None:
+            return
+
+        close_qty = abs(Decimal(quantity))
+        if close_qty <= 0:
+            return
+
+        try:
+            best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+        except Exception as exc:
+            self.logger.error(f"[GRVT] Failed to fetch BBO for limit close order: {exc}")
+            return
+
+        tick_size = (
+            self.grvt_tick_size
+            or getattr(self.grvt_client.config, 'tick_size', None)
+            or Decimal('0.01')
+        )
+        limit_price = self._compute_limit_close_price(side, best_bid, best_ask, tick_size)
+        if limit_price is None:
+            self.logger.error(
+                "[GRVT] Unable to determine limit price for %s close order (bid=%s, ask=%s)",
+                side.upper(),
+                best_bid,
+                best_ask
+            )
+            return
+
+        rounded_price = self.grvt_client.round_to_tick(limit_price)
+        try:
+            result = await self.grvt_client.place_close_order(
+                self.grvt_contract_id,
+                close_qty,
+                rounded_price,
+                side
+            )
+        except Exception as exc:
+            self.logger.error(
+                "[GRVT] Exception while placing %s close order %s @ %s: %s",
+                side.upper(),
+                close_qty,
+                rounded_price,
+                exc
+            )
+            return
+
+        if result.success:
+            self.logger.info(
+                "[GRVT] Limit close order submitted (%s %s @ %s | status=%s)",
+                side.upper(),
+                close_qty,
+                result.price or rounded_price,
+                result.status
+            )
+        else:
+            self.logger.error(
+                "[GRVT] Failed to submit %s close order (%s @ %s): %s",
+                side.upper(),
+                close_qty,
+                rounded_price,
+                result.error_message
+            )
+
+    async def _place_bingx_limit_close_order(self, quantity: Decimal, side: str) -> None:
+        if self.bingx_client is None or self.bingx_contract_id is None:
+            return
+
+        close_qty = abs(Decimal(quantity))
+        if close_qty <= 0:
+            return
+
+        try:
+            best_bid, best_ask = await self.bingx_client.fetch_bbo_prices(self.bingx_contract_id)
+        except Exception as exc:
+            self.logger.error(f"[BINGX] Failed to fetch BBO for limit close order: {exc}")
+            return
+
+        tick_size = (
+            self.bingx_tick_size
+            or getattr(self.bingx_client.config, 'tick_size', None)
+            or Decimal('0.01')
+        )
+        limit_price = self._compute_limit_close_price(side, best_bid, best_ask, tick_size)
+        if limit_price is None:
+            self.logger.error(
+                "[BINGX] Unable to determine limit price for %s close order (bid=%s, ask=%s)",
+                side.upper(),
+                best_bid,
+                best_ask
+            )
+            return
+
+        rounded_price = self.bingx_client.round_to_tick(limit_price)
+        try:
+            result = await self.bingx_client.place_close_order(
+                self.bingx_contract_id,
+                close_qty,
+                rounded_price,
+                side
+            )
+        except Exception as exc:
+            self.logger.error(
+                "[BINGX] Exception while placing %s close order %s @ %s: %s",
+                side.upper(),
+                close_qty,
+                rounded_price,
+                exc
+            )
+            return
+
+        if result.success:
+            self.logger.info(
+                "[BINGX] Limit close order submitted (%s %s @ %s | status=%s)",
+                side.upper(),
+                close_qty,
+                result.price or rounded_price,
+                result.status
+            )
+        else:
+            self.logger.error(
+                "[BINGX] Failed to submit %s close order (%s @ %s): %s",
+                side.upper(),
+                close_qty,
+                rounded_price,
+                result.error_message
+            )
+
+    async def _ensure_limit_close_orders(self, trigger: str) -> None:
+        """
+        Ensure both exchanges have maker limit close orders when shutting down or rebalancing.
+        """
+        tolerance = self.position_tolerance
+        grvt_outstanding = abs(self.grvt_position)
+        bingx_outstanding = abs(self.bingx_position)
+
+        if grvt_outstanding <= tolerance and bingx_outstanding <= tolerance:
+            return
+
+        self.logger.warning(
+            "Outstanding positions detected after %s | GRVT=%s | BingX=%s. "
+            "Placing limit close orders on both exchanges.",
+            trigger,
+            self.grvt_position,
+            self.bingx_position
+        )
+
+        tasks = []
+
+        if grvt_outstanding > tolerance:
+            grvt_side = 'sell' if self.grvt_position > 0 else 'buy'
+            tasks.append(self._place_grvt_limit_close_order(grvt_outstanding, grvt_side))
+
+        if bingx_outstanding > tolerance:
+            bingx_side = 'sell' if self.bingx_position > 0 else 'buy'
+            tasks.append(self._place_bingx_limit_close_order(bingx_outstanding, bingx_side))
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    self.logger.error("Error while submitting limit close order: %s", result)
+
     async def wait_for_roi(self) -> None:
         if self.stop_flag:
             return
@@ -1021,35 +1213,40 @@ class HedgeBot:
         await asyncio.sleep(2)
 
         iteration = 0
-        while not self.stop_flag and iteration < self.iterations:
-            iteration += 1
-            self.logger.info(f"----- Iteration {iteration}/{self.iterations} -----")
+        try:
+            while not self.stop_flag and iteration < self.iterations:
+                iteration += 1
+                self.logger.info(f"----- Iteration {iteration}/{self.iterations} -----")
 
-            buy_completed = await self._run_cycle_phase('buy')
-            if self.stop_flag or not buy_completed:
-                break
+                buy_completed = await self._run_cycle_phase('buy')
+                if self.stop_flag or not buy_completed:
+                    break
 
-            await self.wait_for_roi()
-            if self.stop_flag:
-                break
+                await self.wait_for_roi()
+                if self.stop_flag:
+                    break
 
-            sell_completed = await self._run_cycle_phase('sell')
-            if self.stop_flag or not sell_completed:
-                break
+                sell_completed = await self._run_cycle_phase('sell')
+                if self.stop_flag or not sell_completed:
+                    break
 
-            await self.wait_for_roi()
-            if self.stop_flag:
-                break
+                await self.wait_for_roi()
+                if self.stop_flag:
+                    break
 
-            if not self._positions_are_flat():
-                self.logger.error(
-                    "Residual positions detected after iteration %s | GRVT=%s | BingX=%s. Halting to prevent compounding.",
-                    iteration,
-                    self.grvt_position,
-                    self.bingx_position
-                )
-                self.stop_flag = True
-                break
+                if not self._positions_are_flat():
+                    self.logger.error(
+                        "Residual positions detected after iteration %s | GRVT=%s | BingX=%s. Halting to prevent compounding.",
+                        iteration,
+                        self.grvt_position,
+                        self.bingx_position
+                    )
+                    self.stop_flag = True
+                    break
+        finally:
+            await self._ensure_limit_close_orders(
+                "shutdown" if self.stop_flag else "loop completion"
+            )
 
         self.logger.info("Trading loop finished")
 
