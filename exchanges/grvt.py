@@ -5,11 +5,13 @@ GRVT exchange client implementation.
 import os
 import asyncio
 import time
+import logging
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Any, List, Optional, Tuple
 from pysdk.grvt_ccxt import GrvtCcxt
 from pysdk.grvt_ccxt_ws import GrvtCcxtWS
 from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
+import websockets.exceptions
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
@@ -87,6 +89,27 @@ class GrvtClient(BaseExchangeClient):
             # Import logger from pysdk like in the test file
             from pysdk.grvt_ccxt_logging_selector import logger
 
+            # Configure pysdk logger to suppress ConnectionClosedOK errors
+            # ConnectionClosedOK (status 1000) is a normal closure, not an error
+            pysdk_logger = logging.getLogger('pysdk.grvt_ccxt_logging_selector')
+            # Create a custom filter to suppress ConnectionClosedOK errors
+            class ConnectionClosedOKFilter(logging.Filter):
+                def filter(self, record):
+                    # Suppress ERROR level logs that contain ConnectionClosedOK or normal closure messages
+                    if record.levelno == logging.ERROR:
+                        msg = str(record.msg) if hasattr(record, 'msg') else ''
+                        if record.exc_info:
+                            exc_type = record.exc_info[0]
+                            if exc_type and 'ConnectionClosedOK' in str(exc_type):
+                                return False
+                        if 'ConnectionClosedOK' in msg or 'connection closed' in msg.lower() or 'sent 1000' in msg:
+                            return False
+                    return True
+            
+            # Add filter to suppress normal connection closure errors
+            if not any(isinstance(f, ConnectionClosedOKFilter) for f in pysdk_logger.filters):
+                pysdk_logger.addFilter(ConnectionClosedOKFilter())
+
             # Parameters for GRVT SDK - match test file structure
             parameters = {
                 'api_key': self.api_key,
@@ -120,7 +143,14 @@ class GrvtClient(BaseExchangeClient):
         try:
             if self._ws_client:
                 await self._ws_client.__aexit__()
+        except websockets.exceptions.ConnectionClosedOK:
+            # ConnectionClosedOK (status 1000) is a normal closure, not an error
+            self.logger.log("GRVT WebSocket disconnected normally", "INFO")
+        except websockets.exceptions.ConnectionClosed as e:
+            # Other connection closed errors (abnormal closure)
+            self.logger.log(f"GRVT WebSocket connection closed: {e}", "WARNING")
         except Exception as e:
+            # Other unexpected errors
             self.logger.log(f"Error during GRVT disconnect: {e}", "ERROR")
 
     def get_exchange_name(self) -> str:
