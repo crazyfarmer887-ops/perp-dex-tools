@@ -39,6 +39,7 @@ class HedgeBot:
         bingx_limit_offset_ticks: Optional[Decimal] = None,
         bingx_attach_tp_sl: Optional[bool] = None,
         bingx_time_in_force: Optional[str] = None,
+        strict_mode: Optional[bool] = None,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
@@ -201,6 +202,40 @@ class HedgeBot:
             )
             self.position_tolerance = Decimal('0')
 
+        env_strict_mode = _parse_bool(os.getenv('GRVT_BINGX_STRICT_MODE'), 'GRVT_BINGX_STRICT_MODE')
+        if strict_mode is not None:
+            self.strict_mode = bool(strict_mode)
+        elif env_strict_mode is not None:
+            self.strict_mode = env_strict_mode
+        else:
+            self.strict_mode = True
+
+        default_close_poll = max(0.5, float(self.fill_timeout) if self.fill_timeout > 0 else 2.0)
+        self.position_close_poll_interval = max(
+            0.5,
+            _coerce_float(
+                os.getenv('GRVT_BINGX_POSITION_CLOSE_POLL_INTERVAL'),
+                default_close_poll,
+                'GRVT_BINGX_POSITION_CLOSE_POLL_INTERVAL'
+            )
+        )
+        self.position_close_retry_delay = max(
+            self.position_close_poll_interval,
+            _coerce_float(
+                os.getenv('GRVT_BINGX_POSITION_CLOSE_RETRY_DELAY'),
+                max(30.0, default_close_poll * 5),
+                'GRVT_BINGX_POSITION_CLOSE_RETRY_DELAY'
+            )
+        )
+        self.position_close_timeout = max(
+            0.0,
+            _coerce_float(
+                os.getenv('GRVT_BINGX_POSITION_CLOSE_TIMEOUT'),
+                300.0,
+                'GRVT_BINGX_POSITION_CLOSE_TIMEOUT'
+            )
+        )
+
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
 
@@ -234,6 +269,13 @@ class HedgeBot:
             self.bingx_hedge_limit_offset_ticks,
             self.bingx_hedge_time_in_force or 'DEFAULT',
             self.bingx_attach_tp_sl,
+        )
+        self.logger.info("Strict cycle mode: %s", "ENABLED" if self.strict_mode else "DISABLED")
+        self.logger.info(
+            "Position close guard | poll=%.1fs | retry=%.1fs | timeout=%s",
+            self.position_close_poll_interval,
+            self.position_close_retry_delay,
+            f"{self.position_close_timeout:.1f}s" if self.position_close_timeout > 0 else "DISABLED"
         )
 
     # ------------------------------------------------------------------ #
@@ -837,8 +879,18 @@ class HedgeBot:
             f"📌 Scheduling next GRVT {side.upper()} order @ {rounded_price} due to {trigger.replace('_', ' ')}"
         )
 
+    def _per_exchange_positions_flat(
+        self,
+        grvt_position: Decimal,
+        bingx_position: Decimal
+    ) -> bool:
+        tolerance = self.position_tolerance
+        return abs(grvt_position) <= tolerance and abs(bingx_position) <= tolerance
+
     def _positions_are_flat(self) -> bool:
         tolerance = self.position_tolerance
+        if self.strict_mode:
+            return self._per_exchange_positions_flat(self.grvt_position, self.bingx_position)
         net_exposure = self.grvt_position + self.bingx_position
         return abs(net_exposure) <= tolerance
 
@@ -866,6 +918,12 @@ class HedgeBot:
                     bingx_position
                 )
 
+        return grvt_position, bingx_position
+
+    async def _sync_positions_from_exchanges(self) -> Tuple[Decimal, Decimal]:
+        grvt_position, bingx_position = await self._fetch_signed_positions()
+        self.grvt_position = grvt_position
+        self.bingx_position = bingx_position
         return grvt_position, bingx_position
 
     async def _place_grvt_limit_close(self, position: Decimal) -> bool:
@@ -948,7 +1006,10 @@ class HedgeBot:
         """
         Place limit OPEN orders on both GRVT and BingX to flatten existing positions.
         """
-        self.logger.info("🔚 Initiating GRVT+BingX limit-open position close routine.")
+        self.logger.info(
+            "🔚 Initiating GRVT+BingX limit-open position close routine (strict=%s).",
+            "ON" if self.strict_mode else "OFF"
+        )
 
         if self.grvt_client is None or self.bingx_client is None:
             self.initialize_clients()
@@ -960,36 +1021,86 @@ class HedgeBot:
                 self.logger.error(f"Unable to load contract metadata for position close: {exc}")
                 return
 
-        grvt_position, bingx_position = await self._fetch_signed_positions()
-
         tolerance = self.position_tolerance
-        tasks = []
+        pending_close = False
+        previous_positions: Optional[Tuple[Decimal, Decimal]] = None
+        last_submission_time: Optional[float] = None
+        start_time = time.time()
 
-        if abs(grvt_position) > tolerance:
-            tasks.append(self._place_grvt_limit_close(grvt_position))
-        else:
-            self.logger.info("GRVT position already flat (size=%s); skipping GRVT close order.", grvt_position)
+        while not self.stop_flag:
+            grvt_position, bingx_position = await self._fetch_signed_positions()
+            self.grvt_position = grvt_position
+            self.bingx_position = bingx_position
 
-        if abs(bingx_position) > tolerance:
-            tasks.append(self._place_bingx_limit_close(bingx_position))
-        else:
-            self.logger.info("BingX position already flat (size=%s); skipping BingX close order.", bingx_position)
+            if self._per_exchange_positions_flat(grvt_position, bingx_position):
+                self.logger.info("✅ Both GRVT and BingX positions are flat. Close routine finished.")
+                return
 
-        if not tasks:
-            self.logger.info("No outstanding positions detected on either exchange; nothing to close.")
-            return
+            if self.position_close_timeout > 0 and time.time() - start_time >= self.position_close_timeout:
+                self.logger.error(
+                    "❌ Position close timeout (%.1fs). Residual positions | GRVT=%s | BingX=%s",
+                    time.time() - start_time,
+                    grvt_position,
+                    bingx_position
+                )
+                return
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            if pending_close:
+                positions_changed = False
+                if previous_positions is None:
+                    positions_changed = True
+                else:
+                    if abs(grvt_position - previous_positions[0]) > tolerance:
+                        positions_changed = True
+                    if abs(bingx_position - previous_positions[1]) > tolerance:
+                        positions_changed = True
 
-        failures = [
-            result for result in results
-            if isinstance(result, Exception) or result is False
-        ]
+                if positions_changed:
+                    pending_close = False
+                    previous_positions = (grvt_position, bingx_position)
+                else:
+                    if (
+                        self.position_close_retry_delay > 0
+                        and last_submission_time is not None
+                        and time.time() - last_submission_time < self.position_close_retry_delay
+                    ):
+                        await asyncio.sleep(self.position_close_poll_interval)
+                        continue
+                    self.logger.warning("⚠️ Close orders show no fills; resubmitting.")
+                    pending_close = False
 
-        if failures:
-            self.logger.warning("⚠️ Some limit close orders failed. Review logs for details.")
-        else:
-            self.logger.info("✅ Limit close orders submitted on both exchanges. Monitor fills manually.")
+            tasks = []
+            if abs(grvt_position) > tolerance:
+                tasks.append(self._place_grvt_limit_close(grvt_position))
+            else:
+                self.logger.info("GRVT position already flat (size=%s); skipping GRVT close order.", grvt_position)
+
+            if abs(bingx_position) > tolerance:
+                tasks.append(self._place_bingx_limit_close(bingx_position))
+            else:
+                self.logger.info("BingX position already flat (size=%s); skipping BingX close order.", bingx_position)
+
+            if not tasks:
+                # Within tolerance but not strictly flat; continue polling.
+                await asyncio.sleep(self.position_close_poll_interval)
+                continue
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            failures = [
+                result for result in results
+                if isinstance(result, Exception) or result is False
+            ]
+
+            if failures:
+                self.logger.warning("⚠️ Some limit close orders failed. Review logs for details.")
+                pending_close = False
+            else:
+                self.logger.info("✅ Limit close orders submitted. Awaiting fills...")
+                pending_close = True
+                previous_positions = (grvt_position, bingx_position)
+                last_submission_time = time.time()
+
+            await asyncio.sleep(self.position_close_poll_interval)
 
     async def wait_for_roi(self) -> None:
         if self.stop_flag:
