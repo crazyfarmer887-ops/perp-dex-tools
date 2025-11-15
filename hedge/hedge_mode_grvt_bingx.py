@@ -71,6 +71,9 @@ class HedgeBot:
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
+        self.position_close_poll_interval: float = 1.0
+        self.max_position_close_wait: float = max(self.fill_timeout * 60, 300)
+        self.strict_mode: bool = True
 
         config_warnings: List[str] = []
 
@@ -1057,6 +1060,58 @@ class HedgeBot:
 
             await asyncio.sleep(self.roi_poll_interval)
 
+    async def wait_for_position_close(self) -> bool:
+        """
+        Wait for BingX position to close (strict mode).
+        Returns True if position closed successfully, False if timeout or error.
+        """
+        if self.stop_flag:
+            return False
+        
+        if self.bingx_client is None or self.bingx_contract_id is None:
+            self.logger.warning("⚠️ Cannot wait for position close without BingX client or contract id.")
+            return False
+
+        tolerance = self.position_tolerance
+        start_time = time.time()
+        _, initial_bingx_position = await self._fetch_signed_positions()
+        
+        if abs(initial_bingx_position) <= tolerance:
+            self.logger.info("BingX position already flat; no need to wait for close.")
+            return True
+
+        self.logger.info(
+            f"⏳ Waiting for BingX position to close (strict mode) | initial_position={initial_bingx_position}"
+        )
+
+        while not self.stop_flag:
+            try:
+                _, bingx_position = await self._fetch_signed_positions()
+                
+                if abs(bingx_position) <= tolerance:
+                    elapsed = time.time() - start_time
+                    self.logger.info(
+                        f"✅ BingX position closed successfully after {elapsed:.1f}s | final_position={bingx_position}"
+                    )
+                    self.bingx_position = bingx_position
+                    return True
+
+                elapsed = time.time() - start_time
+                if elapsed >= self.max_position_close_wait:
+                    self.logger.warning(
+                        f"⏱️ Position close wait timed out after {elapsed:.1f}s | current_position={bingx_position}"
+                    )
+                    return False
+
+                await asyncio.sleep(self.position_close_poll_interval)
+                
+            except Exception as exc:
+                self.logger.warning(f"⚠️ Error while waiting for position close: {exc}")
+                await asyncio.sleep(self.position_close_poll_interval)
+                continue
+
+        return False
+
     async def execute_cycle(self, side: str) -> bool:
         price_override = None
         if self.pending_grvt_price and self.pending_grvt_price[0] == side:
@@ -1182,6 +1237,16 @@ class HedgeBot:
             if self.stop_flag:
                 break
 
+            # Strict mode: Wait for BingX position to close before starting next cycle
+            if self.strict_mode:
+                position_closed = await self.wait_for_position_close()
+                if self.stop_flag:
+                    break
+                if not position_closed:
+                    self.logger.warning(
+                        "⚠️ Position did not close within timeout; continuing to next cycle anyway."
+                    )
+
             sell_completed = await self._run_cycle_phase('sell')
             if self.stop_flag or not sell_completed:
                 break
@@ -1189,6 +1254,16 @@ class HedgeBot:
             await self.wait_for_roi()
             if self.stop_flag:
                 break
+
+            # Strict mode: Wait for BingX position to close before starting next cycle
+            if self.strict_mode:
+                position_closed = await self.wait_for_position_close()
+                if self.stop_flag:
+                    break
+                if not position_closed:
+                    self.logger.warning(
+                        "⚠️ Position did not close within timeout; continuing to next cycle anyway."
+                    )
 
             if not self._positions_are_flat():
                 self.logger.error(
