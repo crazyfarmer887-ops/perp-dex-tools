@@ -5,7 +5,7 @@ GRVT exchange client implementation.
 import os
 import asyncio
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Dict, Any, List, Optional, Tuple
 from pysdk.grvt_ccxt import GrvtCcxt
 from pysdk.grvt_ccxt_ws import GrvtCcxtWS
@@ -535,6 +535,21 @@ class GrvtClient(BaseExchangeClient):
                 return abs(Decimal(position.get('size', 0)))
 
         return Decimal(0)
+
+    @query_retry(default_return=Decimal('0'))
+    async def get_signed_position(self) -> Decimal:
+        """Fetch the current signed position size for the configured contract."""
+        positions = self.rest_client.fetch_positions()
+
+        for position in positions:
+            if position.get('instrument') != self.config.contract_id:
+                continue
+            try:
+                return Decimal(str(position.get('size', '0')))
+            except (InvalidOperation, ValueError, TypeError):
+                return Decimal('0')
+
+        return Decimal('0')
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID and tick size for a ticker."""

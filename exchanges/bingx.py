@@ -4,7 +4,7 @@ BingX exchange client implementation.
 
 import asyncio
 import os
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 import ccxt.async_support as ccxt  # type: ignore
@@ -495,6 +495,48 @@ class BingxClient(BaseExchangeClient):
                 value = position.get(key)
                 if value not in (None, ''):
                     return abs(_to_decimal(value))
+        return Decimal('0')
+
+    @query_retry(default_return=Decimal('0'))
+    async def get_signed_position(self) -> Decimal:
+        """Return the signed position amount for the configured contract."""
+        try:
+            positions = await self.exchange.fetch_positions([self.config.contract_id])
+        except (ExchangeError, NetworkError):
+            return Decimal('0')
+
+        for position in positions:
+            if position.get('symbol') != self.config.contract_id:
+                continue
+
+            quantity = Decimal('0')
+            for key in ('positionAmt', 'contracts', 'size', 'contractSize'):
+                value = position.get(key)
+                if value in (None, ''):
+                    continue
+                try:
+                    quantity = _to_decimal(value)
+                except (InvalidOperation, ValueError, TypeError):
+                    quantity = Decimal('0')
+                break
+
+            if quantity == 0:
+                info = position.get('info') or {}
+                raw_amount = info.get('positionAmt')
+                if raw_amount not in (None, ''):
+                    try:
+                        quantity = _to_decimal(raw_amount)
+                    except (InvalidOperation, ValueError, TypeError):
+                        quantity = Decimal('0')
+
+            side = (position.get('side') or position.get('direction') or '').strip().lower()
+            if side in {'short', 'sell'}:
+                quantity = -abs(quantity)
+            elif side in {'long', 'buy'}:
+                quantity = abs(quantity)
+
+            return quantity
+
         return Decimal('0')
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:

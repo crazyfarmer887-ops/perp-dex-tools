@@ -842,6 +842,155 @@ class HedgeBot:
         net_exposure = self.grvt_position + self.bingx_position
         return abs(net_exposure) <= tolerance
 
+    async def _fetch_signed_positions(self) -> Tuple[Decimal, Decimal]:
+        grvt_position = self.grvt_position
+        bingx_position = self.bingx_position
+
+        if self.grvt_client is not None and self.grvt_contract_id is not None:
+            try:
+                grvt_position = await self.grvt_client.get_signed_position()
+            except Exception as exc:
+                self.logger.warning(
+                    "⚠️ Failed to fetch GRVT position from exchange API (%s); using local state %s",
+                    exc,
+                    grvt_position
+                )
+
+        if self.bingx_client is not None and self.bingx_contract_id is not None:
+            try:
+                bingx_position = await self.bingx_client.get_signed_position()
+            except Exception as exc:
+                self.logger.warning(
+                    "⚠️ Failed to fetch BingX position from exchange API (%s); using local state %s",
+                    exc,
+                    bingx_position
+                )
+
+        return grvt_position, bingx_position
+
+    async def _place_grvt_limit_close(self, position: Decimal) -> bool:
+        assert self.grvt_client is not None
+        assert self.grvt_contract_id is not None
+
+        quantity = abs(position)
+        if quantity <= 0:
+            return True
+
+        side = 'sell' if position > 0 else 'buy'
+        self.grvt_client.config.direction = side
+        self.grvt_client.config.close_order_side = 'sell' if side == 'buy' else 'buy'
+
+        self.logger.info("[GRVT] Placing limit %s order to close %s", side.upper(), quantity)
+        try:
+            result = await self.grvt_client.place_open_order(
+                contract_id=self.grvt_contract_id,
+                quantity=quantity,
+                direction=side
+            )
+        except Exception as exc:
+            self.logger.error("[GRVT] Failed to submit limit close order: %s", exc)
+            return False
+
+        if not result or not result.success:
+            error = getattr(result, 'error_message', 'Unknown error') if result else 'No response'
+            self.logger.error("[GRVT] Limit close order rejected: %s", error)
+            return False
+
+        self.logger.info(
+            "[GRVT] Close order accepted | id=%s | side=%s | qty=%s | price=%s | status=%s",
+            result.order_id,
+            side.upper(),
+            quantity,
+            result.price,
+            result.status
+        )
+        return True
+
+    async def _place_bingx_limit_close(self, position: Decimal) -> bool:
+        assert self.bingx_client is not None
+        assert self.bingx_contract_id is not None
+
+        quantity = abs(position)
+        if quantity <= 0:
+            return True
+
+        side = 'sell' if position > 0 else 'buy'
+        self.bingx_client.config.direction = side
+        self.bingx_client.config.close_order_side = 'sell' if side == 'buy' else 'buy'
+
+        self.logger.info("[BINGX] Placing limit %s order to close %s", side.upper(), quantity)
+        try:
+            result = await self.bingx_client.place_open_order(
+                contract_id=self.bingx_contract_id,
+                quantity=quantity,
+                direction=side
+            )
+        except Exception as exc:
+            self.logger.error("[BINGX] Failed to submit limit close order: %s", exc)
+            return False
+
+        if not result or not result.success:
+            error = getattr(result, 'error_message', 'Unknown error') if result else 'No response'
+            self.logger.error("[BINGX] Limit close order rejected: %s", error)
+            return False
+
+        self.logger.info(
+            "[BINGX] Close order accepted | id=%s | side=%s | qty=%s | price=%s | status=%s",
+            result.order_id,
+            side.upper(),
+            quantity,
+            result.price,
+            result.status
+        )
+        return True
+
+    async def close_positions_with_limit_orders(self) -> None:
+        """
+        Place limit OPEN orders on both GRVT and BingX to flatten existing positions.
+        """
+        self.logger.info("🔚 Initiating GRVT+BingX limit-open position close routine.")
+
+        if self.grvt_client is None or self.bingx_client is None:
+            self.initialize_clients()
+
+        if self.grvt_contract_id is None or self.bingx_contract_id is None:
+            try:
+                await self.load_contract_metadata()
+            except Exception as exc:
+                self.logger.error(f"Unable to load contract metadata for position close: {exc}")
+                return
+
+        grvt_position, bingx_position = await self._fetch_signed_positions()
+
+        tolerance = self.position_tolerance
+        tasks = []
+
+        if abs(grvt_position) > tolerance:
+            tasks.append(self._place_grvt_limit_close(grvt_position))
+        else:
+            self.logger.info("GRVT position already flat (size=%s); skipping GRVT close order.", grvt_position)
+
+        if abs(bingx_position) > tolerance:
+            tasks.append(self._place_bingx_limit_close(bingx_position))
+        else:
+            self.logger.info("BingX position already flat (size=%s); skipping BingX close order.", bingx_position)
+
+        if not tasks:
+            self.logger.info("No outstanding positions detected on either exchange; nothing to close.")
+            return
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        failures = [
+            result for result in results
+            if isinstance(result, Exception) or result is False
+        ]
+
+        if failures:
+            self.logger.warning("⚠️ Some limit close orders failed. Review logs for details.")
+        else:
+            self.logger.info("✅ Limit close orders submitted on both exchanges. Monitor fills manually.")
+
     async def wait_for_roi(self) -> None:
         if self.stop_flag:
             return
