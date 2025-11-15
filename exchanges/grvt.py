@@ -121,7 +121,16 @@ class GrvtClient(BaseExchangeClient):
             if self._ws_client:
                 await self._ws_client.__aexit__()
         except Exception as e:
-            self.logger.log(f"Error during GRVT disconnect: {e}", "ERROR")
+            # ConnectionClosedOK is a normal closure, not an error
+            # Check both exception type name and error message
+            error_type = type(e).__name__
+            error_str = str(e)
+            if (error_type == "ConnectionClosedOK" or 
+                "ConnectionClosedOK" in error_str or 
+                ("sent 1000" in error_str and "received 1000" in error_str)):
+                self.logger.log(f"GRVT WebSocket closed normally", "INFO")
+            else:
+                self.logger.log(f"Error during GRVT disconnect: {e}", "ERROR")
 
     def get_exchange_name(self) -> str:
         """Get the exchange name."""

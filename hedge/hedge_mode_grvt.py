@@ -90,6 +90,26 @@ class HedgeBot:
         logging.getLogger('pysdk.grvt_ccxt_ws').setLevel(logging.CRITICAL)
         logging.getLogger('pysdk.grvt_ccxt_logging_selector').setLevel(logging.CRITICAL)
         logging.getLogger('pysdk.grvt_ccxt_env').setLevel(logging.CRITICAL)
+        
+        # Suppress ConnectionClosedOK errors from pysdk - these are normal shutdowns
+        # Create a custom filter to suppress ConnectionClosedOK messages
+        class ConnectionClosedFilter(logging.Filter):
+            def filter(self, record):
+                msg = record.getMessage()
+                # Filter out ConnectionClosedOK errors - these are normal shutdowns
+                # Check for various forms of the message
+                if ("ConnectionClosedOK" in msg or 
+                    ("sent 1000" in msg and "received 1000" in msg) or
+                    ("sent 1000 (OK)" in msg and "received 1000 (OK)" in msg) or
+                    ("connection closed" in msg.lower() and "tdg_rpc_full" in msg)):
+                    return False
+                return True
+        
+        # Apply filter to pysdk loggers
+        closed_filter = ConnectionClosedFilter()
+        logging.getLogger('pysdk.grvt_ccxt_logging_selector').addFilter(closed_filter)
+        logging.getLogger('pysdk.grvt_ccxt_ws').addFilter(closed_filter)
+        logging.getLogger('pysdk').addFilter(closed_filter)
         logging.getLogger('lighter').setLevel(logging.CRITICAL)
         logging.getLogger('lighter.signer_client').setLevel(logging.CRITICAL)
         
@@ -181,18 +201,9 @@ class HedgeBot:
         self.grvt_environment = os.getenv('GRVT_ENVIRONMENT', 'prod')
 
     def shutdown(self, signum=None, frame=None):
-        """Graceful shutdown handler."""
+        """Graceful shutdown handler (synchronous)."""
         self.stop_flag = True
         self.logger.info("\n🛑 Stopping...")
-
-        # Close WebSocket connections
-        if self.grvt_client:
-            try:
-                # Note: disconnect() is async, but shutdown() is sync
-                # We'll let the cleanup happen naturally
-                self.logger.info("🔌 GRVT WebSocket will be disconnected")
-            except Exception as e:
-                self.logger.error(f"Error disconnecting GRVT WebSocket: {e}")
 
         # Cancel Lighter WebSocket task
         if self.lighter_ws_task and not self.lighter_ws_task.done():
@@ -209,6 +220,19 @@ class HedgeBot:
                 self.logger.removeHandler(handler)
             except Exception:
                 pass
+
+    async def cleanup(self):
+        """Async cleanup method for proper websocket disconnection."""
+        if self.grvt_client:
+            try:
+                self.logger.info("🔌 Disconnecting GRVT WebSocket...")
+                await self.grvt_client.disconnect()
+                self.logger.info("✅ GRVT WebSocket disconnected")
+            except Exception as e:
+                # ConnectionClosedOK is normal, don't log as error
+                error_str = str(e)
+                if "ConnectionClosedOK" not in error_str and "sent 1000" not in error_str:
+                    self.logger.error(f"Error disconnecting GRVT WebSocket: {e}")
 
     def _initialize_csv_file(self):
         """Initialize CSV file with headers if it doesn't exist."""
@@ -1212,6 +1236,7 @@ class HedgeBot:
             self.logger.info("\n🛑 Received interrupt signal...")
         finally:
             self.logger.info("🔄 Cleaning up...")
+            await self.cleanup()
             self.shutdown()
 
 
