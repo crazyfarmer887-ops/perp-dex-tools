@@ -5,11 +5,13 @@ GRVT exchange client implementation.
 import os
 import asyncio
 import time
+import contextlib
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Any, List, Optional, Tuple
 from pysdk.grvt_ccxt import GrvtCcxt
 from pysdk.grvt_ccxt_ws import GrvtCcxtWS
 from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
@@ -51,6 +53,16 @@ class GrvtClient(BaseExchangeClient):
         self._order_update_handler = None
         self._ws_client = None
         self._order_update_callback = None
+        self._ws_subscription_task = None
+        self._ws_should_listen = False
+        self._sdk_logger = None
+        self._ws_parameters = {
+            'api_key': self.api_key,
+            'trading_account_id': self.trading_account_id,
+            'api_ws_version': 'v1',
+            'private_key': self.private_key
+        }
+        self._max_reconnect_delay = 30
 
     def _initialize_grvt_clients(self) -> None:
         """Initialize the GRVT REST and WebSocket clients."""
@@ -71,6 +83,70 @@ class GrvtClient(BaseExchangeClient):
         except Exception as e:
             raise ValueError(f"Failed to initialize GRVT client: {e}")
 
+    async def _reset_ws_connection(self) -> None:
+        """Close the current WebSocket connection if it exists."""
+        if self._ws_client is None:
+            return
+        try:
+            await self._ws_client.__aexit__()
+        except Exception as exc:
+            self.logger.log(f"Error while closing GRVT WebSocket: {exc}", "DEBUG")
+        finally:
+            self._ws_client = None
+
+    async def _create_ws_client(self) -> None:
+        """Instantiate and initialize a new WebSocket client."""
+        loop = asyncio.get_running_loop()
+        if self._sdk_logger is None:
+            from pysdk.grvt_ccxt_logging_selector import logger as sdk_logger
+            self._sdk_logger = sdk_logger
+
+        self._ws_client = GrvtCcxtWS(
+            env=self.env,
+            loop=loop,
+            logger=self._sdk_logger,
+            parameters=self._ws_parameters
+        )
+        await self._ws_client.initialize()
+        await asyncio.sleep(2)
+
+    async def _ensure_ws_client(self) -> None:
+        """Ensure that a WebSocket client instance is available."""
+        if self._ws_client is None:
+            await self._create_ws_client()
+
+    def _start_order_subscription_if_ready(self) -> None:
+        """Start the order subscription task when prerequisites are met."""
+        if self._order_update_callback is None or self._ws_client is None:
+            return
+
+        if self._ws_subscription_task and not self._ws_subscription_task.done():
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop yet (likely called before connect); defer until later.
+            self.logger.log("Event loop not running; deferring GRVT subscription startup", "DEBUG")
+            return
+
+        self._ws_should_listen = True
+        self._ws_subscription_task = loop.create_task(
+            self._subscribe_to_orders(self._order_update_callback)
+        )
+        self.logger.log(f"Started GRVT order subscription task for {self.config.contract_id}", "INFO")
+
+    async def _stop_subscription_task(self) -> None:
+        """Cancel the subscription task if it is running."""
+        self._ws_should_listen = False
+        if not self._ws_subscription_task:
+            return
+
+        self._ws_subscription_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._ws_subscription_task
+        self._ws_subscription_task = None
+
     def _validate_config(self) -> None:
         """Validate GRVT configuration."""
         required_env_vars = ['GRVT_TRADING_ACCOUNT_ID', 'GRVT_PRIVATE_KEY', 'GRVT_API_KEY']
@@ -81,36 +157,9 @@ class GrvtClient(BaseExchangeClient):
     async def connect(self) -> None:
         """Connect to GRVT WebSocket."""
         try:
-            # Initialize WebSocket client - match the working test implementation
-            loop = asyncio.get_running_loop()
-
-            # Import logger from pysdk like in the test file
-            from pysdk.grvt_ccxt_logging_selector import logger
-
-            # Parameters for GRVT SDK - match test file structure
-            parameters = {
-                'api_key': self.api_key,
-                'trading_account_id': self.trading_account_id,
-                'api_ws_version': 'v1',
-                'private_key': self.private_key
-            }
-
-            self._ws_client = GrvtCcxtWS(
-                env=self.env,
-                loop=loop,
-                logger=logger,  # Add logger parameter like in test file
-                parameters=parameters
-            )
-
-            # Initialize and connect
-            await self._ws_client.initialize()
-            await asyncio.sleep(2)  # Wait for connection to establish
-
-            # If an order update callback was set before connect, subscribe now
+            await self._ensure_ws_client()
             if self._order_update_callback is not None:
-                asyncio.create_task(self._subscribe_to_orders(self._order_update_callback))
-                self.logger.log(f"Deferred subscription started for {self.config.contract_id}", "INFO")
-
+                self._start_order_subscription_if_ready()
         except Exception as e:
             self.logger.log(f"Error connecting to GRVT WebSocket: {e}", "ERROR")
             raise
@@ -118,8 +167,8 @@ class GrvtClient(BaseExchangeClient):
     async def disconnect(self) -> None:
         """Disconnect from GRVT."""
         try:
-            if self._ws_client:
-                await self._ws_client.__aexit__()
+            await self._stop_subscription_task()
+            await self._reset_ws_connection()
         except Exception as e:
             self.logger.log(f"Error during GRVT disconnect: {e}", "ERROR")
 
@@ -209,8 +258,7 @@ class GrvtClient(BaseExchangeClient):
         # Subscribe immediately if WebSocket is already initialized; otherwise defer to connect()
         if self._ws_client:
             try:
-                asyncio.create_task(self._subscribe_to_orders(self._order_update_callback))
-                self.logger.log(f"Successfully initiated subscription to order updates for {self.config.contract_id}", "INFO")
+                self._start_order_subscription_if_ready()
             except Exception as e:
                 self.logger.log(f"Error subscribing to order updates: {e}", "ERROR")
                 raise
@@ -218,18 +266,48 @@ class GrvtClient(BaseExchangeClient):
             self.logger.log("WebSocket not ready yet; will subscribe after connect()", "INFO")
 
     async def _subscribe_to_orders(self, callback):
-        """Subscribe to order updates asynchronously."""
-        try:
-            await self._ws_client.subscribe(
-                stream="order",
-                callback=callback,
-                ws_end_point_type=GrvtWSEndpointType.TRADE_DATA_RPC_FULL,
-                params={"instrument": self.config.contract_id}
-            )
-            await asyncio.sleep(0)  # Small delay like in test file
-            self.logger.log(f"Successfully subscribed to order updates for {self.config.contract_id}", "INFO")
-        except Exception as e:
-            self.logger.log(f"Error in subscription task: {e}", "ERROR")
+        """Subscribe to order updates asynchronously with automatic reconnection."""
+        backoff = 1
+        while self._ws_should_listen:
+            try:
+                await self._ensure_ws_client()
+            except Exception as exc:
+                self.logger.log(f"Error initializing GRVT WebSocket client: {exc}", "ERROR")
+                if not self._ws_should_listen:
+                    break
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self._max_reconnect_delay)
+                continue
+
+            try:
+                self.logger.log(f"Subscribing to GRVT order updates for {self.config.contract_id}", "INFO")
+                await self._ws_client.subscribe(
+                    stream="order",
+                    callback=callback,
+                    ws_end_point_type=GrvtWSEndpointType.TRADE_DATA_RPC_FULL,
+                    params={"instrument": self.config.contract_id}
+                )
+                # If subscribe returns, the stream ended unexpectedly; restart after resetting.
+                self.logger.log("GRVT order subscription ended; attempting to restart", "WARNING")
+            except asyncio.CancelledError:
+                self.logger.log("GRVT order subscription task cancelled", "INFO")
+                raise
+            except ConnectionClosedOK as exc:
+                self.logger.log(f"GRVT WebSocket closed normally ({exc.code}); reconnecting", "WARNING")
+            except ConnectionClosed as exc:
+                self.logger.log(f"GRVT WebSocket closed unexpectedly ({exc.code}): {exc.reason}", "WARNING")
+            except Exception as exc:
+                self.logger.log(f"Error in subscription task: {exc}", "ERROR")
+            finally:
+                await self._reset_ws_connection()
+
+            if not self._ws_should_listen:
+                break
+
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, self._max_reconnect_delay)
+
+        self.logger.log("GRVT order subscription loop stopped", "INFO")
 
     @query_retry(reraise=True)
     async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
