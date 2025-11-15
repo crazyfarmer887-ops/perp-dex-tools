@@ -613,7 +613,11 @@ class HedgeBot:
                 tp_sl_order_type='limit'
             )
         except Exception as exc:
-            self.logger.error(f"[BINGX] Market hedge exception: {exc}")
+            exc_type = type(exc).__name__
+            exc_msg = str(exc) if str(exc) else repr(exc)
+            self.logger.error(f"[BINGX] Market hedge exception: {exc_type}: {exc_msg}")
+            import traceback
+            self.logger.debug(f"[BINGX] Market hedge traceback: {traceback.format_exc()}")
             return None
 
         if not result.success:
@@ -729,7 +733,11 @@ class HedgeBot:
                 tp_sl_order_type='limit'
             )
         except Exception as exc:
-            self.logger.error(f"[BINGX] Limit hedge exception: {exc}")
+            exc_type = type(exc).__name__
+            exc_msg = str(exc) if str(exc) else repr(exc)
+            self.logger.error(f"[BINGX] Limit hedge exception: {exc_type}: {exc_msg}")
+            import traceback
+            self.logger.debug(f"[BINGX] Limit hedge traceback: {traceback.format_exc()}")
             return None
 
     @staticmethod

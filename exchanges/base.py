@@ -6,7 +6,7 @@ All exchange implementations should inherit from this class.
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional, Tuple, Type, Union
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 
@@ -67,11 +67,61 @@ class BaseExchangeClient(ABC):
         self._validate_config()
 
     def round_to_tick(self, price) -> Decimal:
-        price = Decimal(price)
+        try:
+            price = Decimal(str(price))
+        except (ValueError, TypeError, InvalidOperation):
+            raise ValueError(f"Invalid price value for rounding: {price}")
 
-        tick = self.config.tick_size
-        # quantize forces price to be a multiple of tick
-        return price.quantize(tick, rounding=ROUND_HALF_UP)
+        tick = getattr(self.config, 'tick_size', None)
+        if tick is None:
+            return price
+        
+        try:
+            tick = Decimal(str(tick))
+        except (ValueError, TypeError, InvalidOperation):
+            # Fallback to default tick size if config tick_size is invalid
+            tick = Decimal('0.01')
+        
+        if tick <= 0:
+            # Invalid tick size, return price as-is
+            return price
+        
+        try:
+            # quantize forces price to be a multiple of tick
+            # Normalize tick to ensure it has proper precision for quantize
+            return price.quantize(tick, rounding=ROUND_HALF_UP)
+        except InvalidOperation:
+            # If quantize fails, try to normalize the tick size
+            # Use Decimal's as_tuple() to get the exponent (precision)
+            try:
+                tick_tuple = tick.as_tuple()
+                if tick_tuple.exponent is not None:
+                    # Calculate decimal places from exponent
+                    # Exponent is negative for decimal places (e.g., -2 means 2 decimal places)
+                    decimal_places = abs(tick_tuple.exponent)
+                    # Limit to reasonable precision (max 8 decimal places)
+                    decimal_places = min(decimal_places, 8)
+                else:
+                    decimal_places = 2  # Default fallback
+            except (AttributeError, TypeError):
+                # Fallback: try to extract from string representation
+                tick_str = str(tick).rstrip('0').rstrip('.')
+                if '.' in tick_str:
+                    decimal_places = min(len(tick_str.split('.')[1]), 8)
+                else:
+                    decimal_places = 2
+            
+            # Use a normalized tick based on decimal places
+            if decimal_places > 0:
+                normalized_tick = Decimal('1') / (Decimal('10') ** Decimal(str(decimal_places)))
+            else:
+                normalized_tick = Decimal('1')
+            
+            try:
+                return price.quantize(normalized_tick, rounding=ROUND_HALF_UP)
+            except InvalidOperation:
+                # Last resort: round to reasonable precision (2 decimal places)
+                return price.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     @abstractmethod
     def _validate_config(self) -> None:

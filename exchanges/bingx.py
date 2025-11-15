@@ -143,9 +143,23 @@ class BingxClient(BaseExchangeClient):
         if normalized_type not in {'limit', 'market'}:
             raise ValueError(f"Unsupported TP/SL order_type '{order_type}'.")
 
-        rounded_price = self.round_to_tick(price)
-        price_str = str(rounded_price)
-        quantity_str = self._quantize_amount(quantity)
+        try:
+            # Ensure price is a valid Decimal
+            if price is None:
+                raise ValueError("TP/SL price cannot be None")
+            price_decimal = Decimal(str(price))
+            if price_decimal <= 0:
+                raise ValueError(f"TP/SL price must be positive, got {price_decimal}")
+            
+            rounded_price = self.round_to_tick(price_decimal)
+            price_str = str(rounded_price)
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid TP/SL price '{price}': {exc}") from exc
+        
+        try:
+            quantity_str = self._quantize_amount(quantity)
+        except Exception as exc:
+            raise ValueError(f"Invalid quantity '{quantity}' for TP/SL: {exc}") from exc
 
         type_mapping = {
             ('take_profit', 'limit'): 'TAKE_PROFIT',
