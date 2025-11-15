@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 from decimal import Decimal
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Set
 
 from rich import box
 from rich.console import Console
@@ -76,6 +76,9 @@ class HedgeBot:
         self.last_fill_price: Optional[Decimal] = None
         self.last_fill_side: Optional[str] = None
         self.pending_exit_orders: Dict[str, Dict[str, Any]] = {}
+        self.bingx_exit_orders: Dict[str, Dict[str, Any]] = {}
+        self.bingx_exit_groups: Dict[str, Set[str]] = {}
+        self.exit_orders_active = False
 
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/grvt_bingx_{self.ticker.lower()}_hedge_log.txt"
@@ -323,10 +326,21 @@ class HedgeBot:
                 last_message=f"{size} @ {price}",
                 status="Hedging"
             )
+            if order_id in self.bingx_exit_orders:
+                meta = self.bingx_exit_orders.pop(order_id)
+                base_id = meta.get('base_order_id')
+                if base_id and base_id in self.bingx_exit_groups:
+                    group = self.bingx_exit_groups[base_id]
+                    group.discard(order_id)
+                    if not group:
+                        self.bingx_exit_groups.pop(base_id, None)
+                if self.loop:
+                    asyncio.create_task(self._cancel_bingx_exit_orders(base_order_id=base_id, exclude_order_id=order_id))
 
     async def _handle_close_fill(self, fill_payload: Dict[str, Any], order_id: Optional[str]) -> None:
         try:
             await self._cancel_pending_exit_orders(exclude_order_id=order_id)
+            await self._cancel_bingx_exit_orders()
             await self.place_bingx_hedge(fill_payload)
         except Exception as exc:
             self.logger.error(f"Error handling close fill: {exc}")
@@ -455,10 +469,8 @@ class HedgeBot:
         hedge_side = 'sell' if side == 'buy' else 'buy'
         self.bingx_client.config.direction = hedge_side
         self.bingx_client.config.close_order_side = 'buy' if hedge_side == 'sell' else 'sell'
-        reduce_only = (side == 'sell')  # close GRVT sell -> BingX buy closes short
 
-        filled_total = Decimal('0')
-        attempt = 0
+        await self._cancel_bingx_exit_orders()
 
         self._update_ui(
             last_action=f"BINGX hedge {hedge_side}",
@@ -466,114 +478,71 @@ class HedgeBot:
             status="Hedging"
         )
 
-        while filled_total < target_size and not self.stop_flag:
-            remaining = target_size - filled_total
-            attempt += 1
-            if attempt > self.max_bingx_retries:
-                self.logger.error("[BINGX] Max hedge attempts exceeded")
-                break
-
-            self.logger.info(f"[BINGX] Hedging attempt {attempt}: {hedge_side} {remaining}")
-            order_result = await self.bingx_client.place_bbo_close_order(
-                contract_id=self.bingx_contract_id,
-                quantity=remaining,
-                side=hedge_side,
-                reduce_only=reduce_only
-            )
-
-            if not order_result.success or not order_result.order_id:
-                self.logger.error(f"[BINGX] Hedge order failed: {order_result.error_message}")
-                self._update_ui(
-                    last_action="BINGX hedge failed",
-                    last_message=order_result.error_message or "Unknown error",
-                    status="Error"
-                )
-                return False
-
-            self.active_bingx_order_id = order_result.order_id
-
-            if order_result.status == 'FILLED':
-                synthetic_message = {
-                    'order_id': order_result.order_id,
-                    'side': hedge_side,
-                    'order_type': 'CLOSE',
-                    'status': 'FILLED',
-                    'size': str(remaining),
-                    'price': str(order_result.price or Decimal('0')),
-                    'contract_id': self.bingx_contract_id,
-                    'filled_size': str(remaining)
-                }
-                self._handle_bingx_order_update(synthetic_message)
-                filled_total = target_size
-                break
-
-            self.bingx_fill_event.clear()
-            fill_confirmed = await self._wait_for_bingx_fill(order_result.order_id)
-            if fill_confirmed:
-                filled_total += remaining
-                self.active_bingx_order_id = None
-                continue
-
-            # Timeout or mismatch - check current status
-            info = await self.bingx_client.get_order_info(order_result.order_id)
-            if info and info.status == 'FILLED':
-                filled_total = target_size
-                self.active_bingx_order_id = None
-                continue
-
-            partial_filled = Decimal('0')
-            if info:
-                partial_filled = info.filled_size
-                filled_total = min(target_size, filled_total + partial_filled)
-
-            await self.bingx_client.cancel_order(order_result.order_id)
-            self.active_bingx_order_id = None
-            self.logger.warning(
-                f"[BINGX] Repricing hedge order {order_result.order_id}, "
-                f"filled={filled_total}, remaining={target_size - filled_total}"
-            )
-
-        success = filled_total >= target_size
-        if not success:
-            self._update_ui(
-                last_action="BINGX hedge incomplete",
-                last_message="Continuing without full hedge",
-                status="Warning"
-            )
-            self.logger.warning("[BINGX] Unable to complete hedge; continuing per relaxed mode")
-            return False
-
-        self.logger.info("[BINGX] Hedge cycle completed")
-        self._update_ui(
-            last_action="BINGX hedge complete",
-            last_message=f"{target_size}",
-            status="Hedged"
+        order_result = await self.bingx_client.place_market_order(
+            contract_id=self.bingx_contract_id,
+            quantity=target_size,
+            side=hedge_side
         )
-        return True
 
-    async def _wait_for_bingx_fill(self, order_id: str) -> bool:
-        timeout = float(self.fill_timeout)
-        if timeout <= 0:
-            timeout = 5.0
-        try:
-            await asyncio.wait_for(self.bingx_fill_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
+        if not order_result.success or not order_result.order_id:
+            self.logger.error(f"[BINGX] Hedge order failed: {order_result.error_message}")
+            self._update_ui(
+                last_action="BINGX hedge failed",
+                last_message=order_result.error_message or "Unknown error",
+                status="Error"
+            )
             return False
-        finally:
-            if self.bingx_fill_event.is_set():
-                self.bingx_fill_event.clear()
 
-        if self.last_bingx_fill and self.last_bingx_fill.get('order_id') == order_id:
-            return True
-        return False
+        filled_size = order_result.filled_size or target_size
+        hedge_price = order_result.price or Decimal('0')
+        hedge_price = Decimal(str(hedge_price))
+
+        if hedge_side == 'buy':
+            self.bingx_position += filled_size
+        else:
+            self.bingx_position -= filled_size
+        self.total_bingx_volume += filled_size
+
+        self.last_bingx_fill = {
+            'order_id': order_result.order_id,
+            'side': hedge_side,
+            'size': filled_size,
+            'price': hedge_price
+        }
+        self.active_bingx_order_id = order_result.order_id
+
+        self.logger.info(
+            f"[BINGX] MARKET {hedge_side.upper()} {filled_size} @ {hedge_price} | Position={self.bingx_position}"
+        )
+        self._update_ui(
+            bingx_position=self.bingx_position,
+            bingx_volume=self.total_bingx_volume,
+            last_action=f"BINGX {hedge_side} hedge",
+            last_message=f"{filled_size} @ {hedge_price}",
+            status="Hedging"
+        )
+
+        if self.auto_exit_enabled:
+            grvt_price = Decimal(str(fill.get('price', hedge_price)))
+            avg_entry_price = (grvt_price + hedge_price) / Decimal('2')
+            placed_grvt = await self._place_exit_orders(fill, entry_price_override=avg_entry_price)
+            self.exit_orders_active = placed_grvt
+            await self._place_bingx_exit_orders(
+                base_order_id=order_result.order_id,
+                entry_side=hedge_side,
+                size=filled_size,
+                avg_entry_price=avg_entry_price
+            )
+
+        return True
 
     async def execute_cycle(self, side: str) -> Optional[Dict[str, Any]]:
         fill = await self.place_grvt_order(side)
         if not fill or self.stop_flag:
             return None
 
-        await self.place_bingx_hedge(fill)
-        if self.stop_flag:
+        hedge_success = await self.place_bingx_hedge(fill)
+        if not hedge_success or self.stop_flag:
             return None
 
         if self.sleep_time > 0 and not self.stop_flag:
@@ -618,11 +587,14 @@ class HedgeBot:
         self.logger.info(f"[GRVT] Exit {label.upper()} order {result.order_id} placed @ {price}")
         return result.order_id
 
-    async def _place_exit_orders(self, fill: Dict[str, Any]) -> bool:
+    async def _place_exit_orders(self, fill: Dict[str, Any], entry_price_override: Optional[Decimal] = None) -> bool:
         if not self.auto_exit_enabled:
             return False
 
-        entry_price = Decimal(str(fill.get('price', '0')))
+        if entry_price_override is not None:
+            entry_price = entry_price_override
+        else:
+            entry_price = Decimal(str(fill.get('price', '0')))
         entry_side = fill.get('side', 'buy')
         size = Decimal(str(fill.get('size', self.order_quantity)))
         exit_side = 'sell' if entry_side == 'buy' else 'buy'
@@ -636,6 +608,9 @@ class HedgeBot:
             sl_price = self._calculate_exit_price(entry_price, entry_side, self.sl_roi, 'sl')
             order_id = await self._submit_exit_order(sl_price, exit_side, size, 'sl')
             placed_any = placed_any or bool(order_id)
+        self.exit_orders_active = placed_any
+        if not placed_any:
+            self.logger.warning("No GRVT exit orders active after placement attempt")
         return placed_any
 
     async def _wait_for_exit_fill(self, expected_side: str) -> Optional[Dict[str, Any]]:
@@ -652,6 +627,7 @@ class HedgeBot:
 
     async def _cancel_pending_exit_orders(self, exclude_order_id: Optional[str] = None) -> None:
         if not self.pending_exit_orders:
+            self.exit_orders_active = False
             return
         assert self.grvt_client is not None
         to_cancel = [oid for oid in list(self.pending_exit_orders.keys()) if oid != exclude_order_id]
@@ -662,6 +638,123 @@ class HedgeBot:
                 self.logger.warning(f"Failed to cancel exit order {order_id}: {exc}")
             finally:
                 self.pending_exit_orders.pop(order_id, None)
+        if not self.pending_exit_orders:
+            self.exit_orders_active = False
+
+    async def _submit_bingx_exit_order(
+        self,
+        *,
+        base_order_id: str,
+        price: Decimal,
+        side: str,
+        size: Decimal,
+        label: str,
+        post_only: bool,
+        stop_price: Optional[Decimal] = None
+    ) -> Optional[str]:
+        assert self.bingx_client is not None
+        assert self.bingx_contract_id is not None
+
+        result = await self.bingx_client.place_reduce_only_limit(
+            contract_id=self.bingx_contract_id,
+            quantity=size,
+            side=side,
+            price=price,
+            post_only=post_only,
+            stop_price=stop_price
+        )
+
+        if not result.success or not result.order_id:
+            self.logger.error(f"[BINGX] Failed to place {label} exit order: {result.error_message}")
+            return None
+
+        self.bingx_exit_orders[result.order_id] = {
+            'base_order_id': base_order_id,
+            'side': side,
+            'size': size,
+            'price': price,
+            'label': label
+        }
+        self.bingx_exit_groups.setdefault(base_order_id, set()).add(result.order_id)
+        self.logger.info(f"[BINGX] Exit {label.upper()} order {result.order_id} placed @ {price}")
+        return result.order_id
+
+    async def _place_bingx_exit_orders(
+        self,
+        *,
+        base_order_id: Optional[str],
+        entry_side: str,
+        size: Decimal,
+        avg_entry_price: Decimal
+    ) -> bool:
+        if not self.auto_exit_enabled or not base_order_id:
+            return False
+
+        exit_side = 'buy' if entry_side == 'sell' else 'sell'
+        placed_any = False
+
+        if self.tp_roi is not None:
+            tp_price = self._calculate_exit_price(avg_entry_price, entry_side, self.tp_roi, 'tp')
+            order_id = await self._submit_bingx_exit_order(
+                base_order_id=base_order_id,
+                price=tp_price,
+                side=exit_side,
+                size=size,
+                label='tp',
+                post_only=True
+            )
+            placed_any = placed_any or bool(order_id)
+
+        if self.sl_roi is not None:
+            sl_price = self._calculate_exit_price(avg_entry_price, entry_side, self.sl_roi, 'sl')
+            order_id = await self._submit_bingx_exit_order(
+                base_order_id=base_order_id,
+                price=sl_price,
+                side=exit_side,
+                size=size,
+                label='sl',
+                post_only=False,
+                stop_price=sl_price
+            )
+            placed_any = placed_any or bool(order_id)
+
+        if not placed_any:
+            self.logger.warning("[BINGX] Failed to place TP/SL exit orders")
+        return placed_any
+
+    async def _cancel_bingx_exit_orders(
+        self,
+        *,
+        base_order_id: Optional[str] = None,
+        exclude_order_id: Optional[str] = None
+    ) -> None:
+        if not self.bingx_exit_orders:
+            return
+        assert self.bingx_client is not None
+
+        if base_order_id:
+            order_ids = list(self.bingx_exit_groups.get(base_order_id, set()))
+        else:
+            order_ids = list(self.bingx_exit_orders.keys())
+
+        for order_id in order_ids:
+            if exclude_order_id and order_id == exclude_order_id:
+                continue
+            if order_id not in self.bingx_exit_orders:
+                continue
+            try:
+                await self.bingx_client.cancel_order(order_id)
+            except Exception as exc:
+                self.logger.warning(f"[BINGX] Failed to cancel exit order {order_id}: {exc}")
+            finally:
+                meta = self.bingx_exit_orders.pop(order_id, None)
+                if meta:
+                    group_id = meta.get('base_order_id')
+                    if group_id and group_id in self.bingx_exit_groups:
+                        group = self.bingx_exit_groups[group_id]
+                        group.discard(order_id)
+                        if not group:
+                            self.bingx_exit_groups.pop(group_id, None)
 
     # ------------------------------------------------------------------ #
     # Main run loop
@@ -692,15 +785,15 @@ class HedgeBot:
             self._update_ui(iteration=iteration, phase="BUY cycle", status="Running")
 
             await self._cancel_pending_exit_orders()
+            await self._cancel_bingx_exit_orders()
 
             fill_buy = await self.execute_cycle('buy')
             if self.stop_flag or not fill_buy:
                 break
 
             if self.auto_exit_enabled:
-                placed = await self._place_exit_orders(fill_buy)
-                if not placed:
-                    self.logger.error("Failed to place ROI exit orders; falling back to manual routine")
+                if not self.exit_orders_active:
+                    self.logger.error("ROI exit orders inactive; falling back to manual routine")
                 else:
                     self._update_ui(phase="EXIT orders resting", status="Waiting")
                     exit_side = 'sell' if fill_buy.get('side') == 'buy' else 'buy'
@@ -708,6 +801,7 @@ class HedgeBot:
                     if exit_fill is None:
                         self.logger.warning("Exit orders did not fill within timeout; cancelling")
                     await self._cancel_pending_exit_orders()
+                    await self._cancel_bingx_exit_orders()
                     continue
 
             entry_avg_price = Decimal(str(fill_buy.get('price'))) if fill_buy.get('price') is not None else await self.wait_for_last_fill(expected_side='buy')

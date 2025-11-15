@@ -154,7 +154,8 @@ class BingxClient(BaseExchangeClient):
         price: Decimal,
         *,
         reduce_only: bool = False,
-        post_only: bool = True
+        post_only: bool = True,
+        extra_params: Optional[Dict[str, Any]] = None
     ) -> OrderResult:
         params = {
             'reduceOnly': reduce_only
@@ -164,6 +165,8 @@ class BingxClient(BaseExchangeClient):
                 'timeInForce': 'PO',  # post-only if supported
                 'postOnly': True,
             })
+        if extra_params:
+            params.update(extra_params)
 
         order_price = self.round_to_tick(price)
         amount_str = self._quantize_amount(quantity)
@@ -202,6 +205,30 @@ class BingxClient(BaseExchangeClient):
             size=quantity,
             price=order_price,
             status=status
+        )
+
+    async def place_reduce_only_limit(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        side: str,
+        price: Decimal,
+        *,
+        post_only: bool = True,
+        stop_price: Optional[Decimal] = None
+    ) -> OrderResult:
+        extra_params: Dict[str, Any] = {}
+        if stop_price is not None:
+            extra_params['stopPrice'] = str(stop_price)
+
+        return await self._create_limit_order(
+            contract_id=contract_id,
+            quantity=quantity,
+            side=side.lower(),
+            price=price,
+            reduce_only=True,
+            post_only=post_only,
+            extra_params=extra_params or None
         )
 
     @query_retry(default_return=(Decimal('0'), Decimal('0')))
