@@ -1171,9 +1171,9 @@ class HedgeBot:
 
         iteration = 0
         while not self.stop_flag and iteration < self.iterations:
-            iteration += 1
-            self.logger.info(f"----- Iteration {iteration}/{self.iterations} -----")
+            self.logger.info(f"----- Attempting cycle (target iteration {iteration + 1}/{self.iterations}) -----")
 
+            # Execute buy cycle
             buy_completed = await self._run_cycle_phase('buy')
             if self.stop_flag or not buy_completed:
                 break
@@ -1182,6 +1182,7 @@ class HedgeBot:
             if self.stop_flag:
                 break
 
+            # Execute sell cycle
             sell_completed = await self._run_cycle_phase('sell')
             if self.stop_flag or not sell_completed:
                 break
@@ -1190,15 +1191,19 @@ class HedgeBot:
             if self.stop_flag:
                 break
 
-            if not self._positions_are_flat():
-                self.logger.error(
-                    "Residual positions detected after iteration %s | GRVT=%s | BingX=%s. Halting to prevent compounding.",
-                    iteration,
-                    self.grvt_position,
-                    self.bingx_position
+            # Strict mode: Only count as completed iteration when positions are fully closed
+            if self._positions_are_flat():
+                iteration += 1
+                self.logger.info(
+                    f"✅ Cycle completed - Iteration {iteration}/{self.iterations} | Positions are flat"
                 )
-                self.stop_flag = True
-                break
+            else:
+                # Positions not closed yet - continue trying to close them
+                self.logger.warning(
+                    f"⚠️ Positions not fully closed | GRVT={self.grvt_position} | BingX={self.bingx_position}. "
+                    f"Retrying cycle (strict mode)..."
+                )
+                # Continue the loop without incrementing iteration to retry closing positions
 
         self.logger.info("Trading loop finished")
 
