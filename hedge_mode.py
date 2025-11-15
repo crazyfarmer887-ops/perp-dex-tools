@@ -62,6 +62,8 @@ Examples:
                         help='Target ROI percentage for stop loss based on average entry price')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
+    parser.add_argument('--position-close', action='store_true',
+                        help='(grvt_bingx only) Place limit OPEN orders on both exchanges to close existing hedge positions')
     
     return parser.parse_args()
 
@@ -141,8 +143,18 @@ async def main():
             tp_roi=tp_roi,
             sl_roi=sl_roi
         )
+        if args.position_close:
+            if args.exchange.lower() != 'grvt_bingx':
+                print("--position-close is currently supported only for the grvt_bingx hedge mode.")
+                return 1
+            print("Submitting limit close orders on GRVT + BingX...")
+            try:
+                await bot.close_positions_with_limit_orders()
+            finally:
+                await bot.cleanup()
+            return 0
         
-        # Run the bot
+        # Run the bot normally
         await bot.run()
         
     except KeyboardInterrupt:

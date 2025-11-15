@@ -327,6 +327,9 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 
 # 运行 BTC 对冲模式（Apex），并使用 ROI 止盈/止损
 python hedge_mode.py --exchange apex --ticker BTC --size 0.05 --iter 20 --tp-roi 0.4 --sl-roi 0.2
+
+# 使用 GRVT + BingX 对冲模式，通过限价 open 单平掉现有仓位
+python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --position-close
 ```
 
 ### 对冲模式参数
@@ -339,6 +342,7 @@ python hedge_mode.py --exchange apex --ticker BTC --size 0.05 --iter 20 --tp-roi
 - `--sleep`: 每一笔交易之后的暂停时间，增加持仓时间（秒，默认 0）
 - `--tp-roi`: 基于平均开仓价的止盈 ROI 百分比（可选）
 - `--sl-roi`: 基于平均开仓价的止损 ROI 百分比（可选）
+- `--position-close`: （仅限 grvt_bingx）跳过正常交易循环，直接在两个交易所同时挂出限价 OPEN 单来平掉当前对冲仓位
 
 ## 配置
 

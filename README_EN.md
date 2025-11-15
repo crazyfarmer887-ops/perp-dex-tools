@@ -304,6 +304,9 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 
 # Run BTC hedge mode with Apex using ROI-based take profit/stop loss
 python hedge_mode.py --exchange apex --ticker BTC --size 0.05 --iter 20 --tp-roi 0.4 --sl-roi 0.2
+
+# Close existing GRVT + BingX hedge positions via limit open orders
+python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --position-close
 ```
 
 ### Hedge Mode Parameters
@@ -316,6 +319,7 @@ python hedge_mode.py --exchange apex --ticker BTC --size 0.05 --iter 20 --tp-roi
 - `--sleep`: Sleep time in seconds after each step (default: 0)
 - `--tp-roi`: Take profit ROI percentage relative to the average entry price (optional)
 - `--sl-roi`: Stop loss ROI percentage relative to the average entry price (optional)
+- `--position-close`: (grvt_bingx only) Skip the trading loop and submit limit OPEN orders on both exchanges to flatten existing hedge positions
 
 ## Configuration
 
