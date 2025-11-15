@@ -6,7 +6,7 @@ All exchange implementations should inherit from this class.
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional, Tuple, Type, Union
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation, localcontext
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 
@@ -67,11 +67,32 @@ class BaseExchangeClient(ABC):
         self._validate_config()
 
     def round_to_tick(self, price) -> Decimal:
-        price = Decimal(price)
+        """Round a price to the configured tick size, supporting arbitrary tick increments."""
+        price_dec = Decimal(str(price))
 
-        tick = self.config.tick_size
-        # quantize forces price to be a multiple of tick
-        return price.quantize(tick, rounding=ROUND_HALF_UP)
+        tick_value = getattr(self.config, 'tick_size', None)
+        if tick_value in (None, 0, Decimal('0')):
+            return price_dec
+
+        tick_dec = Decimal(str(tick_value))
+        if tick_dec <= 0:
+            return price_dec
+
+        # For non power-of-ten ticks we cannot rely on Decimal.quantize directly because it
+        # raises InvalidOperation. Instead, compute how many ticks fit into the price,
+        # round that integer count, and rebuild the price.
+        with localcontext() as ctx:
+            ctx.prec = max(ctx.prec, 34)
+            steps = (price_dec / tick_dec).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+            rounded = steps * tick_dec
+
+        try:
+            # Align the exponent with the tick when possible for cleaner decimals.
+            rounded = rounded.quantize(tick_dec)
+        except InvalidOperation:
+            pass
+
+        return rounded
 
     @abstractmethod
     def _validate_config(self) -> None:
