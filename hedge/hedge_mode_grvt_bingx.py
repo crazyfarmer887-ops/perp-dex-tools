@@ -497,11 +497,10 @@ class HedgeBot:
         if not success:
             self._update_ui(
                 last_action="BINGX hedge incomplete",
-                last_message="Stop flag engaged",
-                status="Error"
+                last_message="Continuing without full hedge",
+                status="Warning"
             )
-            self.logger.error("[BINGX] Unable to complete hedge; stopping per SOP")
-            self.stop_flag = True
+            self.logger.warning("[BINGX] Unable to complete hedge; continuing per relaxed mode")
             return False
 
         self.logger.info("[BINGX] Hedge cycle completed")
@@ -533,41 +532,14 @@ class HedgeBot:
         if not fill or self.stop_flag:
             return None
 
-        hedge_success = await self.place_bingx_hedge(fill)
-        if not hedge_success or self.stop_flag:
+        await self.place_bingx_hedge(fill)
+        if self.stop_flag:
             return None
 
         if self.sleep_time > 0 and not self.stop_flag:
             await asyncio.sleep(self.sleep_time)
 
         return fill
-
-    async def _ensure_positions_flat(self) -> bool:
-        assert self.grvt_client is not None
-        assert self.bingx_client is not None
-
-        grvt_pos = await self.grvt_client.get_account_positions()
-        bingx_pos = await self.bingx_client.get_account_positions()
-
-        tolerance = self.position_tolerance
-        if grvt_pos <= tolerance and bingx_pos <= tolerance:
-            self._update_ui(
-                last_action="Positions flat",
-                last_message=f"GRVT={grvt_pos} | BingX={bingx_pos}",
-                status="Flat"
-            )
-            return True
-
-        self.logger.error(
-            f"Positions not flat (GRVT={grvt_pos}, BingX={bingx_pos}). Halting per SOP."
-        )
-        self._update_ui(
-            last_action="Positions mismatch",
-            last_message=f"GRVT={grvt_pos}, BingX={bingx_pos}",
-            status="Halted"
-        )
-        self.stop_flag = True
-        return False
 
     # ------------------------------------------------------------------ #
     # Main run loop
@@ -597,17 +569,13 @@ class HedgeBot:
             self.logger.info(f"----- Iteration {iteration}/{self.iterations} -----")
             self._update_ui(iteration=iteration, phase="BUY cycle", status="Running")
 
-            fill_buy = await self.execute_cycle('buy')
-            if self.stop_flag or not fill_buy:
-                self.logger.error("Buy cycle failed; stopping per SOP")
+            await self.execute_cycle('buy')
+            if self.stop_flag:
                 break
 
             entry_avg_price = await self.wait_for_last_fill(expected_side='buy')
-            if entry_avg_price is None:
-                self.logger.error("Missing GRVT buy fill confirmation; stopping")
-                break
 
-            if fill_buy and entry_avg_price is not None and (self.tp_roi is not None or self.sl_roi is not None):
+            if entry_avg_price is not None and (self.tp_roi is not None or self.sl_roi is not None):
                 self.logger.info(f"Waiting for ROI thresholds based on entry price {entry_avg_price} before sell cycle")
                 self._update_ui(
                     phase="ROI wait",
@@ -634,18 +602,11 @@ class HedgeBot:
                 break
 
             self._update_ui(phase="SELL cycle", status="Running")
-            sell_fill = await self.execute_cycle('sell')
-            if self.stop_flag or not sell_fill:
-                self.logger.error("Sell cycle failed; stopping per SOP")
+            await self.execute_cycle('sell')
+            if self.stop_flag:
                 break
 
-            exit_price = await self.wait_for_last_fill(expected_side='sell')
-            if exit_price is None:
-                self.logger.error("Missing GRVT sell fill confirmation; stopping")
-                break
-
-            if not await self._ensure_positions_flat():
-                break
+            await self.wait_for_last_fill(expected_side='sell')
 
         self.logger.info("Trading loop finished")
 
