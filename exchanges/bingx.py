@@ -267,7 +267,14 @@ class BingxClient(BaseExchangeClient):
             reduce_only=True
         )
 
-    async def place_bbo_close_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
+    async def place_bbo_close_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        side: str,
+        *,
+        reduce_only: bool = False
+    ) -> OrderResult:
         """
         Place a reduce-only limit order at the current BBO price to close/open hedge exposure.
         Unlike place_close_order, this method intentionally joins/takes the top of book instead of
@@ -290,7 +297,7 @@ class BingxClient(BaseExchangeClient):
             quantity=quantity,
             side=side_lower,
             price=target_price,
-            reduce_only=True
+            reduce_only=reduce_only
         )
 
     async def place_market_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:

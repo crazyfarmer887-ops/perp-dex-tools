@@ -408,6 +408,7 @@ class HedgeBot:
         hedge_side = 'sell' if side == 'buy' else 'buy'
         self.bingx_client.config.direction = hedge_side
         self.bingx_client.config.close_order_side = 'buy' if hedge_side == 'sell' else 'sell'
+        reduce_only = (side == 'sell')  # close GRVT sell -> BingX buy closes short
 
         filled_total = Decimal('0')
         attempt = 0
@@ -429,7 +430,8 @@ class HedgeBot:
             order_result = await self.bingx_client.place_bbo_close_order(
                 contract_id=self.bingx_contract_id,
                 quantity=remaining,
-                side=hedge_side
+                side=hedge_side,
+                reduce_only=reduce_only
             )
 
             if not order_result.success or not order_result.order_id:
