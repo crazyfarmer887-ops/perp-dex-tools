@@ -153,13 +153,17 @@ class BingxClient(BaseExchangeClient):
         side: str,
         price: Decimal,
         *,
-        reduce_only: bool = False
+        reduce_only: bool = False,
+        post_only: bool = True
     ) -> OrderResult:
         params = {
-            'timeInForce': 'PO',  # post-only if supported
-            'postOnly': True,
             'reduceOnly': reduce_only
         }
+        if post_only:
+            params.update({
+                'timeInForce': 'PO',  # post-only if supported
+                'postOnly': True,
+            })
 
         order_price = self.round_to_tick(price)
         amount_str = self._quantize_amount(quantity)
@@ -243,7 +247,8 @@ class BingxClient(BaseExchangeClient):
             quantity=quantity,
             side=direction,
             price=order_price,
-            reduce_only=False
+            reduce_only=False,
+            post_only=True
         )
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
@@ -264,7 +269,8 @@ class BingxClient(BaseExchangeClient):
             quantity=quantity,
             side=side.lower(),
             price=adjusted_price,
-            reduce_only=True
+            reduce_only=True,
+            post_only=True
         )
 
     async def place_bbo_close_order(
@@ -297,7 +303,8 @@ class BingxClient(BaseExchangeClient):
             quantity=quantity,
             side=side_lower,
             price=target_price,
-            reduce_only=reduce_only
+            reduce_only=reduce_only,
+            post_only=False
         )
 
     async def place_market_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
