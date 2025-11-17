@@ -141,15 +141,32 @@ class HedgeBot:
             tif_value = 'IOC' if self.bingx_hedge_order_type == 'limit' else None
         self.bingx_hedge_time_in_force = tif_value
 
+        roi_targets_defined = self.tp_roi is not None or self.sl_roi is not None
+        attach_source = 'default'
         if bingx_attach_tp_sl is not None:
             attach_value = bool(bingx_attach_tp_sl)
+            attach_source = 'cli'
         else:
             env_attach = _parse_bool(os.getenv('BINGX_HEDGE_ATTACH_TPSL'), 'BINGX_HEDGE_ATTACH_TPSL')
             if env_attach is None:
-                attach_value = False
+                attach_value = roi_targets_defined
+                attach_source = 'roi_auto' if roi_targets_defined else 'default'
             else:
                 attach_value = env_attach
+                attach_source = 'env'
         self.bingx_attach_tp_sl = attach_value
+
+        if roi_targets_defined:
+            if attach_value and attach_source == 'roi_auto':
+                self.logger.info(
+                    "Auto-enabling BingX TP/SL attachments because ROI targets are configured."
+                )
+            elif not attach_value:
+                origin = "CLI flag" if attach_source == 'cli' else "BINGX_HEDGE_ATTACH_TPSL"
+                self.logger.warning(
+                    "ROI targets are set but BingX TP/SL attachments remain disabled (%s override).",
+                    origin
+                )
 
         default_cycle_retry_delay = float(self.sleep_time) if self.sleep_time > 0 else 3.0
         self.cycle_retry_delay = max(

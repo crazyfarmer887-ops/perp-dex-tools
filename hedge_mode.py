@@ -64,6 +64,19 @@ Examples:
                         help=".env file path (default: .env)")
     parser.add_argument('--position-close', action='store_true',
                         help='(grvt_bingx only) Place limit OPEN orders on both exchanges to close existing hedge positions')
+    parser.add_argument(
+        '--bingx-attach-tpsl',
+        dest='bingx_attach_tpsl',
+        action='store_true',
+        help='(grvt_bingx only) Attach ROI-based take profit/stop loss to BingX hedge orders'
+    )
+    parser.add_argument(
+        '--no-bingx-attach-tpsl',
+        dest='bingx_attach_tpsl',
+        action='store_false',
+        help='(grvt_bingx only) Disable attaching ROI-based TP/SL to BingX hedges'
+    )
+    parser.set_defaults(bingx_attach_tpsl=None)
     
     return parser.parse_args()
 
@@ -134,15 +147,19 @@ async def main():
         tp_roi = args.tp_roi if args.tp_roi is not None else None
         sl_roi = args.sl_roi if args.sl_roi is not None else None
 
-        bot = HedgeBotClass(
-            ticker=args.ticker.upper(),
-            order_quantity=Decimal(args.size),
-            fill_timeout=args.fill_timeout,
-            iterations=args.iter,
-            sleep_time=args.sleep,
-            tp_roi=tp_roi,
-            sl_roi=sl_roi
-        )
+        bot_kwargs = {
+            'ticker': args.ticker.upper(),
+            'order_quantity': Decimal(args.size),
+            'fill_timeout': args.fill_timeout,
+            'iterations': args.iter,
+            'sleep_time': args.sleep,
+            'tp_roi': tp_roi,
+            'sl_roi': sl_roi
+        }
+        if args.exchange.lower() == 'grvt_bingx':
+            bot_kwargs['bingx_attach_tp_sl'] = args.bingx_attach_tpsl
+
+        bot = HedgeBotClass(**bot_kwargs)
         if args.position_close:
             if args.exchange.lower() != 'grvt_bingx':
                 print("--position-close is currently supported only for the grvt_bingx hedge mode.")
