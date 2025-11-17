@@ -51,8 +51,8 @@ class HedgeBot:
         self.fill_timeout = fill_timeout
         self.iterations = iterations
         self.sleep_time = sleep_time
-        self.tp_roi = Decimal(tp_roi) if tp_roi is not None else None
-        self.sl_roi = Decimal(sl_roi) if sl_roi is not None else None
+        self.tp_roi: Optional[Decimal] = None
+        self.sl_roi: Optional[Decimal] = None
 
         self.stop_flag = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -80,6 +80,28 @@ class HedgeBot:
         self.parallel_bingx_order: Optional[Dict[str, Any]] = None
 
         config_warnings: List[str] = []
+
+        def _parse_roi(value: Any, label: str, allow_negative: bool = False) -> Optional[Decimal]:
+            if value is None:
+                return None
+            try:
+                roi_value = Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                config_warnings.append(f"{label}='{value}' is invalid; ignoring.")
+                return None
+            if roi_value == 0:
+                config_warnings.append(f"{label} is zero; ignoring.")
+                return None
+            if roi_value < 0:
+                if allow_negative:
+                    roi_value = abs(roi_value)
+                else:
+                    config_warnings.append(f"{label} must be positive; ignoring.")
+                    return None
+            return roi_value
+
+        self.tp_roi = _parse_roi(tp_roi, 'tp_roi', allow_negative=False)
+        self.sl_roi = _parse_roi(sl_roi, 'sl_roi', allow_negative=True)
 
         def _coerce_decimal(value: Any, default: Decimal, label: str) -> Decimal:
             if value is None:
