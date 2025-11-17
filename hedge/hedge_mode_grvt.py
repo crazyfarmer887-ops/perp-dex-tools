@@ -10,7 +10,7 @@ import argparse
 import traceback
 import csv
 from decimal import Decimal
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 from lighter.signer_client import SignerClient
 import sys
@@ -64,6 +64,7 @@ class HedgeBot:
         self.roi_poll_interval: float = 1.0
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
+        self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -640,12 +641,13 @@ class HedgeBot:
             return price
         return (price / self.grvt_tick_size).quantize(Decimal('1')) * self.grvt_tick_size
 
-    async def place_bbo_order(self, side: str, quantity: Decimal):
+    async def place_bbo_order(self, side: str, quantity: Decimal, price_override: Optional[Decimal] = None):
         # Place the order using GRVT client
         order_result = await self.grvt_client.place_open_order(
             contract_id=self.grvt_contract_id,
             quantity=quantity,
-            direction=side.lower()
+            direction=side.lower(),
+            price=price_override
         )
 
         if order_result.success:
@@ -659,14 +661,25 @@ class HedgeBot:
             raise Exception("GRVT client not initialized")
 
         self.grvt_order_status = None
+        
+        # Check if there's a pending price override for this side
+        price_override = None
+        if self.pending_grvt_price and self.pending_grvt_price[0] == side:
+            price_override = self.pending_grvt_price[1]
+            self.logger.info(f"[OPEN] [GRVT] [{side}] Using override price {price_override} for GRVT POST-ONLY order")
+        
         self.logger.info(f"[OPEN] [GRVT] [{side}] Placing GRVT POST-ONLY order")
-        order_id, order_price = await self.place_bbo_order(side, quantity)
+        order_id, order_price = await self.place_bbo_order(side, quantity, price_override=price_override)
+        
+        # Clear pending price if it was used
+        if price_override is not None and self.pending_grvt_price and self.pending_grvt_price[0] == side:
+            self.pending_grvt_price = None
 
         start_time = time.time()
         while not self.stop_flag:
             if self.grvt_order_status == 'CANCELED':
                 self.grvt_order_status = 'NEW'
-                order_id, order_price = await self.place_bbo_order(side, quantity)
+                order_id, order_price = await self.place_bbo_order(side, quantity, price_override=price_override)
                 start_time = time.time()
                 await asyncio.sleep(0.5)
             elif self.grvt_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
@@ -674,14 +687,16 @@ class HedgeBot:
                 # Check if we need to cancel and replace the order
                 should_cancel = False
                 best_bid, best_ask = await self.fetch_grvt_bbo_prices()
-                if side == 'buy':
-                    if order_price < best_bid:
-                        should_cancel = True
-                else:
-                    if order_price > best_ask:
-                        should_cancel = True
+                # Don't cancel if we're using a price override (ROI target price)
+                if price_override is None:
+                    if side == 'buy':
+                        if order_price < best_bid:
+                            should_cancel = True
+                    else:
+                        if order_price > best_ask:
+                            should_cancel = True
                 if time.time() - start_time > 10:
-                    if should_cancel:
+                    if should_cancel and price_override is None:
                         try:
                             # Cancel the order using GRVT client
                             cancel_result = await self.grvt_client.cancel_order(order_id)
@@ -690,7 +705,10 @@ class HedgeBot:
                         except Exception as e:
                             self.logger.error(f"❌ Error canceling GRVT order: {e}")
                     else:
-                        self.logger.info(f"Order {order_id} is at best bid/ask, waiting for fill")
+                        if price_override is not None:
+                            self.logger.info(f"Order {order_id} placed at ROI target price {order_price}, waiting for fill")
+                        else:
+                            self.logger.info(f"Order {order_id} is at best bid/ask, waiting for fill")
                         start_time = time.time()
             elif self.grvt_order_status == 'FILLED':
                 break
@@ -751,6 +769,7 @@ class HedgeBot:
                 self.current_take_profit_price = None
                 self.current_stop_loss_price = None
                 self.last_roi_reason = None
+                self.pending_grvt_price = None
 
 
     def _update_roi_targets(self, side: str, entry_price: Decimal) -> None:
@@ -783,6 +802,40 @@ class HedgeBot:
 
         if messages:
             self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
+
+    def _schedule_next_grvt_order_price(self, trigger: str) -> None:
+        """Schedule the next GRVT order to be placed at TP/SL price when ROI target is hit."""
+        if self.current_entry_side is None:
+            return
+
+        if trigger not in ('take_profit', 'stop_loss'):
+            self.pending_grvt_price = None
+            return
+
+        target_price = (
+            self.current_take_profit_price if trigger == 'take_profit' else self.current_stop_loss_price
+        )
+
+        if target_price is None or target_price <= 0:
+            self.pending_grvt_price = None
+            if target_price is not None and target_price <= 0:
+                self.logger.warning("⚠️ Computed ROI target price is non-positive; skipping override.")
+            return
+
+        side = 'sell' if self.current_entry_side == 'buy' else 'buy'
+
+        rounded_price = target_price
+        if self.grvt_client is not None:
+            try:
+                rounded_price = self.grvt_client.round_to_tick(target_price)
+            except Exception as exc:
+                self.logger.warning(f"⚠️ Failed to round ROI target price: {exc}")
+                rounded_price = target_price
+
+        self.pending_grvt_price = (side, rounded_price)
+        self.logger.info(
+            f"📌 Scheduling next GRVT {side.upper()} order @ {rounded_price} due to {trigger.replace('_', ' ')}"
+        )
 
     async def wait_for_roi(self) -> None:
         """Wait until ROI-based take profit or stop loss is reached before proceeding."""
@@ -833,17 +886,20 @@ class HedgeBot:
                 if take_profit_hit:
                     self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
                     self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%)")
+                    self._schedule_next_grvt_order_price('take_profit')
                     return
 
                 if stop_loss_hit:
                     self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
                     self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%)")
+                    self._schedule_next_grvt_order_price('stop_loss')
                     return
 
             elapsed = time.time() - start_time
             if elapsed >= self.max_roi_wait:
                 self.last_roi_reason = f"timeout ({elapsed:.1f}s)"
                 self.logger.info(f"⏱️ ROI wait timed out after {elapsed:.1f}s; proceeding to close position.")
+                self.pending_grvt_price = None
                 return
 
             await asyncio.sleep(self.roi_poll_interval)
