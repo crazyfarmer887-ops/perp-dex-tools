@@ -6,7 +6,13 @@ All exchange implementations should inherit from this class.
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional, Tuple, Type, Union
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import (
+    Decimal,
+    ROUND_HALF_UP,
+    InvalidOperation,
+    getcontext,
+    localcontext,
+)
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 
@@ -67,11 +73,24 @@ class BaseExchangeClient(ABC):
         self._validate_config()
 
     def round_to_tick(self, price) -> Decimal:
-        price = Decimal(price)
+        """Round prices to the configured tick size with safe precision handling."""
+        price_decimal = Decimal(str(price))
+        tick_size = getattr(self.config, 'tick_size', None)
+        if not tick_size:
+            return price_decimal
 
-        tick = self.config.tick_size
-        # quantize forces price to be a multiple of tick
-        return price.quantize(tick, rounding=ROUND_HALF_UP)
+        tick_decimal = Decimal(str(tick_size))
+        if tick_decimal <= 0:
+            return price_decimal
+
+        extra_precision = len(price_decimal.as_tuple().digits) + abs(tick_decimal.as_tuple().exponent) + 6
+        with localcontext() as ctx:
+            ctx.prec = max(getcontext().prec, extra_precision)
+            try:
+                return price_decimal.quantize(tick_decimal, rounding=ROUND_HALF_UP)
+            except InvalidOperation:
+                ratio = (price_decimal / tick_decimal).to_integral_value(rounding=ROUND_HALF_UP)
+                return (ratio * tick_decimal).normalize()
 
     @abstractmethod
     def _validate_config(self) -> None:
