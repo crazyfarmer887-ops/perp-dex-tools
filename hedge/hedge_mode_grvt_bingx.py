@@ -1323,10 +1323,10 @@ class HedgeBot:
         price_override = None
         if self.pending_grvt_price and self.pending_grvt_price[0] == side:
             price_override = self.pending_grvt_price[1]
-          elif self.entry_tick_price is not None:
-              tick_override = await self._compute_entry_price_override(side)
-              if tick_override is not None:
-                  price_override = tick_override
+        elif self.entry_tick_price is not None:
+            tick_override = await self._compute_entry_price_override(side)
+            if tick_override is not None:
+                price_override = tick_override
 
         trade_delta = self._compute_trade_delta(side)
         if trade_delta == 0:
