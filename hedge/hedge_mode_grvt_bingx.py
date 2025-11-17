@@ -53,6 +53,7 @@ class HedgeBot:
         self.sleep_time = sleep_time
         self.tp_roi: Optional[Decimal] = None
         self.sl_roi: Optional[Decimal] = None
+        self.leverage: Optional[Decimal] = None
 
         self.stop_flag = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -100,8 +101,33 @@ class HedgeBot:
                     return None
             return roi_value
 
-        self.tp_roi = _parse_roi(tp_roi, 'tp_roi', allow_negative=False)
-        self.sl_roi = _parse_roi(sl_roi, 'sl_roi', allow_negative=True)
+        def _normalize_roi(raw_roi: Optional[Decimal]) -> Optional[Decimal]:
+            if raw_roi is None:
+                return None
+            adjusted = raw_roi / self.leverage
+            if adjusted <= 0:
+                return None
+            return adjusted
+
+        raw_tp_roi = _parse_roi(tp_roi, 'tp_roi', allow_negative=False)
+        raw_sl_roi = _parse_roi(sl_roi, 'sl_roi', allow_negative=True)
+
+        self.tp_roi = _normalize_roi(raw_tp_roi)
+        self.sl_roi = _normalize_roi(raw_sl_roi)
+        if leverage is not None:
+            lev_value = _coerce_decimal(leverage, Decimal('1'), 'leverage')
+        else:
+            lev_value = _coerce_decimal(
+                os.getenv('GRVT_BINGX_LEVERAGE'),
+                Decimal('1'),
+                'GRVT_BINGX_LEVERAGE'
+            )
+        if lev_value <= 0:
+            config_warnings.append(
+                f"Leverage value '{lev_value}' is invalid; defaulting to 1 (no leverage scaling)."
+            )
+            lev_value = Decimal('1')
+        self.leverage = lev_value
 
         def _coerce_decimal(value: Any, default: Decimal, label: str) -> Decimal:
             if value is None:
@@ -360,6 +386,8 @@ class HedgeBot:
             "BingX parallel limit entries: %s",
             "ENABLED" if self.bingx_simultaneous_limit else "DISABLED"
         )
+        if self.leverage and self.leverage > 1:
+            self.logger.info("Effective leverage: %sx (ROI scaled accordingly)", self.leverage)
         if self.bingx_attach_tp_sl:
             attachment_reason = "auto (ROI targets configured)" if self._auto_tp_sl_enabled else "explicit"
             self.logger.info("BingX TP/SL attachments ENABLED (%s).", attachment_reason)
