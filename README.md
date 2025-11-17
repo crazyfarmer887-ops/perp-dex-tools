@@ -344,6 +344,7 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `--sl-roi`: 基于平均开仓价的止损 ROI 百分比（可选）
 - `--entry-tick-price`: （仅限 grvt_bingx）根据 GRVT 与 BingX 的中间价平均值加/减该偏移量来提交 GRVT 限价单（多单 -offset, 空单 +offset）
 - `--bingx-sim-limit` / `--no-bingx-sim-limit`: （仅限 grvt_bingx）是否在提交 GRVT maker 单的同时，在 BingX 上提交对冲用的限价单（默认关闭，可通过环境变量启用）
+- `--gap-threshold`: （仅限 grvt_bingx）要求开启一个新循环所需的最小 GRVT/BingX 中间价差（价格单位，默认取 BingX tick）
 - `--position-close`: （仅限 grvt_bingx）跳过正常交易循环，直接在两个交易所同时挂出限价 OPEN 单来平掉当前对冲仓位
 
 `grvt_bingx` 策略会实时比较两家交易所的中间价，当价差超过 BingX 的最小 tick 时：  
@@ -401,6 +402,7 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `GRVT_API_KEY`: 您的 GRVT API 密钥
 - `GRVT_ATTACH_TPSL`: 是否为 GRVT maker 单自动附带 TP/SL 触发器（可选，默认在设置 ROI 时自动开启）
 - `GRVT_TPSL_TRIGGER_BY`: GRVT TPSL 的触发价格类型，可选值：`INDEX`、`LAST`、`MID`、`MARK`（默认：`LAST`）
+- `GRVT_BINGX_GAP_THRESHOLD`: 自定义 GRVT/BingX 中间价差门槛（价格单位），若未设置则默认使用 BingX tick
 
 #### BingX 配置
 

@@ -36,6 +36,7 @@ class HedgeBot:
         tp_roi: Optional[Decimal] = None,
         sl_roi: Optional[Decimal] = None,
         entry_tick_price: Optional[Decimal] = None,
+        gap_threshold: Optional[Decimal] = None,
         bingx_order_type: Optional[str] = None,
         bingx_limit_offset_ticks: Optional[Decimal] = None,
         bingx_attach_tp_sl: Optional[bool] = None,
@@ -153,6 +154,19 @@ class HedgeBot:
             env_tick = os.getenv('GRVT_BINGX_ENTRY_TICK_PRICE')
             tick_value = _coerce_decimal(env_tick, Decimal('0'), 'GRVT_BINGX_ENTRY_TICK_PRICE')
             self.entry_tick_price = tick_value if tick_value > 0 else None
+
+        if gap_threshold is not None:
+            self.gap_threshold = _coerce_decimal(gap_threshold, Decimal('0'), 'gap_threshold')
+        else:
+            env_gap = os.getenv('GRVT_BINGX_GAP_THRESHOLD')
+            self.gap_threshold = _coerce_decimal(env_gap, Decimal('0'), 'GRVT_BINGX_GAP_THRESHOLD')
+        if self.gap_threshold <= 0:
+            fallback_tick = self.bingx_tick_size or Decimal('0.01')
+            if self.gap_threshold < 0:
+                config_warnings.append(
+                    f"gap_threshold='{self.gap_threshold}' is invalid; defaulting to {fallback_tick}."
+                )
+            self.gap_threshold = fallback_tick
 
         env_sim_limit = _parse_bool(os.getenv('BINGX_SIMULTANEOUS_LIMIT'), 'BINGX_SIMULTANEOUS_LIMIT')
         if bingx_simultaneous_limit is not None:
@@ -315,6 +329,11 @@ class HedgeBot:
             self.logger.info("Entry tick-price override enabled: %s", self.entry_tick_price)
         else:
             self.logger.info("Entry tick-price override disabled.")
+        self.logger.info(
+            "Gap threshold: %s (BingX tick=%s)",
+            self.gap_threshold,
+            self.bingx_tick_size or 'UNKNOWN'
+        )
         self.logger.info(
             "BingX parallel limit entries: %s",
             "ENABLED" if self.bingx_simultaneous_limit else "DISABLED"
@@ -1282,7 +1301,7 @@ class HedgeBot:
         grvt_mid = mids['grvt_mid']
         bingx_mid = mids['bingx_mid']
         gap = abs(grvt_mid - bingx_mid)
-        threshold = self.bingx_tick_size or Decimal('0.01')
+        threshold = self.gap_threshold
         self._render_gap_meter(grvt_mid, bingx_mid, gap, threshold)
 
         if gap <= threshold:
