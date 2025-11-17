@@ -270,19 +270,28 @@ class HedgeBot:
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/grvt_bingx_{self.ticker.lower()}_hedge_log.txt"
 
+        log_level_name = (os.getenv('GRVT_BINGX_LOG_LEVEL') or 'INFO').strip().upper()
+        self.log_level = getattr(logging, log_level_name, logging.INFO)
+
         self.logger = logging.getLogger(f"hedge_grvt_bingx_{self.ticker}")
-        self.logger.setLevel(logging.INFO)
+        self.logger.setLevel(self.log_level)
         self.logger.propagate = False
         self.logger.handlers.clear()
 
         file_handler = logging.FileHandler(self.log_filename)
-        file_handler.setLevel(logging.INFO)
-        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setLevel(self.log_level)
+        file_formatter = logging.Formatter(
+            '%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
         file_handler.setFormatter(file_formatter)
 
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
-        console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+        console_handler.setLevel(self.log_level)
+        console_formatter = logging.Formatter(
+            '%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',
+            datefmt='%H:%M:%S'
+        )
         console_handler.setFormatter(console_formatter)
 
         self.logger.addHandler(file_handler)
@@ -357,8 +366,16 @@ class HedgeBot:
         self.grvt_contract_id, self.grvt_tick_size = await self.grvt_client.get_contract_attributes()
         self.bingx_contract_id, self.bingx_tick_size = await self.bingx_client.get_contract_attributes()
 
-        self.logger.info(f"GRVT contract: {self.grvt_contract_id} (tick {self.grvt_tick_size})")
-        self.logger.info(f"BingX contract: {self.bingx_contract_id} (tick {self.bingx_tick_size})")
+        self.logger.info(
+            "GRVT contract: %s (tick %s)",
+            self.grvt_contract_id,
+            self._fmt_decimal(self.grvt_tick_size, 10)
+        )
+        self.logger.info(
+            "BingX contract: %s (tick %s)",
+            self.bingx_contract_id,
+            self._fmt_decimal(self.bingx_tick_size, 10)
+        )
 
     # ------------------------------------------------------------------ #
     # Order handling
@@ -710,6 +727,13 @@ class HedgeBot:
             self.logger.warning(f"[BINGX] Failed to fetch BingX BBO for limit hedge: {exc}")
             return None
 
+        self.logger.debug(
+            "[BINGX] BBO snapshot | best_bid=%s | best_ask=%s | tick=%s",
+            self._fmt_decimal(best_bid, 8),
+            self._fmt_decimal(best_ask, 8),
+            self._fmt_decimal(self.bingx_tick_size, 8)
+        )
+
         tick_size = self.bingx_tick_size or getattr(self.bingx_client.config, 'tick_size', None) or Decimal('0.01')
         offset_ticks = self.bingx_hedge_limit_offset_ticks
         if offset_ticks < 0:
@@ -857,7 +881,9 @@ class HedgeBot:
                 self.current_take_profit_price = entry_price * (one + tp_factor)
             else:
                 self.current_take_profit_price = entry_price * (one - tp_factor)
-            messages.append(f"TP @ {self.current_take_profit_price} ({self.tp_roi}% ROI)")
+            messages.append(
+                f"TP @ {self._fmt_decimal(self.current_take_profit_price, 8)} ({self.tp_roi}% ROI)"
+            )
 
         if self.sl_roi is not None:
             sl_factor = self.sl_roi / hundred
@@ -865,10 +891,27 @@ class HedgeBot:
                 self.current_stop_loss_price = entry_price * (one - sl_factor)
             else:
                 self.current_stop_loss_price = entry_price * (one + sl_factor)
-            messages.append(f"SL @ {self.current_stop_loss_price} (-{self.sl_roi}% ROI)")
+            messages.append(
+                f"SL @ {self._fmt_decimal(self.current_stop_loss_price, 8)} (-{self.sl_roi}% ROI)"
+            )
 
         if messages:
             self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
+
+    @staticmethod
+    def _fmt_decimal(value: Optional[Decimal], max_places: int = 8) -> str:
+        if value is None:
+            return "None"
+        quantity = Decimal(value)
+        try:
+            quantize_step = Decimal('1').scaleb(-max_places)
+            quantity = quantity.quantize(quantize_step)
+        except (InvalidOperation, ValueError):
+            quantity = quantity.normalize()
+        text = format(quantity, 'f')
+        if '.' in text:
+            text = text.rstrip('0').rstrip('.')
+        return text
 
     def _target_position_for_side(self, side: str) -> Decimal:
         normalized = side.strip().lower()
@@ -1507,6 +1550,14 @@ class HedgeBot:
                 roi_float = float(roi)
                 take_profit_hit = self.tp_roi is not None and roi >= self.tp_roi
                 stop_loss_hit = self.sl_roi is not None and roi <= -self.sl_roi
+                self.logger.debug(
+                    "ROI monitor | entry=%s | reference=%s | roi=%.6f%% | tp=%s | sl=%s",
+                    self._fmt_decimal(entry_price, 8),
+                    self._fmt_decimal(reference_price, 8),
+                    roi_float,
+                    self._fmt_decimal(self.current_take_profit_price, 8),
+                    self._fmt_decimal(self.current_stop_loss_price, 8)
+                )
 
                 if take_profit_hit:
                     self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
