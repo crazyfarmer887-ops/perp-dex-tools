@@ -539,6 +539,116 @@ class BingxClient(BaseExchangeClient):
 
         return Decimal('0')
 
+    async def get_position_info(self) -> Optional[Dict[str, Any]]:
+        """Get position information including position ID."""
+        try:
+            positions = await self.exchange.fetch_positions([self.config.contract_id])
+            for position in positions:
+                if position.get('symbol') == self.config.contract_id:
+                    return position
+        except (ExchangeError, NetworkError):
+            pass
+        return None
+
+    async def set_position_tp_sl(
+        self,
+        contract_id: str,
+        take_profit_price: Optional[Decimal] = None,
+        stop_loss_price: Optional[Decimal] = None
+    ) -> OrderResult:
+        """Set take profit and stop loss for existing position."""
+        try:
+            position_info = await self.get_position_info()
+            if not position_info:
+                return OrderResult(success=False, error_message="No position found")
+            
+            quantity = Decimal('0')
+            for key in ('positionAmt', 'contracts', 'size', 'contractSize'):
+                value = position_info.get(key)
+                if value not in (None, ''):
+                    try:
+                        quantity = abs(_to_decimal(value))
+                    except (InvalidOperation, ValueError, TypeError):
+                        quantity = Decimal('0')
+                    break
+            
+            if quantity <= 0:
+                return OrderResult(success=False, error_message="Position size is zero")
+            
+            # Determine side based on position
+            side_info = position_info.get('side') or position_info.get('direction') or ''
+            side = 'sell' if 'long' in side_info.lower() or (quantity > 0 and 'buy' in side_info.lower()) else 'buy'
+            
+            # Use modify_position API if available, otherwise place TP/SL orders
+            try:
+                # Try to modify position with TP/SL
+                params: Dict[str, Any] = {}
+                if take_profit_price is not None:
+                    params['takeProfit'] = self._build_tp_sl_payload(
+                        'take_profit',
+                        quantity,
+                        take_profit_price,
+                        'limit'
+                    )
+                if stop_loss_price is not None:
+                    params['stopLoss'] = self._build_tp_sl_payload(
+                        'stop_loss',
+                        quantity,
+                        stop_loss_price,
+                        'limit'
+                    )
+                
+                if params:
+                    # Note: BingX may require using edit_order or modify_position API
+                    # For now, we'll place TP/SL as separate orders
+                    # This is a fallback approach
+                    pass
+            except Exception:
+                pass
+            
+            # Place TP/SL as limit orders (fallback)
+            results = []
+            if take_profit_price is not None and take_profit_price > 0:
+                tp_side = 'sell' if quantity > 0 else 'buy'
+                tp_result = await self.place_limit_order(
+                    contract_id=contract_id,
+                    quantity=quantity,
+                    side=tp_side,
+                    price=take_profit_price,
+                    reduce_only=True,
+                    post_only=False,
+                    take_profit_price=None,  # Already setting price
+                    stop_loss_price=None
+                )
+                if tp_result.success:
+                    self.logger.log(f"[BINGX] TP order placed: {tp_result.order_id} @ {take_profit_price}", "INFO")
+                results.append(('tp', tp_result))
+            
+            if stop_loss_price is not None and stop_loss_price > 0:
+                sl_side = 'sell' if quantity > 0 else 'buy'
+                sl_result = await self.place_limit_order(
+                    contract_id=contract_id,
+                    quantity=quantity,
+                    side=sl_side,
+                    price=stop_loss_price,
+                    reduce_only=True,
+                    post_only=False,
+                    take_profit_price=None,
+                    stop_loss_price=None
+                )
+                if sl_result.success:
+                    self.logger.log(f"[BINGX] SL order placed: {sl_result.order_id} @ {stop_loss_price}", "INFO")
+                results.append(('sl', sl_result))
+            
+            if not results:
+                return OrderResult(success=False, error_message="No TP/SL prices provided")
+            
+            success = any(r[1].success for r in results)
+            return OrderResult(success=success)
+        except Exception as e:
+            self.logger.log(f"[BINGX] Error setting TP/SL: {e}", "ERROR")
+            return OrderResult(success=False, error_message=str(e))
+
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         await self.exchange.load_markets()
         ticker = self.config.ticker.upper()

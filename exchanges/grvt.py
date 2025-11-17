@@ -551,6 +551,72 @@ class GrvtClient(BaseExchangeClient):
 
         return Decimal('0')
 
+    async def get_position_info(self) -> Optional[Dict[str, Any]]:
+        """Get position information including position ID."""
+        positions = self.rest_client.fetch_positions()
+        
+        for position in positions:
+            if position.get('instrument') == self.config.contract_id:
+                return position
+        return None
+
+    async def set_position_tp_sl(
+        self,
+        contract_id: str,
+        take_profit_price: Optional[Decimal] = None,
+        stop_loss_price: Optional[Decimal] = None
+    ) -> OrderResult:
+        """Set take profit and stop loss for existing position."""
+        try:
+            position_info = await self.get_position_info()
+            if not position_info:
+                return OrderResult(success=False, error_message="No position found")
+            
+            position_size = Decimal(str(position_info.get('size', '0')))
+            if abs(position_size) <= 0:
+                return OrderResult(success=False, error_message="Position size is zero")
+            
+            # Determine side based on position
+            side = 'sell' if position_size > 0 else 'buy'
+            quantity = abs(position_size)
+            
+            # Place TP/SL orders as limit orders
+            results = []
+            
+            if take_profit_price is not None and take_profit_price > 0:
+                tp_side = 'sell' if position_size > 0 else 'buy'
+                tp_result = await self.place_close_order(
+                    contract_id=contract_id,
+                    quantity=quantity,
+                    price=take_profit_price,
+                    side=tp_side
+                )
+                if tp_result.success:
+                    self.logger.log(f"[GRVT] TP order placed: {tp_result.order_id} @ {take_profit_price}", "INFO")
+                results.append(('tp', tp_result))
+            
+            if stop_loss_price is not None and stop_loss_price > 0:
+                sl_side = 'sell' if position_size > 0 else 'buy'
+                sl_result = await self.place_close_order(
+                    contract_id=contract_id,
+                    quantity=quantity,
+                    price=stop_loss_price,
+                    side=sl_side
+                )
+                if sl_result.success:
+                    self.logger.log(f"[GRVT] SL order placed: {sl_result.order_id} @ {stop_loss_price}", "INFO")
+                results.append(('sl', sl_result))
+            
+            if not results:
+                return OrderResult(success=False, error_message="No TP/SL prices provided")
+            
+            # Return success if at least one order was placed
+            success = any(r[1].success for r in results)
+            return OrderResult(success=success)
+        except Exception as e:
+            self.logger.log(f"[GRVT] Error setting TP/SL: {e}", "ERROR")
+            return OrderResult(success=False, error_message=str(e))
+
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID and tick size for a ticker."""
         ticker = self.config.ticker
