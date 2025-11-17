@@ -345,7 +345,7 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `--entry-tick-price`: （仅限 grvt_bingx）根据 GRVT 与 BingX 的中间价平均值加/减该偏移量来提交 GRVT 限价单（多单 -offset, 空单 +offset）
 - `--bingx-sim-limit` / `--no-bingx-sim-limit`: （仅限 grvt_bingx）是否在提交 GRVT maker 单的同时，在 BingX 上提交对冲用的限价单（默认关闭，可通过环境变量启用）
 - `--gap-threshold`: （仅限 grvt_bingx）要求开启一个新循环所需的最小 GRVT/BingX 中间价差（价格单位，默认取 BingX tick）
-- `GRVT_BINGX_LEVERAGE`: （可选）传入正数表示“账户杠杆倍数”，TP/SL ROI 会自动除以该倍数（例如杠杆 20，`--tp-roi 10` → 实际只需 +0.5% 的价格波动即可触发）
+- `--leverage`: （仅限 grvt_bingx）设置账户杠杆倍数，TP/SL ROI 会自动除以该倍数（如杠杆 20、`--tp-roi 10` → 实际只需 +0.5% 的价格波动即可触发；也可通过 `GRVT_BINGX_LEVERAGE` 环境变量设置）
 - `--position-close`: （仅限 grvt_bingx）跳过正常交易循环，直接在两个交易所同时挂出限价 OPEN 单来平掉当前对冲仓位
 
 `grvt_bingx` 策略会实时比较两家交易所的中间价，当价差超过 BingX 的最小 tick 时：  

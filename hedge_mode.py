@@ -66,6 +66,8 @@ Examples:
                         help='(grvt_bingx) Submit BingX limit hedge orders simultaneously with GRVT maker entries')
     parser.add_argument('--gap-threshold', type=Decimal, default=None,
                         help='(grvt_bingx) Minimum GRVT vs BingX mid-price gap (in price units) required before opening a cycle (default: BingX tick size)')
+    parser.add_argument('--leverage', type=Decimal, default=None,
+                        help='(grvt_bingx) Account leverage multiplier; TP/SL ROI targets are divided by this factor (e.g., 20 → 10%% ROI becomes 0.5%% price move)')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
     parser.add_argument('--position-close', action='store_true',
@@ -153,6 +155,7 @@ async def main():
             bot_kwargs['entry_tick_price'] = args.entry_tick_price
             bot_kwargs['bingx_simultaneous_limit'] = args.bingx_sim_limit
             bot_kwargs['gap_threshold'] = args.gap_threshold
+            bot_kwargs['leverage'] = args.leverage
 
         bot = HedgeBotClass(**bot_kwargs)
         if args.position_close:

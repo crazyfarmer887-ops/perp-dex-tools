@@ -37,6 +37,7 @@ class HedgeBot:
         sl_roi: Optional[Decimal] = None,
         entry_tick_price: Optional[Decimal] = None,
         gap_threshold: Optional[Decimal] = None,
+        leverage: Optional[Decimal] = None,
         bingx_order_type: Optional[str] = None,
         bingx_limit_offset_ticks: Optional[Decimal] = None,
         bingx_attach_tp_sl: Optional[bool] = None,
@@ -53,7 +54,7 @@ class HedgeBot:
         self.sleep_time = sleep_time
         self.tp_roi: Optional[Decimal] = None
         self.sl_roi: Optional[Decimal] = None
-        self.leverage: Optional[Decimal] = None
+        self.leverage: Decimal = Decimal('1')
 
         self.stop_flag = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -82,6 +83,22 @@ class HedgeBot:
 
         config_warnings: List[str] = []
 
+        def _parse_leverage(value: Any) -> Decimal:
+            if value is None:
+                return Decimal('1')
+            try:
+                lev = Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                config_warnings.append(f"leverage='{value}' is invalid; defaulting to 1.")
+                return Decimal('1')
+            if lev <= 0:
+                config_warnings.append(f"leverage='{lev}' is invalid; defaulting to 1.")
+                return Decimal('1')
+            return lev
+
+        leverage_source = leverage if leverage is not None else os.getenv('GRVT_BINGX_LEVERAGE')
+        self.leverage = _parse_leverage(leverage_source)
+
         def _parse_roi(value: Any, label: str, allow_negative: bool = False) -> Optional[Decimal]:
             if value is None:
                 return None
@@ -104,6 +121,8 @@ class HedgeBot:
         def _normalize_roi(raw_roi: Optional[Decimal]) -> Optional[Decimal]:
             if raw_roi is None:
                 return None
+            if self.leverage <= 0:
+                return raw_roi
             adjusted = raw_roi / self.leverage
             if adjusted <= 0:
                 return None
@@ -114,20 +133,6 @@ class HedgeBot:
 
         self.tp_roi = _normalize_roi(raw_tp_roi)
         self.sl_roi = _normalize_roi(raw_sl_roi)
-        if leverage is not None:
-            lev_value = _coerce_decimal(leverage, Decimal('1'), 'leverage')
-        else:
-            lev_value = _coerce_decimal(
-                os.getenv('GRVT_BINGX_LEVERAGE'),
-                Decimal('1'),
-                'GRVT_BINGX_LEVERAGE'
-            )
-        if lev_value <= 0:
-            config_warnings.append(
-                f"Leverage value '{lev_value}' is invalid; defaulting to 1 (no leverage scaling)."
-            )
-            lev_value = Decimal('1')
-        self.leverage = lev_value
 
         def _coerce_decimal(value: Any, default: Decimal, label: str) -> Decimal:
             if value is None:
