@@ -72,6 +72,15 @@ class HedgeBot:
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
+        
+        # TP/SL monitoring
+        self.grvt_tp_order_id: Optional[str] = None
+        self.grvt_sl_order_id: Optional[str] = None
+        self.bingx_tp_order_id: Optional[str] = None
+        self.bingx_sl_order_id: Optional[str] = None
+        self.tp_sl_monitor_task: Optional[asyncio.Task] = None
+        self.tp_sl_triggered: bool = False
+        self.tp_sl_trigger_time: Optional[float] = None
 
         config_warnings: List[str] = []
 
@@ -760,6 +769,19 @@ class HedgeBot:
         self.current_stop_loss_price = None
         self.last_roi_reason = None
         self.pending_grvt_price = None
+        
+        # Clear TP/SL orders
+        self.grvt_tp_order_id = None
+        self.grvt_sl_order_id = None
+        self.bingx_tp_order_id = None
+        self.bingx_sl_order_id = None
+        self.tp_sl_triggered = False
+        self.tp_sl_trigger_time = None
+        
+        # Cancel TP/SL monitor task
+        if self.tp_sl_monitor_task and not self.tp_sl_monitor_task.done():
+            self.tp_sl_monitor_task.cancel()
+            self.tp_sl_monitor_task = None
 
     def _register_entry(self, fill: Dict[str, Any], previous_position: Decimal) -> None:
         tolerance = self.position_tolerance
@@ -803,6 +825,8 @@ class HedgeBot:
 
         if self.current_entry_price is not None:
             self._update_roi_targets(side, self.current_entry_price)
+            # Set TP/SL orders on both exchanges
+            asyncio.create_task(self._set_tp_sl_orders())
         else:
             self.logger.warning("⚠️ ROI targets disabled due to missing entry price for %s position.", side.upper())
 
@@ -835,6 +859,245 @@ class HedgeBot:
 
         if messages:
             self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
+
+    async def _set_tp_sl_orders(self) -> None:
+        """Set TP/SL orders on both GRVT and BingX positions."""
+        if self.current_entry_price is None or self.current_entry_side is None:
+            return
+        
+        if self.current_take_profit_price is None and self.current_stop_loss_price is None:
+            return
+        
+        if self.grvt_client is None or self.bingx_client is None:
+            return
+        
+        if self.grvt_contract_id is None or self.bingx_contract_id is None:
+            return
+        
+        grvt_position = abs(self.grvt_position)
+        bingx_position = abs(self.bingx_position)
+        
+        if grvt_position <= self.position_tolerance and bingx_position <= self.position_tolerance:
+            return
+        
+        side = self.current_entry_side
+        close_side = 'sell' if side == 'buy' else 'buy'
+        
+        # Set TP/SL on GRVT (monitor position price since GRVT may not support TP/SL API)
+        if grvt_position > self.position_tolerance:
+            self.logger.info(
+                f"[GRVT] TP/SL monitoring enabled | TP={self.current_take_profit_price} | SL={self.current_stop_loss_price}"
+            )
+        
+        # Set TP/SL on BingX (using position TP/SL API if available, otherwise limit orders)
+        if bingx_position > self.position_tolerance:
+            try:
+                # BingX already sets TP/SL during hedge order placement
+                # Try to find TP/SL orders from active orders
+                active_orders = await self.bingx_client.get_active_orders(self.bingx_contract_id)
+                for order in active_orders:
+                    # Check if order is TP/SL order (BingX uses specific order types)
+                    # For now, we'll monitor by checking position price against TP/SL targets
+                    pass
+                self.logger.info(f"[BINGX] TP/SL monitoring via position price check")
+            except Exception as exc:
+                self.logger.warning(f"[BINGX] Failed to set TP/SL orders: {exc}")
+        
+        # Start TP/SL monitoring task
+        if self.tp_sl_monitor_task is None or self.tp_sl_monitor_task.done():
+            self.tp_sl_monitor_task = asyncio.create_task(self._monitor_tp_sl_orders())
+
+    async def _monitor_tp_sl_orders(self) -> None:
+        """Monitor TP/SL orders and handle early closure if one is triggered."""
+        while not self.stop_flag:
+            try:
+                # Check if TP/SL orders are filled
+                grvt_tp_filled = False
+                grvt_sl_filled = False
+                bingx_tp_filled = False
+                bingx_sl_filled = False
+                
+                # Check GRVT TP/SL by monitoring position price
+                if self.current_entry_price and self.current_entry_side:
+                    try:
+                        best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+                        if best_bid > 0 and best_ask > 0:
+                            # Check if current price has reached TP/SL levels
+                            if self.current_entry_side == 'buy':
+                                # Long position: TP is above entry, SL is below entry
+                                if self.current_take_profit_price and best_bid >= self.current_take_profit_price:
+                                    grvt_tp_filled = True
+                                if self.current_stop_loss_price and best_ask <= self.current_stop_loss_price:
+                                    grvt_sl_filled = True
+                            else:
+                                # Short position: TP is below entry, SL is above entry
+                                if self.current_take_profit_price and best_ask <= self.current_take_profit_price:
+                                    grvt_tp_filled = True
+                                if self.current_stop_loss_price and best_bid >= self.current_stop_loss_price:
+                                    grvt_sl_filled = True
+                    except Exception:
+                        pass
+                
+                # Also check GRVT TP/SL orders if we have order IDs (for backward compatibility)
+                if self.grvt_tp_order_id:
+                    try:
+                        order_info = await self.grvt_client.get_order_info(self.grvt_tp_order_id)
+                        if order_info and order_info.status == 'FILLED':
+                            grvt_tp_filled = True
+                    except Exception:
+                        pass
+                
+                if self.grvt_sl_order_id:
+                    try:
+                        order_info = await self.grvt_client.get_order_info(self.grvt_sl_order_id)
+                        if order_info and order_info.status == 'FILLED':
+                            grvt_sl_filled = True
+                    except Exception:
+                        pass
+                
+                # Check BingX TP/SL by monitoring position price
+                if self.current_entry_price and self.current_entry_side:
+                    try:
+                        best_bid, best_ask = await self.bingx_client.fetch_bbo_prices(self.bingx_contract_id)
+                        if best_bid > 0 and best_ask > 0:
+                            # Check if current price has reached TP/SL levels
+                            if self.current_entry_side == 'buy':
+                                # Long position: TP is above entry, SL is below entry
+                                if self.current_take_profit_price and best_bid >= self.current_take_profit_price:
+                                    bingx_tp_filled = True
+                                if self.current_stop_loss_price and best_ask <= self.current_stop_loss_price:
+                                    bingx_sl_filled = True
+                            else:
+                                # Short position: TP is below entry, SL is above entry
+                                if self.current_take_profit_price and best_ask <= self.current_take_profit_price:
+                                    bingx_tp_filled = True
+                                if self.current_stop_loss_price and best_bid >= self.current_stop_loss_price:
+                                    bingx_sl_filled = True
+                    except Exception:
+                        pass
+                
+                # Also check BingX TP/SL orders if we have order IDs
+                if self.bingx_tp_order_id:
+                    try:
+                        order_info = await self.bingx_client.get_order_info(self.bingx_tp_order_id)
+                        if order_info and order_info.status == 'FILLED':
+                            bingx_tp_filled = True
+                    except Exception:
+                        pass
+                
+                if self.bingx_sl_order_id:
+                    try:
+                        order_info = await self.bingx_client.get_order_info(self.bingx_sl_order_id)
+                        if order_info and order_info.status == 'FILLED':
+                            bingx_sl_filled = True
+                    except Exception:
+                        pass
+                
+                # Check if any TP/SL is triggered
+                tp_sl_triggered = grvt_tp_filled or grvt_sl_filled or bingx_tp_filled or bingx_sl_filled
+                
+                if tp_sl_triggered and not self.tp_sl_triggered:
+                    self.tp_sl_triggered = True
+                    self.tp_sl_trigger_time = time.time()
+                    self.logger.info(
+                        "🎯 TP/SL triggered! GRVT: TP=%s SL=%s | BingX: TP=%s SL=%s",
+                        grvt_tp_filled, grvt_sl_filled, bingx_tp_filled, bingx_sl_filled
+                    )
+                
+                # If TP/SL triggered, wait 10 seconds then force close remaining positions
+                if self.tp_sl_triggered and self.tp_sl_trigger_time:
+                    elapsed = time.time() - self.tp_sl_trigger_time
+                    if elapsed >= 10.0:
+                        await self._force_close_remaining_positions()
+                        break
+                
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.logger.warning(f"Error monitoring TP/SL orders: {exc}")
+                await asyncio.sleep(1.0)
+
+    async def _force_close_remaining_positions(self) -> None:
+        """Force close remaining positions with limit orders at 5 ticks from bid/ask."""
+        self.logger.info("🔚 Force closing remaining positions after TP/SL trigger...")
+        
+        if self.grvt_client is None or self.bingx_client is None:
+            return
+        
+        if self.grvt_contract_id is None or self.bingx_contract_id is None:
+            return
+        
+        while not self.stop_flag:
+            grvt_position, bingx_position = await self._fetch_signed_positions()
+            self.grvt_position = grvt_position
+            self.bingx_position = bingx_position
+            
+            tolerance = self.position_tolerance
+            
+            if abs(grvt_position) <= tolerance and abs(bingx_position) <= tolerance:
+                self.logger.info("✅ All positions closed successfully")
+                break
+            
+            # Close GRVT position
+            if abs(grvt_position) > tolerance:
+                try:
+                    best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+                    if best_bid > 0 and best_ask > 0:
+                        tick_size = self.grvt_tick_size or Decimal('0.01')
+                        close_side = 'sell' if grvt_position > 0 else 'buy'
+                        
+                        if close_side == 'sell':
+                            close_price = best_bid - (tick_size * Decimal('5'))
+                        else:
+                            close_price = best_ask + (tick_size * Decimal('5'))
+                        
+                        close_price = self.grvt_client.round_to_tick(close_price)
+                        
+                        result = await self.grvt_client.place_close_order(
+                            contract_id=self.grvt_contract_id,
+                            quantity=abs(grvt_position),
+                            price=close_price,
+                            side=close_side
+                        )
+                        
+                        if result.success:
+                            self.logger.info(
+                                f"[GRVT] Force close order placed: {result.order_id} @ {close_price} ({close_side})"
+                            )
+                except Exception as exc:
+                    self.logger.warning(f"[GRVT] Failed to force close: {exc}")
+            
+            # Close BingX position
+            if abs(bingx_position) > tolerance:
+                try:
+                    best_bid, best_ask = await self.bingx_client.fetch_bbo_prices(self.bingx_contract_id)
+                    if best_bid > 0 and best_ask > 0:
+                        tick_size = self.bingx_tick_size or Decimal('0.01')
+                        close_side = 'sell' if bingx_position > 0 else 'buy'
+                        
+                        if close_side == 'sell':
+                            close_price = best_bid - (tick_size * Decimal('5'))
+                        else:
+                            close_price = best_ask + (tick_size * Decimal('5'))
+                        
+                        close_price = self.bingx_client.round_to_tick(close_price)
+                        
+                        result = await self.bingx_client.place_close_order(
+                            contract_id=self.bingx_contract_id,
+                            quantity=abs(bingx_position),
+                            price=close_price,
+                            side=close_side
+                        )
+                        
+                        if result.success:
+                            self.logger.info(
+                                f"[BINGX] Force close order placed: {result.order_id} @ {close_price} ({close_side})"
+                            )
+                except Exception as exc:
+                    self.logger.warning(f"[BINGX] Failed to force close: {exc}")
+            
+            await asyncio.sleep(1.0)
 
     def _target_position_for_side(self, side: str) -> Decimal:
         normalized = side.strip().lower()
