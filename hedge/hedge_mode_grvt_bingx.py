@@ -40,6 +40,7 @@ class HedgeBot:
         bingx_limit_offset_ticks: Optional[Decimal] = None,
         bingx_attach_tp_sl: Optional[bool] = None,
         bingx_time_in_force: Optional[str] = None,
+        bingx_simultaneous_limit: Optional[bool] = None,
         strict_mode: Optional[bool] = None,
     ):
         self.ticker = ticker.upper()
@@ -73,6 +74,7 @@ class HedgeBot:
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
+        self.parallel_bingx_order: Optional[Dict[str, Any]] = None
 
         config_warnings: List[str] = []
 
@@ -149,6 +151,14 @@ class HedgeBot:
             env_tick = os.getenv('GRVT_BINGX_ENTRY_TICK_PRICE')
             tick_value = _coerce_decimal(env_tick, Decimal('0'), 'GRVT_BINGX_ENTRY_TICK_PRICE')
             self.entry_tick_price = tick_value if tick_value > 0 else None
+
+        env_sim_limit = _parse_bool(os.getenv('BINGX_SIMULTANEOUS_LIMIT'), 'BINGX_SIMULTANEOUS_LIMIT')
+        if bingx_simultaneous_limit is not None:
+            self.bingx_simultaneous_limit = bool(bingx_simultaneous_limit)
+        elif env_sim_limit is not None:
+            self.bingx_simultaneous_limit = env_sim_limit
+        else:
+            self.bingx_simultaneous_limit = False
 
         self._auto_tp_sl_enabled = False
         if bingx_attach_tp_sl is not None:
@@ -285,6 +295,10 @@ class HedgeBot:
             self.logger.info("Entry tick-price override enabled: %s", self.entry_tick_price)
         else:
             self.logger.info("Entry tick-price override disabled.")
+        self.logger.info(
+            "BingX parallel limit entries: %s",
+            "ENABLED" if self.bingx_simultaneous_limit else "DISABLED"
+        )
         if self.bingx_attach_tp_sl:
             attachment_reason = "auto (ROI targets configured)" if self._auto_tp_sl_enabled else "explicit"
             self.logger.info("BingX TP/SL attachments ENABLED (%s).", attachment_reason)
@@ -482,6 +496,13 @@ class HedgeBot:
         hedge_side = 'sell' if side == 'buy' else 'buy'
         self.bingx_client.config.direction = hedge_side
         self.bingx_client.config.close_order_side = 'buy' if hedge_side == 'sell' else 'sell'
+
+        if self.bingx_simultaneous_limit:
+            size, used_parallel = await self._consume_parallel_bingx_order(hedge_side, size)
+            if size <= 0:
+                if used_parallel:
+                    self.logger.info("[BINGX] Parallel limit order fully hedged GRVT %s fill.", side.upper())
+                return True
 
         entry_price: Optional[Decimal]
         try:
@@ -826,6 +847,112 @@ class HedgeBot:
         except Exception as exc:
             self.logger.error(f"[BINGX] Limit hedge exception: {exc}")
             return None
+
+    async def _submit_parallel_bingx_limit(
+        self,
+        hedge_side: str,
+        quantity: Decimal,
+        entry_price_hint: Optional[Decimal]
+    ) -> None:
+        if not self.bingx_simultaneous_limit:
+            return
+        if self.bingx_hedge_order_type != 'limit':
+            self.logger.warning("Parallel BingX limit requested but hedge order type is not 'limit'; skipping.")
+            return
+        if self.bingx_client is None or self.bingx_contract_id is None:
+            return
+        if quantity <= 0:
+            return
+
+        if self.parallel_bingx_order is not None:
+            await self._cancel_parallel_bingx_order("Replacing existing parallel order")
+
+        result = await self._place_bingx_limit_hedge(quantity, hedge_side, entry_price_hint)
+        if result is None or not result.success or not result.order_id:
+            self.logger.warning("[BINGX] Failed to submit parallel limit order for hedge preparation.")
+            return
+
+        self.parallel_bingx_order = {
+            'order_id': result.order_id,
+            'side': hedge_side,
+            'quantity': quantity,
+            'timestamp': time.time(),
+        }
+        self.logger.info(
+            "[BINGX] Parallel %s LIMIT order submitted (%s) qty=%s @ %s",
+            hedge_side.upper(),
+            result.order_id,
+            quantity,
+            result.price
+        )
+
+    async def _cancel_parallel_bingx_order(self, reason: str) -> None:
+        if self.parallel_bingx_order is None:
+            return
+        order_id = self.parallel_bingx_order.get('order_id')
+        self.parallel_bingx_order = None
+        if not order_id:
+            return
+        if self.bingx_client is None:
+            return
+        try:
+            await self.bingx_client.cancel_order(order_id)
+            self.logger.info("[BINGX] Cancelled parallel limit order %s (%s).", order_id, reason)
+        except Exception as exc:
+            self.logger.warning("[BINGX] Failed to cancel parallel order %s (%s): %s", order_id, reason, exc)
+
+    async def _consume_parallel_bingx_order(
+        self,
+        hedge_side: str,
+        required_size: Decimal
+    ) -> Tuple[Decimal, bool]:
+        """
+        Inspect any pre-submitted BingX limit order and determine how much hedge size remains.
+        Returns (remaining_size, used_parallel_order).
+        """
+        if self.parallel_bingx_order is None or required_size <= 0:
+            return required_size, False
+
+        if self.parallel_bingx_order.get('side') != hedge_side:
+            await self._cancel_parallel_bingx_order(
+                f"Parallel order side mismatch (expected {hedge_side})."
+            )
+            return required_size, False
+
+        order_id = self.parallel_bingx_order.get('order_id')
+        if not order_id or self.bingx_client is None:
+            await self._cancel_parallel_bingx_order("Missing order id or client for parallel order.")
+            return required_size, False
+
+        used = False
+        info = await self.bingx_client.get_order_info(order_id)
+        if info is None:
+            await self._cancel_parallel_bingx_order("Unable to fetch parallel order info.")
+            return required_size, False
+
+        filled = info.filled_size or Decimal('0')
+        credited = min(required_size, filled)
+        if credited > 0:
+            used = True
+            if hedge_side == 'buy':
+                self.bingx_position += credited
+            else:
+                self.bingx_position -= credited
+            required_size -= credited
+            self.logger.info(
+                "[BINGX] Parallel order filled %s (remaining hedge %s).",
+                credited,
+                required_size
+            )
+
+        status = (info.status or '').upper()
+        if status in {'FILLED', 'CANCELED', 'REJECTED'} or required_size <= 0:
+            # Cancel any remainder if hedge satisfied
+            await self._cancel_parallel_bingx_order("Parallel order settled.")
+        else:
+            await self._cancel_parallel_bingx_order("Parallel order insufficient; cancelling to retry.")
+
+        return required_size, used
 
     @staticmethod
     def _extract_filled_size(result) -> Optional[Decimal]:
@@ -1362,10 +1489,26 @@ class HedgeBot:
             )
             price_override = None
 
+        parallel_bingx_task: Optional[asyncio.Task] = None
+        if self.bingx_simultaneous_limit and trade_quantity > 0:
+            hedge_side = 'sell' if trade_side == 'buy' else 'buy'
+            entry_hint = price_override
+            parallel_bingx_task = asyncio.create_task(
+                self._submit_parallel_bingx_limit(hedge_side, trade_quantity, entry_hint)
+            )
+
         previous_position = self.grvt_position
 
         fill = await self.place_grvt_order(trade_side, quantity=trade_quantity, price_override=price_override)
+
+        if parallel_bingx_task is not None:
+            try:
+                await parallel_bingx_task
+            except Exception as exc:
+                self.logger.warning("Parallel BingX limit submission raised an error: %s", exc)
+
         if not fill or self.stop_flag:
+            await self._cancel_parallel_bingx_order("GRVT order failed or bot stopping.")
             self._reset_entry_state()
             return False
 

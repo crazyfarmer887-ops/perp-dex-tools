@@ -62,6 +62,8 @@ Examples:
                         help='Target ROI percentage for stop loss based on average entry price')
     parser.add_argument('--entry-tick-price', type=Decimal, default=None,
                         help='(grvt_bingx) Offset (in price units) applied around the combined mid price when submitting GRVT limit entries')
+    parser.add_argument('--bingx-sim-limit', action=argparse.BooleanOptionalAction, default=None,
+                        help='(grvt_bingx) Submit BingX limit hedge orders simultaneously with GRVT maker entries')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
     parser.add_argument('--position-close', action='store_true',
@@ -147,6 +149,7 @@ async def main():
         }
         if args.exchange.lower() == 'grvt_bingx':
             bot_kwargs['entry_tick_price'] = args.entry_tick_price
+            bot_kwargs['bingx_simultaneous_limit'] = args.bingx_sim_limit
 
         bot = HedgeBotClass(**bot_kwargs)
         if args.position_close:

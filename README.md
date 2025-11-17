@@ -343,6 +343,7 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `--tp-roi`: 基于平均开仓价的止盈 ROI 百分比（可选）
 - `--sl-roi`: 基于平均开仓价的止损 ROI 百分比（可选）
 - `--entry-tick-price`: （仅限 grvt_bingx）根据 GRVT 与 BingX 的中间价平均值加/减该偏移量来提交 GRVT 限价单（多单 -offset, 空单 +offset）
+- `--bingx-sim-limit` / `--no-bingx-sim-limit`: （仅限 grvt_bingx）是否在提交 GRVT maker 单的同时，在 BingX 上提交对冲用的限价单（默认关闭，可通过环境变量启用）
 - `--position-close`: （仅限 grvt_bingx）跳过正常交易循环，直接在两个交易所同时挂出限价 OPEN 单来平掉当前对冲仓位
 
 当在 `grvt_bingx` 对冲模式中提供 `--tp-roi` 或 `--sl-roi` 时，系统会自动在 BingX 的对冲订单上附加相应的 take-profit/stop-loss 触发单；如果需要强制关闭该行为，可在环境变量中设置 `BINGX_HEDGE_ATTACH_TPSL=0`。
@@ -401,6 +402,7 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `BINGX_ENVIRONMENT`: 交易环境（`prod` 或 `testnet`，可选）
 - `BINGX_HEDGE_ATTACH_TPSL`: 是否为 grvt_bingx 对冲单附带 TP/SL（可选，默认会在提供 ROI 目标时自动开启）
 - `GRVT_BINGX_ENTRY_TICK_PRICE`: （可选）若未在命令行传入 `--entry-tick-price`，可通过该环境变量设置进入仓位时围绕均价的偏移量
+- `BINGX_SIMULTANEOUS_LIMIT`: （可选）设置为 1 时，在 GRVT 下 maker 单的同时就向 BingX 提交对冲限价单；设置为 0 则禁用
 
 #### Extended 配置
 
