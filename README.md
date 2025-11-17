@@ -344,6 +344,8 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `--sl-roi`: 基于平均开仓价的止损 ROI 百分比（可选）
 - `--position-close`: （仅限 grvt_bingx）跳过正常交易循环，直接在两个交易所同时挂出限价 OPEN 单来平掉当前对冲仓位
 
+当在 `grvt_bingx` 对冲模式中提供 `--tp-roi` 或 `--sl-roi` 时，系统会自动在 BingX 的对冲订单上附加相应的 take-profit/stop-loss 触发单；如果需要强制关闭该行为，可在环境变量中设置 `BINGX_HEDGE_ATTACH_TPSL=0`。
+
 ## 配置
 
 ### 环境变量
@@ -396,6 +398,7 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `BINGX_API_KEY`: 您的 BingX API Key
 - `BINGX_API_SECRET`: 您的 BingX API Secret
 - `BINGX_ENVIRONMENT`: 交易环境（`prod` 或 `testnet`，可选）
+- `BINGX_HEDGE_ATTACH_TPSL`: 是否为 grvt_bingx 对冲单附带 TP/SL（可选，默认会在提供 ROI 目标时自动开启）
 
 #### Extended 配置
 

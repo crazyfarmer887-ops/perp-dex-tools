@@ -141,12 +141,14 @@ class HedgeBot:
             tif_value = 'IOC' if self.bingx_hedge_order_type == 'limit' else None
         self.bingx_hedge_time_in_force = tif_value
 
+        self._auto_tp_sl_enabled = False
         if bingx_attach_tp_sl is not None:
             attach_value = bool(bingx_attach_tp_sl)
         else:
             env_attach = _parse_bool(os.getenv('BINGX_HEDGE_ATTACH_TPSL'), 'BINGX_HEDGE_ATTACH_TPSL')
             if env_attach is None:
-                attach_value = False
+                attach_value = (self.tp_roi is not None) or (self.sl_roi is not None)
+                self._auto_tp_sl_enabled = attach_value
             else:
                 attach_value = env_attach
         self.bingx_attach_tp_sl = attach_value
@@ -270,6 +272,11 @@ class HedgeBot:
             self.bingx_hedge_time_in_force or 'DEFAULT',
             self.bingx_attach_tp_sl,
         )
+        if self.bingx_attach_tp_sl:
+            attachment_reason = "auto (ROI targets configured)" if self._auto_tp_sl_enabled else "explicit"
+            self.logger.info("BingX TP/SL attachments ENABLED (%s).", attachment_reason)
+        elif self.tp_roi is not None or self.sl_roi is not None:
+            self.logger.info("ROI targets configured but BingX TP/SL attachments are disabled.")
         self.logger.info("Strict cycle mode: %s", "ENABLED" if self.strict_mode else "DISABLED")
         self.logger.info(
             "Position close guard | poll=%.1fs | retry=%.1fs | timeout=%s",
