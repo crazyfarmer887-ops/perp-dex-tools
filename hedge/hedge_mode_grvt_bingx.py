@@ -374,7 +374,19 @@ class HedgeBot:
     async def setup_grvt_websocket(self) -> None:
         assert self.grvt_client is not None
         self.grvt_client.setup_order_update_handler(self._handle_grvt_order_update)
-        await self.grvt_client.connect()
+        try:
+            await self.grvt_client.connect()
+        except Exception as exc:
+            # Log but don't fail on WebSocket connection errors
+            # ConnectionClosedOK is a normal closure and may be logged by pysdk internally
+            if "ConnectionClosed" in str(type(exc).__name__) or "1000" in str(exc):
+                self.logger.warning(
+                    f"GRVT WebSocket connection closed (this may be normal): {exc}. "
+                    "Will continue with REST API only."
+                )
+            else:
+                self.logger.error(f"Failed to setup GRVT WebSocket: {exc}")
+                raise
 
     async def setup_bingx(self) -> None:
         assert self.bingx_client is not None

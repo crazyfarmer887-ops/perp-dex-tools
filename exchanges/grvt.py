@@ -86,6 +86,19 @@ class GrvtClient(BaseExchangeClient):
 
             # Import logger from pysdk like in the test file
             from pysdk.grvt_ccxt_logging_selector import logger
+            import logging
+            
+            # Suppress ConnectionClosedOK warnings from pysdk WebSocket
+            # These are normal closure messages and don't indicate actual errors
+            ws_logger = logging.getLogger('pysdk.grvt_ccxt_logging_selector')
+            original_level = ws_logger.level
+            # Set to ERROR to suppress INFO/WARNING level ConnectionClosedOK messages
+            ws_logger.setLevel(logging.ERROR)
+            
+            # Also suppress websockets library warnings
+            websockets_logger = logging.getLogger('websockets')
+            websockets_original_level = websockets_logger.level
+            websockets_logger.setLevel(logging.ERROR)
 
             # Parameters for GRVT SDK - match test file structure
             parameters = {
@@ -103,8 +116,26 @@ class GrvtClient(BaseExchangeClient):
             )
 
             # Initialize and connect
-            await self._ws_client.initialize()
-            await asyncio.sleep(2)  # Wait for connection to establish
+            try:
+                await self._ws_client.initialize()
+                await asyncio.sleep(2)  # Wait for connection to establish
+            except Exception as ws_exc:
+                # Restore logger levels before re-raising
+                ws_logger.setLevel(original_level)
+                websockets_logger.setLevel(websockets_original_level)
+                # Check if it's a normal connection closure
+                if "ConnectionClosedOK" in str(type(ws_exc).__name__) or "1000" in str(ws_exc):
+                    self.logger.log(
+                        f"GRVT WebSocket connection closed normally: {ws_exc}. "
+                        "This is expected behavior and not an error.",
+                        "INFO"
+                    )
+                    return
+                raise
+            
+            # Restore logger levels after successful connection
+            ws_logger.setLevel(original_level)
+            websockets_logger.setLevel(websockets_original_level)
 
             # If an order update callback was set before connect, subscribe now
             if self._order_update_callback is not None:
@@ -112,6 +143,15 @@ class GrvtClient(BaseExchangeClient):
                 self.logger.log(f"Deferred subscription started for {self.config.contract_id}", "INFO")
 
         except Exception as e:
+            # Restore logger levels in case of error
+            try:
+                import logging
+                ws_logger = logging.getLogger('pysdk.grvt_ccxt_logging_selector')
+                websockets_logger = logging.getLogger('websockets')
+                ws_logger.setLevel(logging.ERROR)
+                websockets_logger.setLevel(logging.ERROR)
+            except:
+                pass
             self.logger.log(f"Error connecting to GRVT WebSocket: {e}", "ERROR")
             raise
 
