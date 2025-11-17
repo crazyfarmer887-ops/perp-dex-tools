@@ -349,7 +349,7 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 `grvt_bingx` 策略会实时比较两家交易所的中间价，当价差超过 BingX 的最小 tick 时：  
 - **GRVT 中间价更低 → 在 GRVT 做多（maker 限价），同时在 BingX 做空对冲**  
 - **GRVT 中间价更高 → 在 GRVT 做空，BingX 对冲做多**  
-并结合 `--tp-roi / --sl-roi` 指定的 ROI 目标：BingX 通过附带 TP/SL 完成退出；GRVT 则在触发 ROI 时自动提交反方向限价单来平掉已有仓位。
+并结合 `--tp-roi / --sl-roi` 指定的 ROI 目标：BingX 通过附带 TP/SL 完成退出；GRVT 则在下单时附带官方 TPSL 触发器（默认以 LAST 价触发），由交易所在价格触及目标时自动平仓。
 
 当在 `grvt_bingx` 对冲模式中提供 `--tp-roi` 或 `--sl-roi` 时，系统会自动在 BingX 的对冲订单上附加相应的 take-profit/stop-loss 触发单；如果需要强制关闭该行为，可在环境变量中设置 `BINGX_HEDGE_ATTACH_TPSL=0`。
 
@@ -399,6 +399,8 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `GRVT_TRADING_ACCOUNT_ID`: 您的 GRVT 交易账户 ID
 - `GRVT_PRIVATE_KEY`: 您的 GRVT 私钥
 - `GRVT_API_KEY`: 您的 GRVT API 密钥
+- `GRVT_ATTACH_TPSL`: 是否为 GRVT maker 单自动附带 TP/SL 触发器（可选，默认在设置 ROI 时自动开启）
+- `GRVT_TPSL_TRIGGER_BY`: GRVT TPSL 的触发价格类型，可选值：`INDEX`、`LAST`、`MID`、`MARK`（默认：`LAST`）
 
 #### BingX 配置
 

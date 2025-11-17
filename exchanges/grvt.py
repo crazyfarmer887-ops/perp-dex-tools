@@ -248,20 +248,33 @@ class GrvtClient(BaseExchangeClient):
 
         return best_bid, best_ask
 
-    async def place_post_only_order(self, contract_id: str, quantity: Decimal, price: Decimal,
-                                    side: str) -> OrderResult:
+    async def place_post_only_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        tp_metadata: Optional[Dict[str, Any]] = None,
+        sl_metadata: Optional[Dict[str, Any]] = None
+    ) -> OrderResult:
         """Place a post only order with GRVT using official SDK."""
 
         # Place the order using GRVT SDK
+        params = {
+            'post_only': True,
+            'order_duration_secs': 30 * 86400 - 1,
+        }
+        if tp_metadata:
+            params['take_profit_metadata'] = tp_metadata
+        if sl_metadata:
+            params['stop_loss_metadata'] = sl_metadata
+
         order_result = self.rest_client.create_limit_order(
             symbol=contract_id,
             side=side,
             amount=quantity,
             price=price,
-            params={
-                'post_only': True,
-                'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
-            }
+            params=params
         )
         if not order_result:
             raise Exception(f"[OPEN] Error placing order")
@@ -303,7 +316,9 @@ class GrvtClient(BaseExchangeClient):
         contract_id: str,
         quantity: Decimal,
         direction: str,
-        price: Optional[Decimal] = None
+        price: Optional[Decimal] = None,
+        tp_metadata: Optional[Dict[str, Any]] = None,
+        sl_metadata: Optional[Dict[str, Any]] = None
     ) -> OrderResult:
         """Place an open order with GRVT."""
         attempt = 0
@@ -356,7 +371,14 @@ class GrvtClient(BaseExchangeClient):
 
             # Place the order using GRVT SDK
             try:
-                order_info = await self.place_post_only_order(contract_id, quantity, order_price, direction)
+                order_info = await self.place_post_only_order(
+                    contract_id,
+                    quantity,
+                    order_price,
+                    direction,
+                    tp_metadata=tp_metadata,
+                    sl_metadata=sl_metadata
+                )
             except Exception as e:
                 self.logger.log(f"[OPEN] Error placing order: {e}", "ERROR")
                 continue

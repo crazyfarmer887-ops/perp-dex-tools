@@ -3,7 +3,7 @@ import os
 import signal
 import sys
 import time
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
@@ -42,6 +42,8 @@ class HedgeBot:
         bingx_time_in_force: Optional[str] = None,
         bingx_simultaneous_limit: Optional[bool] = None,
         strict_mode: Optional[bool] = None,
+        grvt_attach_tp_sl: Optional[bool] = None,
+        grvt_tpsl_trigger_by: Optional[str] = None,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
@@ -171,6 +173,24 @@ class HedgeBot:
             else:
                 attach_value = env_attach
         self.bingx_attach_tp_sl = attach_value
+
+        env_grvt_attach = _parse_bool(os.getenv('GRVT_ATTACH_TPSL'), 'GRVT_ATTACH_TPSL')
+        if grvt_attach_tp_sl is not None:
+            self.grvt_attach_tp_sl = bool(grvt_attach_tp_sl)
+        elif env_grvt_attach is not None:
+            self.grvt_attach_tp_sl = env_grvt_attach
+        else:
+            self.grvt_attach_tp_sl = (self.tp_roi is not None) or (self.sl_roi is not None)
+
+        trigger_source = grvt_tpsl_trigger_by or os.getenv('GRVT_TPSL_TRIGGER_BY') or 'LAST'
+        trigger_value = (trigger_source or 'LAST').strip().upper()
+        allowed_triggers = {'UNSPECIFIED', 'INDEX', 'LAST', 'MID', 'MARK'}
+        if trigger_value not in allowed_triggers:
+            config_warnings.append(
+                f"GRVT TPSL trigger '{trigger_source}' is invalid; defaulting to 'LAST'."
+            )
+            trigger_value = 'LAST'
+        self.grvt_tpsl_trigger_by = trigger_value
 
         default_cycle_retry_delay = float(self.sleep_time) if self.sleep_time > 0 else 3.0
         self.cycle_retry_delay = max(
@@ -304,6 +324,11 @@ class HedgeBot:
             self.logger.info("BingX TP/SL attachments ENABLED (%s).", attachment_reason)
         elif self.tp_roi is not None or self.sl_roi is not None:
             self.logger.info("ROI targets configured but BingX TP/SL attachments are disabled.")
+        self.logger.info(
+            "GRVT TP/SL attachments: %s (trigger_by=%s)",
+            "ENABLED" if self.grvt_attach_tp_sl else "DISABLED",
+            self.grvt_tpsl_trigger_by
+        )
         self.logger.info("Strict cycle mode: %s", "ENABLED" if self.strict_mode else "DISABLED")
         self.logger.info(
             "Position close guard | poll=%.1fs | retry=%.1fs | timeout=%s",
@@ -422,6 +447,13 @@ class HedgeBot:
 
         if price_override is not None:
             self.logger.info(f"[GRVT] Using override price {price_override} for {side} order")
+        else:
+            try:
+                price_override = await self.grvt_client.get_order_price(side)
+                self.logger.info(f"[GRVT] Computed maker price {price_override} for {side} order")
+            except Exception as exc:
+                self.logger.warning(f"[GRVT] Failed to compute maker price for {side} order: {exc}")
+                price_override = None
 
         order_quantity = quantity if quantity is not None else self.order_quantity
         if order_quantity is None or order_quantity <= 0:
@@ -434,11 +466,29 @@ class HedgeBot:
 
         self.grvt_client.config.quantity = order_quantity
 
+        tp_metadata = sl_metadata = None
+        if self.grvt_attach_tp_sl and price_override is not None:
+            tp_metadata, sl_metadata = self._compute_grvt_tpsl_metadata(side, price_override)
+            if tp_metadata:
+                self.logger.info(
+                    "[GRVT] Attaching TP metadata (trigger=%s price=%s)",
+                    tp_metadata['trigger_by'],
+                    tp_metadata['trigger_price']
+                )
+            if sl_metadata:
+                self.logger.info(
+                    "[GRVT] Attaching SL metadata (trigger=%s price=%s)",
+                    sl_metadata['trigger_by'],
+                    sl_metadata['trigger_price']
+                )
+
         order_result = await self.grvt_client.place_open_order(
             contract_id=self.grvt_contract_id,
             quantity=order_quantity,
             direction=side,
-            price=price_override
+            price=price_override,
+            tp_metadata=tp_metadata,
+            sl_metadata=sl_metadata
         )
 
         if not order_result.success or not order_result.order_id:
@@ -771,6 +821,52 @@ class HedgeBot:
                     stop_loss_price = None
 
         return take_profit_price, stop_loss_price
+
+    def _format_grvt_trigger_price(self, price: Decimal) -> str:
+        quant = Decimal('0.000000001')
+        return str(price.quantize(quant, rounding=ROUND_HALF_UP))
+
+    def _compute_grvt_tpsl_metadata(
+        self,
+        side: str,
+        entry_price: Optional[Decimal]
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        if not self.grvt_attach_tp_sl:
+            return None, None
+        if entry_price is None or entry_price <= 0:
+            return None, None
+
+        hundred = Decimal('100')
+        one = Decimal('1')
+        tp_metadata: Optional[Dict[str, Any]] = None
+        sl_metadata: Optional[Dict[str, Any]] = None
+
+        def build_metadata(price: Decimal) -> Optional[Dict[str, Any]]:
+            if price <= 0:
+                return None
+            return {
+                'trigger_by': self.grvt_tpsl_trigger_by,
+                'trigger_price': self._format_grvt_trigger_price(price),
+                'close_position': True
+            }
+
+        if self.tp_roi is not None:
+            tp_factor = self.tp_roi / hundred
+            if side == 'buy':
+                target_price = entry_price * (one + tp_factor)
+            else:
+                target_price = entry_price * (one - tp_factor)
+            tp_metadata = build_metadata(target_price)
+
+        if self.sl_roi is not None:
+            sl_factor = self.sl_roi / hundred
+            if side == 'buy':
+                target_price = entry_price * (one - sl_factor)
+            else:
+                target_price = entry_price * (one + sl_factor)
+            sl_metadata = build_metadata(target_price)
+
+        return tp_metadata, sl_metadata
 
     async def _place_bingx_limit_hedge(
         self,
@@ -1204,39 +1300,6 @@ class HedgeBot:
         )
         return side, price_override
 
-    def _schedule_next_grvt_order_price(self, trigger: str) -> None:
-        if self.current_entry_side is None:
-            return
-
-        if trigger not in ('take_profit', 'stop_loss'):
-            self.pending_grvt_price = None
-            return
-
-        target_price = (
-            self.current_take_profit_price if trigger == 'take_profit' else self.current_stop_loss_price
-        )
-
-        if target_price is None or target_price <= 0:
-            self.pending_grvt_price = None
-            if target_price is not None and target_price <= 0:
-                self.logger.warning("⚠️ Computed ROI target price is non-positive; skipping override.")
-            return
-
-        side = 'sell' if self.current_entry_side == 'buy' else 'buy'
-
-        rounded_price = target_price
-        if self.grvt_client is not None:
-            try:
-                rounded_price = self.grvt_client.round_to_tick(target_price)
-            except Exception as exc:
-                self.logger.warning(f"⚠️ Failed to round ROI target price: {exc}")
-                rounded_price = target_price
-
-        self.pending_grvt_price = (side, rounded_price)
-        self.logger.info(
-            f"📌 Scheduling next GRVT {side.upper()} order @ {rounded_price} due to {trigger.replace('_', ' ')}"
-        )
-
     async def _close_grvt_position_with_roi(self, target_price: Optional[Decimal], trigger: str) -> bool:
         quantity = abs(self.grvt_position)
         if quantity <= self.position_tolerance:
@@ -1589,6 +1652,9 @@ class HedgeBot:
                 if take_profit_hit:
                     self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
                     self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%)")
+                    if self.grvt_attach_tp_sl:
+                        self.logger.info("Waiting for GRVT TP trigger to execute automatically.")
+                        return
                     success = await self._close_grvt_position_with_roi(
                         self.current_take_profit_price,
                         'take_profit'
@@ -1600,6 +1666,9 @@ class HedgeBot:
                 if stop_loss_hit:
                     self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
                     self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%)")
+                    if self.grvt_attach_tp_sl:
+                        self.logger.info("Waiting for GRVT SL trigger to execute automatically.")
+                        return
                     success = await self._close_grvt_position_with_roi(
                         self.current_stop_loss_price,
                         'stop_loss'
