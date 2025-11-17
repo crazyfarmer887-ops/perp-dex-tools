@@ -30,6 +30,8 @@ GRVT_ENVIRONMENT=prod # or testnet/staging/dev
 BINGX_API_KEY=your_bingx_api_key
 BINGX_API_SECRET=your_bingx_api_secret
 BINGX_ENVIRONMENT=prod # or testnet
+# Set to 1/true to force attaching ROI-based TP/SL to BingX hedge orders, 0/false to disable (auto by default)
+BINGX_HEDGE_ATTACH_TPSL=
 
 # Aster Configuration
 ASTER_API_KEY=your_aster_api_key

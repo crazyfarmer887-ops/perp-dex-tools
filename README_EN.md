@@ -281,6 +281,8 @@ Optional ROI parameters let you delay the closing phase until price moves a desi
 - `--tp-roi` (take profit ROI %)
 - `--sl-roi` (stop loss ROI %)
 
+When running the `grvt_bingx` hedge mode, any ROI targets you provide automatically become BingX TP/SL orders so the hedge leg has exit orders on the books. Set the `BINGX_HEDGE_ATTACH_TPSL` environment variable to `0` to disable or `1` to force-enable this behavior.
+
 ### Hedge Mode Usage Examples
 
 ```bash
@@ -373,6 +375,7 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `BINGX_API_KEY`: Your BingX API key
 - `BINGX_API_SECRET`: Your BingX API secret
 - `BINGX_ENVIRONMENT`: Trading environment (`prod` or `testnet`, optional)
+- `BINGX_HEDGE_ATTACH_TPSL`: Force enable (`1`/`true`) or disable (`0`/`false`) ROI-based TP/SL attachments on BingX hedge orders. Defaults to auto (enabled whenever ROI targets are set).
 
 #### Extended Configuration
 

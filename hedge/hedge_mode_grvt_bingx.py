@@ -141,15 +141,19 @@ class HedgeBot:
             tif_value = 'IOC' if self.bingx_hedge_order_type == 'limit' else None
         self.bingx_hedge_time_in_force = tif_value
 
+        roi_targets_configured = self.tp_roi is not None or self.sl_roi is not None
+        env_attach = _parse_bool(os.getenv('BINGX_HEDGE_ATTACH_TPSL'), 'BINGX_HEDGE_ATTACH_TPSL')
         if bingx_attach_tp_sl is not None:
             attach_value = bool(bingx_attach_tp_sl)
+            attach_source = 'argument'
+        elif env_attach is not None:
+            attach_value = env_attach
+            attach_source = 'env'
         else:
-            env_attach = _parse_bool(os.getenv('BINGX_HEDGE_ATTACH_TPSL'), 'BINGX_HEDGE_ATTACH_TPSL')
-            if env_attach is None:
-                attach_value = False
-            else:
-                attach_value = env_attach
+            attach_value = roi_targets_configured
+            attach_source = 'roi_auto'
         self.bingx_attach_tp_sl = attach_value
+        self._bingx_attach_tp_sl_source = attach_source
 
         default_cycle_retry_delay = float(self.sleep_time) if self.sleep_time > 0 else 3.0
         self.cycle_retry_delay = max(
@@ -262,6 +266,22 @@ class HedgeBot:
 
         for message in config_warnings:
             self.logger.warning(message)
+
+        if self.bingx_attach_tp_sl and self._bingx_attach_tp_sl_source == 'roi_auto':
+            self.logger.info(
+                "Auto-enabling BingX TP/SL attachment because ROI targets are configured (tp_roi=%s, sl_roi=%s).",
+                self.tp_roi,
+                self.sl_roi
+            )
+        elif (self.tp_roi is not None or self.sl_roi is not None) and not self.bingx_attach_tp_sl:
+            self.logger.info(
+                "ROI targets detected but BingX TP/SL attachment disabled (source=%s). No automatic TP/SL orders will be sent.",
+                self._bingx_attach_tp_sl_source
+            )
+        elif self.bingx_attach_tp_sl and self.tp_roi is None and self.sl_roi is None:
+            self.logger.warning(
+                "BingX TP/SL attachment enabled but no ROI targets provided; TP/SL prices cannot be computed."
+            )
 
         self.logger.info(
             "BingX hedge config | type=%s | limit_offset_ticks=%s | time_in_force=%s | attach_tp_sl=%s",
@@ -628,6 +648,9 @@ class HedgeBot:
         entry_price: Optional[Decimal]
     ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
         if not self.bingx_attach_tp_sl:
+            return None, None
+
+        if self.tp_roi is None and self.sl_roi is None:
             return None, None
 
         if entry_price is None or entry_price <= 0:
