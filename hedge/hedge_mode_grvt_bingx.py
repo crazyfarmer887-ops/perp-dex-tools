@@ -146,7 +146,8 @@ class HedgeBot:
         else:
             env_attach = _parse_bool(os.getenv('BINGX_HEDGE_ATTACH_TPSL'), 'BINGX_HEDGE_ATTACH_TPSL')
             if env_attach is None:
-                attach_value = False
+                # Auto-enable TP/SL if ROI settings are provided
+                attach_value = (self.tp_roi is not None) or (self.sl_roi is not None)
             else:
                 attach_value = env_attach
         self.bingx_attach_tp_sl = attach_value
@@ -627,7 +628,9 @@ class HedgeBot:
         hedge_side: str,
         entry_price: Optional[Decimal]
     ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        if not self.bingx_attach_tp_sl:
+        # Compute TP/SL if ROI settings are provided, regardless of bingx_attach_tp_sl flag
+        # This allows ROI-based TP/SL to work automatically when ROI settings are specified
+        if self.tp_roi is None and self.sl_roi is None:
             return None, None
 
         if entry_price is None or entry_price <= 0:
