@@ -72,6 +72,10 @@ class HedgeBot:
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
+        self.roi_exit_orders: Dict[str, Optional[str]] = {'grvt': None, 'bingx': None}
+        self.force_close_offset_ticks: Decimal = Decimal('5')
+        self.force_close_interval: float = 1.0
+        self.unmatched_exit_grace_period: float = 10.0
 
         config_warnings: List[str] = []
 
@@ -836,6 +840,311 @@ class HedgeBot:
         if messages:
             self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
 
+    def _get_roi_exit_price(self, trigger: str) -> Optional[Decimal]:
+        normalized = (trigger or '').strip().lower()
+        if normalized == 'take_profit':
+            return self.current_take_profit_price
+        if normalized == 'stop_loss':
+            return self.current_stop_loss_price
+        return None
+
+    async def _handle_roi_exit(self, trigger: str) -> None:
+        exit_price = self._get_roi_exit_price(trigger)
+        if exit_price is None or exit_price <= 0:
+            self.logger.warning("⚠️ Cannot submit ROI %s exits due to invalid target price.", trigger)
+            return
+
+        positions_available = (
+            abs(self.grvt_position) > self.position_tolerance or
+            abs(self.bingx_position) > self.position_tolerance
+        )
+        if not positions_available:
+            grvt_position, bingx_position = await self._sync_positions_from_exchanges()
+            positions_available = (
+                abs(grvt_position) > self.position_tolerance or
+                abs(bingx_position) > self.position_tolerance
+            )
+
+        if not positions_available:
+            self.logger.info("No outstanding positions to close for ROI %s trigger.", trigger.replace('_', ' '))
+            self._reset_entry_state()
+            return
+
+        self.logger.info(
+            "📤 ROI %s trigger detected. Submitting exit orders @ %s (grace %.1fs).",
+            trigger.replace('_', ' '),
+            exit_price,
+            self.unmatched_exit_grace_period
+        )
+
+        placements = await self._place_roi_exit_orders(exit_price)
+        if not any(placements.values()):
+            self.logger.error("❌ Failed to place ROI exit orders on both exchanges; manual intervention required.")
+            return
+
+        try:
+            await self._monitor_roi_exit_completion()
+        finally:
+            await self._cancel_all_roi_exit_orders()
+
+        self._reset_entry_state()
+
+    async def _place_roi_exit_orders(self, exit_price: Decimal) -> Dict[str, bool]:
+        placements = {'grvt': False, 'bingx': False}
+        grvt_position, bingx_position = await self._sync_positions_from_exchanges()
+
+        tolerance = self.position_tolerance
+        if abs(grvt_position) > tolerance and self.grvt_client is not None and self.grvt_contract_id is not None:
+            order_id = await self._place_grvt_roi_exit_order(grvt_position, exit_price)
+            if order_id:
+                placements['grvt'] = True
+                self.roi_exit_orders['grvt'] = order_id
+        else:
+            self.roi_exit_orders['grvt'] = None
+
+        if abs(bingx_position) > tolerance and self.bingx_client is not None and self.bingx_contract_id is not None:
+            order_id = await self._place_bingx_roi_exit_order(bingx_position, exit_price)
+            if order_id:
+                placements['bingx'] = True
+                self.roi_exit_orders['bingx'] = order_id
+        else:
+            self.roi_exit_orders['bingx'] = None
+
+        # If any placement failed but a position still exists, immediately trigger aggressive close for that exchange.
+        if abs(grvt_position) > tolerance and not placements['grvt']:
+            fallback_id = await self._place_aggressive_exit_order('grvt', grvt_position)
+            placements['grvt'] = placements['grvt'] or bool(fallback_id)
+        if abs(bingx_position) > tolerance and not placements['bingx']:
+            fallback_id = await self._place_aggressive_exit_order('bingx', bingx_position)
+            placements['bingx'] = placements['bingx'] or bool(fallback_id)
+
+        return placements
+
+    async def _place_grvt_roi_exit_order(self, position: Decimal, price: Decimal) -> Optional[str]:
+        assert self.grvt_client is not None
+        assert self.grvt_contract_id is not None
+
+        quantity = abs(position)
+        if quantity <= 0:
+            return None
+
+        side = 'sell' if position > 0 else 'buy'
+        self.grvt_client.config.direction = side
+        self.grvt_client.config.close_order_side = 'sell' if side == 'buy' else 'buy'
+
+        try:
+            result = await self.grvt_client.place_open_order(
+                contract_id=self.grvt_contract_id,
+                quantity=quantity,
+                direction=side,
+                price=price
+            )
+        except Exception as exc:
+            self.logger.error(f"[GRVT] ROI {side.upper()} exit order exception: {exc}")
+            return None
+
+        if result and result.success and result.order_id:
+            self.logger.info(
+                "[GRVT] ROI exit %s qty=%s @ %s | status=%s",
+                side.upper(),
+                quantity,
+                result.price,
+                result.status
+            )
+            return result.order_id
+
+        error = getattr(result, 'error_message', 'Unknown error') if result else 'No response'
+        self.logger.error("[GRVT] ROI exit order rejected: %s", error)
+        return None
+
+    async def _place_bingx_roi_exit_order(self, position: Decimal, price: Decimal) -> Optional[str]:
+        assert self.bingx_client is not None
+        assert self.bingx_contract_id is not None
+
+        quantity = abs(position)
+        if quantity <= 0:
+            return None
+
+        side = 'sell' if position > 0 else 'buy'
+
+        try:
+            result = await self.bingx_client.place_limit_order(
+                contract_id=self.bingx_contract_id,
+                quantity=quantity,
+                side=side,
+                price=price,
+                reduce_only=True,
+                post_only=False,
+                time_in_force='GTC'
+            )
+        except Exception as exc:
+            self.logger.error(f"[BINGX] ROI {side.upper()} exit order exception: {exc}")
+            return None
+
+        if result and result.success and result.order_id:
+            self.logger.info(
+                "[BINGX] ROI exit %s qty=%s @ %s | status=%s",
+                side.upper(),
+                quantity,
+                result.price,
+                result.status
+            )
+            return result.order_id
+
+        error = getattr(result, 'error_message', 'Unknown error') if result else 'No response'
+        self.logger.error("[BINGX] ROI exit order rejected: %s", error)
+        return None
+
+    async def _cancel_roi_exit_order(self, exchange: str) -> None:
+        order_id = self.roi_exit_orders.get(exchange)
+        if not order_id:
+            return
+
+        client = self.grvt_client if exchange == 'grvt' else self.bingx_client
+        if client is None:
+            self.roi_exit_orders[exchange] = None
+            return
+
+        try:
+            result = await client.cancel_order(order_id)
+            if result.success:
+                self.logger.info("%s ROI exit order %s cancelled.", exchange.upper(), order_id)
+        except Exception as exc:
+            self.logger.warning("%s ROI exit order cancellation failed: %s", exchange.upper(), exc)
+        finally:
+            self.roi_exit_orders[exchange] = None
+
+    async def _cancel_all_roi_exit_orders(self) -> None:
+        await asyncio.gather(
+            self._cancel_roi_exit_order('grvt'),
+            self._cancel_roi_exit_order('bingx')
+        )
+
+    async def _monitor_roi_exit_completion(self) -> None:
+        tolerance = self.position_tolerance
+        first_flat_exchange: Optional[str] = None
+        first_flat_timestamp: Optional[float] = None
+        poll_interval = min(self.position_close_poll_interval, 1.0)
+
+        while not self.stop_flag:
+            grvt_position, bingx_position = await self._fetch_signed_positions()
+            self.grvt_position = grvt_position
+            self.bingx_position = bingx_position
+
+            grvt_flat = abs(grvt_position) <= tolerance
+            bingx_flat = abs(bingx_position) <= tolerance
+
+            if grvt_flat and bingx_flat:
+                self.logger.info("✅ ROI exit complete: GRVT and BingX positions are flat.")
+                return
+
+            now = time.time()
+            if grvt_flat != bingx_flat:
+                if first_flat_exchange is None:
+                    first_flat_exchange = 'grvt' if grvt_flat else 'bingx'
+                    first_flat_timestamp = now
+                    self.logger.info(
+                        "%s position closed; waiting up to %.1fs for the other exchange.",
+                        first_flat_exchange.upper(),
+                        self.unmatched_exit_grace_period
+                    )
+                elif first_flat_timestamp and now - first_flat_timestamp >= self.unmatched_exit_grace_period:
+                    await self._apply_fallback_close(grvt_position, bingx_position)
+                    await asyncio.sleep(self.force_close_interval)
+                    continue
+            else:
+                first_flat_exchange = None
+                first_flat_timestamp = None
+
+            await asyncio.sleep(poll_interval)
+
+    async def _apply_fallback_close(self, grvt_position: Decimal, bingx_position: Decimal) -> None:
+        tolerance = self.position_tolerance
+        tasks = []
+
+        if abs(grvt_position) > tolerance:
+            tasks.append(self._place_aggressive_exit_order('grvt', grvt_position))
+        if abs(bingx_position) > tolerance:
+            tasks.append(self._place_aggressive_exit_order('bingx', bingx_position))
+
+        if not tasks:
+            return
+
+        self.logger.warning("⚠️ ROI exit mismatch persists; submitting aggressive close orders.")
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _place_aggressive_exit_order(self, exchange: str, position: Decimal) -> Optional[str]:
+        if position == 0:
+            return None
+
+        if exchange == 'grvt':
+            if self.grvt_client is None or self.grvt_contract_id is None:
+                return None
+            client = self.grvt_client
+            contract_id = self.grvt_contract_id
+            tick_size = self.grvt_tick_size or Decimal('0.01')
+        else:
+            if self.bingx_client is None or self.bingx_contract_id is None:
+                return None
+            client = self.bingx_client
+            contract_id = self.bingx_contract_id
+            tick_size = self.bingx_tick_size or Decimal('0.01')
+
+        try:
+            best_bid, best_ask = await client.fetch_bbo_prices(contract_id)
+        except Exception as exc:
+            self.logger.warning("%s aggressive close skipped; failed to fetch BBO: %s", exchange.upper(), exc)
+            return None
+
+        price = self._compute_aggressive_exit_price(position, best_bid, best_ask, tick_size)
+        if price is None:
+            self.logger.warning("%s aggressive close skipped; unable to calculate price.", exchange.upper())
+            return None
+
+        await self._cancel_roi_exit_order(exchange)
+
+        order_id = None
+        if exchange == 'grvt':
+            order_id = await self._place_grvt_roi_exit_order(position, price)
+        else:
+            order_id = await self._place_bingx_roi_exit_order(position, price)
+
+        if order_id:
+            self.roi_exit_orders[exchange] = order_id
+        return order_id
+
+    def _compute_aggressive_exit_price(
+        self,
+        position: Decimal,
+        best_bid: Decimal,
+        best_ask: Decimal,
+        tick_size: Decimal
+    ) -> Optional[Decimal]:
+        if tick_size <= 0:
+            tick_size = Decimal('0.01')
+
+        offset = tick_size * self.force_close_offset_ticks
+        if offset <= 0:
+            offset = tick_size
+
+        price: Optional[Decimal] = None
+        if position > 0:
+            reference = best_bid if best_bid > 0 else best_ask
+            if reference and reference > 0:
+                price = reference - offset
+        else:
+            reference = best_ask if best_ask > 0 else best_bid
+            if reference and reference > 0:
+                price = reference + offset
+
+        if price is None:
+            return None
+
+        if price <= 0:
+            price = tick_size
+
+        return price
+
     def _target_position_for_side(self, side: str) -> Decimal:
         normalized = side.strip().lower()
         if normalized == 'buy':
@@ -1150,13 +1459,13 @@ class HedgeBot:
                 if take_profit_hit:
                     self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
                     self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%)")
-                    self._schedule_next_grvt_order_price('take_profit')
+                    await self._handle_roi_exit('take_profit')
                     return
 
                 if stop_loss_hit:
                     self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
                     self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%)")
-                    self._schedule_next_grvt_order_price('stop_loss')
+                    await self._handle_roi_exit('stop_loss')
                     return
 
             elapsed = time.time() - start_time
