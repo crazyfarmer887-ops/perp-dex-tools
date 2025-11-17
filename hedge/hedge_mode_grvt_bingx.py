@@ -627,7 +627,11 @@ class HedgeBot:
         hedge_side: str,
         entry_price: Optional[Decimal]
     ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        if not self.bingx_attach_tp_sl:
+        # Compute TP/SL if ROI settings are provided, regardless of bingx_attach_tp_sl flag
+        # ROI-based TP/SL takes precedence
+        has_roi_settings = self.tp_roi is not None or self.sl_roi is not None
+        
+        if not has_roi_settings and not self.bingx_attach_tp_sl:
             return None, None
 
         if entry_price is None or entry_price <= 0:
