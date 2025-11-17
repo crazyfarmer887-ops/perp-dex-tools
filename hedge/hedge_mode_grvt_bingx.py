@@ -263,12 +263,21 @@ class HedgeBot:
         for message in config_warnings:
             self.logger.warning(message)
 
+        # Auto-enable TP/SL if ROI is configured
+        roi_configured = self.tp_roi is not None or self.sl_roi is not None
+        if roi_configured and not self.bingx_attach_tp_sl:
+            self.logger.info(
+                "ROI configured (tp_roi=%s, sl_roi=%s); automatically enabling TP/SL on BingX hedge orders",
+                self.tp_roi,
+                self.sl_roi
+            )
+        
         self.logger.info(
             "BingX hedge config | type=%s | limit_offset_ticks=%s | time_in_force=%s | attach_tp_sl=%s",
             self.bingx_hedge_order_type,
             self.bingx_hedge_limit_offset_ticks,
             self.bingx_hedge_time_in_force or 'DEFAULT',
-            self.bingx_attach_tp_sl,
+            self.bingx_attach_tp_sl or roi_configured,
         )
         self.logger.info("Strict cycle mode: %s", "ENABLED" if self.strict_mode else "DISABLED")
         self.logger.info(
@@ -627,7 +636,9 @@ class HedgeBot:
         hedge_side: str,
         entry_price: Optional[Decimal]
     ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        if not self.bingx_attach_tp_sl:
+        # Automatically enable TP/SL when ROI is configured, unless explicitly disabled
+        roi_configured = self.tp_roi is not None or self.sl_roi is not None
+        if not self.bingx_attach_tp_sl and not roi_configured:
             return None, None
 
         if entry_price is None or entry_price <= 0:
