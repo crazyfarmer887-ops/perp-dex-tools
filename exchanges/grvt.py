@@ -248,9 +248,16 @@ class GrvtClient(BaseExchangeClient):
 
         return best_bid, best_ask
 
-    async def place_post_only_order(self, contract_id: str, quantity: Decimal, price: Decimal,
-                                    side: str) -> OrderResult:
-        """Place a post only order with GRVT using official SDK."""
+    async def place_limit_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        *,
+        post_only: bool = True
+    ) -> OrderResult:
+        """Place a limit order with GRVT using official SDK."""
 
         # Place the order using GRVT SDK
         order_result = self.rest_client.create_limit_order(
@@ -259,7 +266,7 @@ class GrvtClient(BaseExchangeClient):
             amount=quantity,
             price=price,
             params={
-                'post_only': True,
+                'post_only': post_only,
                 'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
             }
         )
@@ -284,6 +291,22 @@ class GrvtClient(BaseExchangeClient):
             raise Exception('Paradex Server Error: Order not processed after 10 seconds')
         else:
             return order_info
+
+    async def place_post_only_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str
+    ) -> OrderResult:
+        """Backwards-compatible helper for code paths that explicitly request post-only orders."""
+        return await self.place_limit_order(
+            contract_id=contract_id,
+            quantity=quantity,
+            price=price,
+            side=side,
+            post_only=True
+        )
 
     async def get_order_price(self, direction: str) -> Decimal:
         """Get the price of an order with GRVT using official SDK."""
@@ -356,7 +379,13 @@ class GrvtClient(BaseExchangeClient):
 
             # Place the order using GRVT SDK
             try:
-                order_info = await self.place_post_only_order(contract_id, quantity, order_price, direction)
+                order_info = await self.place_limit_order(
+                    contract_id,
+                    quantity,
+                    order_price,
+                    direction,
+                    post_only=True
+                )
             except Exception as e:
                 self.logger.log(f"[OPEN] Error placing order: {e}", "ERROR")
                 continue
@@ -411,7 +440,13 @@ class GrvtClient(BaseExchangeClient):
 
             adjusted_price = self.round_to_tick(adjusted_price)
             try:
-                order_info = await self.place_post_only_order(contract_id, quantity, adjusted_price, side)
+                order_info = await self.place_limit_order(
+                    contract_id,
+                    quantity,
+                    adjusted_price,
+                    side,
+                    post_only=True
+                )
             except Exception as e:
                 self.logger.log(f"[CLOSE] Error placing order: {e}", "ERROR")
                 continue
