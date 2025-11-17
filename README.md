@@ -295,7 +295,8 @@ python runbot.py --exchange extended --ticker ETH --quantity 0.1 --take-profit 0
 3. **平仓阶段**：在选定交易所下另一个 maker 订单平仓
 4. **对冲平仓**：在对冲交易所下市价订单平仓
 
-可选参数 `--tp-roi` 和 `--sl-roi` 允许你基于平均开仓价设定 ROI 百分比的止盈/止损目标；在达到目标之前，策略会等待而不是立即进入下一步。
+可选参数 `--tp-roi` 和 `--sl-roi` 允许你基于平均开仓价设定 ROI 百分比的止盈/止损目标；在达到目标之前，策略会等待而不是立即进入下一步。  
+在 `grvt_bingx` 模式下，这些 ROI 目标还会自动转换成 BingX 对冲腿的 TP/SL 订单（可通过 `BINGX_HEDGE_ATTACH_TPSL=false` 禁用）。
 
 ### 对冲模式优势
 
@@ -396,6 +397,7 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `BINGX_API_KEY`: 您的 BingX API Key
 - `BINGX_API_SECRET`: 您的 BingX API Secret
 - `BINGX_ENVIRONMENT`: 交易环境（`prod` 或 `testnet`，可选）
+- `BINGX_HEDGE_ATTACH_TPSL`: 可选开关，用于强制开启（`true`）或关闭（`false`）基于 ROI 的 BingX TP/SL 附带订单；未设置时只要配置了 ROI 参数就会自动开启。
 
 #### Extended 配置
 

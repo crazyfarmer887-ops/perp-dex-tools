@@ -146,7 +146,7 @@ class HedgeBot:
         else:
             env_attach = _parse_bool(os.getenv('BINGX_HEDGE_ATTACH_TPSL'), 'BINGX_HEDGE_ATTACH_TPSL')
             if env_attach is None:
-                attach_value = False
+                attach_value = (self.tp_roi is not None) or (self.sl_roi is not None)
             else:
                 attach_value = env_attach
         self.bingx_attach_tp_sl = attach_value
@@ -277,6 +277,24 @@ class HedgeBot:
             self.position_close_retry_delay,
             f"{self.position_close_timeout:.1f}s" if self.position_close_timeout > 0 else "DISABLED"
         )
+
+        tp_roi_active = self.tp_roi is not None
+        sl_roi_active = self.sl_roi is not None
+        if tp_roi_active or sl_roi_active:
+            tp_display = f"{self.tp_roi}%" if tp_roi_active else "DISABLED"
+            sl_display = f"{self.sl_roi}%" if sl_roi_active else "DISABLED"
+            if self.bingx_attach_tp_sl:
+                self.logger.info(
+                    "BingX hedges will auto-attach TP/SL orders from ROI targets (tp=%s, sl=%s).",
+                    tp_display,
+                    sl_display
+                )
+            else:
+                self.logger.warning(
+                    "ROI targets configured (tp=%s, sl=%s) but BingX TP/SL attachment is disabled; hedges will not have exchange-managed TP/SL.",
+                    tp_display,
+                    sl_display
+                )
 
     # ------------------------------------------------------------------ #
     # Initialization helpers
