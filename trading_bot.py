@@ -8,7 +8,7 @@ import asyncio
 import traceback
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Tuple
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
@@ -32,6 +32,9 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    tp_roi: Optional[Decimal] = None
+    sl_roi: Optional[Decimal] = None
+    tp_sl_order_type: str = 'market'
 
     @property
     def close_order_side(self) -> str:
@@ -70,6 +73,15 @@ class TradingBot:
             )
         except ValueError as e:
             raise ValueError(f"Failed to create exchange client: {e}")
+
+        self._tp_sl_supported = False
+        if hasattr(self.exchange_client, "supports_attached_tp_sl"):
+            try:
+                self._tp_sl_supported = bool(self.exchange_client.supports_attached_tp_sl())
+            except Exception:
+                self._tp_sl_supported = False
+        self._tp_sl_order_type = self._normalize_tp_sl_order_type(self.config.tp_sl_order_type)
+        self._roi_support_warned = False
 
         # Trading state
         self.active_close_orders = []
@@ -160,6 +172,149 @@ class TradingBot:
         # Setup order update handler
         self.exchange_client.setup_order_update_handler(order_update_handler)
 
+    def _normalize_tp_sl_order_type(self, order_type: Optional[str]) -> str:
+        """Normalize tp/sl order type to supported values."""
+        if not order_type:
+            return 'market'
+        normalized = str(order_type).strip().lower()
+        return normalized if normalized in ('market', 'limit') else 'market'
+
+    def _roi_targets_enabled(self) -> bool:
+        """Return True if ROI-based TP/SL targets have been configured."""
+        zero = Decimal('0')
+        tp_enabled = self.config.tp_roi is not None and self.config.tp_roi > zero
+        sl_enabled = self.config.sl_roi is not None and self.config.sl_roi > zero
+        return tp_enabled or sl_enabled
+
+    def _maybe_warn_roi_support(self):
+        """Warn once when ROI TP/SL is requested but unsupported by the exchange."""
+        if self._roi_targets_enabled() and not self._tp_sl_supported and not self._roi_support_warned:
+            self.logger.log(
+                f"ROI TP/SL requested but {self.config.exchange} does not support attached TP/SL orders; "
+                "placing standard limit close orders only.",
+                "WARNING"
+            )
+            self._roi_support_warned = True
+
+    def _round_price(self, price: Decimal) -> Decimal:
+        """Round a price to the exchange tick size."""
+        try:
+            return self.exchange_client.round_to_tick(price)
+        except Exception:
+            return price
+
+    def _compute_roi_targets(self, entry_price: Decimal, close_side: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """Compute ROI-based take profit and stop loss prices."""
+        take_profit_price: Optional[Decimal] = None
+        stop_loss_price: Optional[Decimal] = None
+
+        if entry_price is None or entry_price <= 0:
+            return None, None
+
+        one = Decimal('1')
+        hundred = Decimal('100')
+
+        if self.config.tp_roi is not None:
+            if self.config.tp_roi > 0:
+                tp_factor = self.config.tp_roi / hundred
+                if close_side == 'sell':
+                    take_profit_price = entry_price * (one + tp_factor)
+                elif close_side == 'buy':
+                    take_profit_price = entry_price * (one - tp_factor)
+            else:
+                self.logger.log("tp_roi must be positive; ignoring ROI take profit setting.", "WARNING")
+
+        if self.config.sl_roi is not None:
+            if self.config.sl_roi > 0:
+                sl_factor = self.config.sl_roi / hundred
+                if close_side == 'sell':
+                    stop_loss_price = entry_price * (one - sl_factor)
+                elif close_side == 'buy':
+                    stop_loss_price = entry_price * (one + sl_factor)
+            else:
+                self.logger.log("sl_roi must be positive; ignoring ROI stop loss setting.", "WARNING")
+
+        if take_profit_price is not None:
+            take_profit_price = self._round_price(take_profit_price)
+        if stop_loss_price is not None:
+            stop_loss_price = self._round_price(stop_loss_price)
+
+        return take_profit_price, stop_loss_price
+
+    def _compute_default_close_price(self, entry_price: Decimal, close_side: str) -> Decimal:
+        """Compute default take profit price using configured percentage."""
+        one = Decimal('1')
+        hundred = Decimal('100')
+        take_profit_pct = self.config.take_profit if self.config.take_profit is not None else Decimal('0')
+        if take_profit_pct < 0:
+            take_profit_pct = Decimal('0')
+        tp_factor = take_profit_pct / hundred
+
+        if close_side == 'sell':
+            price = entry_price * (one + tp_factor)
+        elif close_side == 'buy':
+            price = entry_price * (one - tp_factor)
+        else:
+            raise ValueError(f"Unsupported close order side: {close_side}")
+
+        return self._round_price(price)
+
+    def _build_exit_targets(self, entry_price: Decimal, close_side: str) -> Tuple[Decimal, Optional[Decimal], Optional[Decimal]]:
+        """Build exit prices for close orders and optional ROI TP/SL triggers."""
+        if entry_price is None or entry_price <= 0:
+            raise ValueError("Entry price must be positive to build exit targets.")
+
+        roi_tp_price, roi_sl_price = self._compute_roi_targets(entry_price, close_side)
+        close_price = roi_tp_price if roi_tp_price is not None else self._compute_default_close_price(entry_price, close_side)
+        if close_price <= 0:
+            raise ValueError("Computed close price is non-positive.")
+
+        return close_price, roi_tp_price, roi_sl_price
+
+    def _log_roi_targets(self, close_side: str, tp_price: Optional[Decimal], sl_price: Optional[Decimal]) -> None:
+        """Log ROI TP/SL targets for visibility."""
+        messages = []
+        if tp_price is not None:
+            messages.append(f"TP @ {tp_price}")
+        if sl_price is not None:
+            messages.append(f"SL @ {sl_price}")
+        if messages:
+            self.logger.log(f"ROI targets ({close_side.upper()}): {', '.join(messages)}", "INFO")
+
+    async def _submit_close_order(self, quantity: Decimal, entry_price: Decimal):
+        """Submit a close order with optional ROI-based TP/SL triggers."""
+        close_side = self.config.close_order_side
+        try:
+            close_price, roi_tp_price, roi_sl_price = self._build_exit_targets(entry_price, close_side)
+        except ValueError as exc:
+            self.logger.log(f"Failed to compute close order targets: {exc}", "WARNING")
+            fallback_price = entry_price if entry_price and entry_price > 0 else Decimal('0')
+            close_price, roi_tp_price, roi_sl_price = fallback_price, None, None
+
+        kwargs = {}
+        roi_requested = roi_tp_price is not None or roi_sl_price is not None
+        if self._tp_sl_supported and roi_requested:
+            kwargs['tp_sl_order_type'] = self._tp_sl_order_type
+            if roi_tp_price is not None:
+                kwargs['take_profit_price'] = roi_tp_price
+            if roi_sl_price is not None:
+                kwargs['stop_loss_price'] = roi_sl_price
+        else:
+            self._maybe_warn_roi_support()
+
+        result = await self.exchange_client.place_close_order(
+            self.config.contract_id,
+            quantity,
+            close_price,
+            close_side,
+            **kwargs
+        )
+
+        if result.success and roi_requested and self._tp_sl_supported:
+            self._log_roi_targets(close_side, roi_tp_price, roi_sl_price)
+
+        return result
+
     def _calculate_wait_time(self) -> Decimal:
         """Calculate wait time between orders."""
         cool_down_time = self.config.wait_time
@@ -238,18 +393,9 @@ class TradingBot:
                 )
             else:
                 self.last_open_order_time = time.time()
-                # Place close order
-                close_side = self.config.close_order_side
-                if close_side == 'sell':
-                    close_price = filled_price * (1 + self.config.take_profit/100)
-                else:
-                    close_price = filled_price * (1 - self.config.take_profit/100)
-
-                close_order_result = await self.exchange_client.place_close_order(
-                    self.config.contract_id,
+                close_order_result = await self._submit_close_order(
                     self.config.quantity,
-                    close_price,
-                    close_side
+                    filled_price
                 )
                 if self.config.exchange == "lighter":
                     await asyncio.sleep(1)
@@ -338,16 +484,9 @@ class TradingBot:
                         close_side
                     )
                 else:
-                    if close_side == 'sell':
-                        close_price = filled_price * (1 + self.config.take_profit/100)
-                    else:
-                        close_price = filled_price * (1 - self.config.take_profit/100)
-
-                    close_order_result = await self.exchange_client.place_close_order(
-                        self.config.contract_id,
+                    close_order_result = await self._submit_close_order(
                         self.order_filled_amount,
-                        close_price,
-                        close_side
+                        filled_price
                     )
                     if self.config.exchange == "lighter":
                         await asyncio.sleep(1)

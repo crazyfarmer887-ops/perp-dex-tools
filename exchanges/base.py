@@ -94,8 +94,18 @@ class BaseExchangeClient(ABC):
         pass
 
     @abstractmethod
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        """Place a close order."""
+    async def place_close_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        *,
+        take_profit_price: Optional[Decimal] = None,
+        stop_loss_price: Optional[Decimal] = None,
+        tp_sl_order_type: str = 'market'
+    ) -> OrderResult:
+        """Place a close order, optionally attaching ROI-based TP/SL targets."""
         pass
 
     @abstractmethod
@@ -127,3 +137,7 @@ class BaseExchangeClient(ABC):
     def get_exchange_name(self) -> str:
         """Get the exchange name."""
         pass
+
+    def supports_attached_tp_sl(self) -> bool:
+        """Return True when the exchange can attach TP/SL triggers to close orders."""
+        return False

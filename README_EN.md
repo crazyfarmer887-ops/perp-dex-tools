@@ -187,6 +187,16 @@ Assuming current ETH price is $2000 with take-profit set to 0.02%:
 - **Real-time Monitoring**: Continuously monitors positions and order status
 - **⚠️ No Stop Loss**: This strategy does not include stop-loss functionality and may face significant losses in adverse market conditions
 
+#### 🎯 ROI-Based TP/SL (BingX)
+
+You can attach exchange-native take-profit/stop-loss triggers (TPSL) based on ROI targets when running against BingX:
+
+- `--tp-roi`: Percentage gain relative to the fill price that should trigger take-profit.
+- `--sl-roi`: Percentage loss relative to the fill price that should trigger stop-loss.
+- `--tp-sl-order-type`: Trigger execution style (`market` or `limit`, default `market`).
+
+When these flags are set, the bot still places a standard limit close order at the ROI-derived take-profit price. Exchanges without native TPSL support ignore the additional triggers, but BingX will submit attached TP/SL orders automatically. A warning is logged if you enable ROI targets on unsupported exchanges.
+
 ## Sample commands:
 
 ### EdgeX Exchange:

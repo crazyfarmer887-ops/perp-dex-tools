@@ -96,6 +96,10 @@ class BingxClient(BaseExchangeClient):
     def get_exchange_name(self) -> str:
         return "bingx"
 
+    def supports_attached_tp_sl(self) -> bool:
+        """BingX supports attached TP/SL orders on limit/market submissions."""
+        return True
+
     def setup_order_update_handler(self, handler) -> None:
         self._order_update_handler = handler
 
@@ -296,7 +300,17 @@ class BingxClient(BaseExchangeClient):
             time_in_force='PO'
         )
 
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
+    async def place_close_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        *,
+        take_profit_price: Optional[Decimal] = None,
+        stop_loss_price: Optional[Decimal] = None,
+        tp_sl_order_type: str = 'market'
+    ) -> OrderResult:
         best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
         if best_bid <= 0 or best_ask <= 0:
             return OrderResult(success=False, error_message='Invalid bid/ask prices')
@@ -309,14 +323,17 @@ class BingxClient(BaseExchangeClient):
         elif side.lower() == 'buy' and price >= best_ask:
             adjusted_price = best_ask - tick
 
-        return await self._create_limit_order(
+        return await self.place_limit_order(
             contract_id=contract_id,
             quantity=quantity,
             side=side.lower(),
             price=adjusted_price,
             reduce_only=True,
             post_only=True,
-            time_in_force='PO'
+            time_in_force='PO',
+            take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price,
+            tp_sl_order_type=tp_sl_order_type
         )
 
     async def place_limit_order(

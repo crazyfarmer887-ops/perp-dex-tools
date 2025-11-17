@@ -341,7 +341,17 @@ class LighterClient(BaseExchangeClient):
                 active_close_orders += 1
         return active_close_orders
 
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
+    async def place_close_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        *,
+        take_profit_price: Optional[Decimal] = None,
+        stop_loss_price: Optional[Decimal] = None,
+        tp_sl_order_type: str = 'market'
+    ) -> OrderResult:
         """Place a close order with Lighter using official SDK."""
         self.current_order = None
         self.current_order_client_id = None

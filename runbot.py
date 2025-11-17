@@ -49,6 +49,13 @@ def parse_arguments():
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
     parser.add_argument('--boost', action='store_true',
                         help='Use the Boost mode for volume boosting')
+    parser.add_argument('--tp-roi', type=Decimal, default=None,
+                        help='Target ROI percentage for take profit (optional)')
+    parser.add_argument('--sl-roi', type=Decimal, default=None,
+                        help='Target ROI percentage for stop loss (optional)')
+    parser.add_argument('--tp-sl-order-type', type=str, default='market',
+                        choices=['market', 'limit'],
+                        help='Order type for ROI TP/SL triggers (default: market)')
 
     return parser.parse_args()
 
@@ -116,7 +123,10 @@ async def main():
         grid_step=Decimal(args.grid_step),
         stop_price=Decimal(args.stop_price),
         pause_price=Decimal(args.pause_price),
-        boost_mode=args.boost
+        boost_mode=args.boost,
+        tp_roi=args.tp_roi,
+        sl_roi=args.sl_roi,
+        tp_sl_order_type=args.tp_sl_order_type
     )
 
     # Create and run the bot

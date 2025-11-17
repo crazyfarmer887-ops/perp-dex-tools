@@ -118,8 +118,18 @@ class YourExchangeClient(BaseExchangeClient):
         except Exception as e:
             return OrderResult(success=False, error_message=str(e))
 
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        """Place a close order."""
+    async def place_close_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        *,
+        take_profit_price: Optional[Decimal] = None,
+        stop_loss_price: Optional[Decimal] = None,
+        tp_sl_order_type: str = 'market'
+    ) -> OrderResult:
+        """Place a close order. Exchanges that support attached TP/SL orders can use the optional parameters."""
         try:
             # Adjust price to ensure maker order
             best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
@@ -294,10 +304,12 @@ All exchange clients must implement these methods from `BaseExchangeClient`:
 ### Order Management
 
 - `place_open_order(contract_id, quantity, direction)` - Place opening orders
-- `place_close_order(contract_id, quantity, price, side)` - Place closing orders
+- `place_close_order(contract_id, quantity, price, side, *, take_profit_price=None, stop_loss_price=None, tp_sl_order_type='market')` - Place closing orders, optionally attaching TP/SL targets
 - `cancel_order(order_id)` - Cancel orders
 - `get_order_info(order_id)` - Get order details
 - `get_active_orders(contract_id)` - Get all active orders
+
+If your exchange can attach take-profit/stop-loss triggers directly to close orders, override `supports_attached_tp_sl()` to return `True` so the trading bot can pass ROI targets automatically.
 
 ### Data Retrieval
 

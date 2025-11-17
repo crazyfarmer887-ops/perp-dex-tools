@@ -413,7 +413,17 @@ class BackpackClient(BaseExchangeClient):
                 status='FILLED'
             )
 
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
+    async def place_close_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        *,
+        take_profit_price: Optional[Decimal] = None,
+        stop_loss_price: Optional[Decimal] = None,
+        tp_sl_order_type: str = 'market'
+    ) -> OrderResult:
         """Place a close order with Backpack using official SDK with retry logic for POST_ONLY rejections."""
         max_retries = 15
         retry_count = 0
