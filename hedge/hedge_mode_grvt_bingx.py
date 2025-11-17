@@ -1250,6 +1250,30 @@ class HedgeBot:
             'bingx_mid': (bingx_bid + bingx_ask) / Decimal('2')
         }
 
+    def _render_gap_meter(
+        self,
+        grvt_mid: Decimal,
+        bingx_mid: Decimal,
+        gap: Decimal,
+        threshold: Decimal
+    ) -> None:
+        if threshold <= 0:
+            threshold = Decimal('0.01')
+        ratio = float(gap / threshold)
+        ratio = max(0.0, ratio)
+        bar_width = 30
+        filled = min(bar_width, int(ratio * (bar_width / 2)))
+        bar = '#'
+        bar = '#' * filled + '-' * (bar_width - filled)
+        self.logger.info(
+            "📊 GAP | GRVT=%.3f | BingX=%.3f | Δ=%.4f (%.2fx tick) | [%s]",
+            float(grvt_mid),
+            float(bingx_mid),
+            float(gap),
+            ratio,
+            bar
+        )
+
     async def _plan_gap_trade(self) -> Optional[Tuple[str, Optional[Decimal]]]:
         mids = await self._fetch_exchange_mids()
         if mids is None:
@@ -1259,6 +1283,7 @@ class HedgeBot:
         bingx_mid = mids['bingx_mid']
         gap = abs(grvt_mid - bingx_mid)
         threshold = self.bingx_tick_size or Decimal('0.01')
+        self._render_gap_meter(grvt_mid, bingx_mid, gap, threshold)
 
         if gap <= threshold:
             self.logger.info(
