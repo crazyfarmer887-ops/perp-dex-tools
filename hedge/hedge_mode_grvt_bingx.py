@@ -1172,6 +1172,41 @@ class HedgeBot:
         net_exposure = self.grvt_position + self.bingx_position
         return abs(net_exposure) <= tolerance
 
+    async def _enforce_balanced_positions(self, context: str) -> bool:
+        """Ensure BingX position mirrors GRVT within tolerance; rebalance if necessary."""
+        grvt_position, bingx_position = await self._sync_positions_from_exchanges()
+        net_exposure = grvt_position + bingx_position
+        if abs(net_exposure) <= self.position_tolerance:
+            return True
+
+        self.logger.warning(
+            "⚠️ Position mismatch detected (%s) | GRVT=%s | BingX=%s | net=%s. Attempting BingX rebalance.",
+            context,
+            grvt_position,
+            bingx_position,
+            net_exposure
+        )
+
+        pseudo_side = 'sell' if net_exposure < 0 else 'buy'
+        pseudo_fill = {
+            'side': pseudo_side,
+            'size': abs(net_exposure),
+            'price': self.current_entry_price or None
+        }
+        success = await self._ensure_bingx_hedge(pseudo_fill)
+        if success:
+            self.logger.info(
+                "[BINGX] Rebalance executed (%s %s) during %s.",
+                ('BUY' if pseudo_side == 'sell' else 'SELL'),
+                abs(net_exposure),
+                context.upper()
+            )
+            await self._sync_positions_from_exchanges()
+            return True
+
+        self.logger.error("❌ Unable to rebalance BingX position during %s.", context)
+        return False
+
     async def _fetch_signed_positions(self) -> Tuple[Decimal, Decimal]:
         grvt_position = self.grvt_position
         bingx_position = self.bingx_position
@@ -1399,11 +1434,21 @@ class HedgeBot:
             self.logger.warning("⚠️ Cannot evaluate ROI targets because entry price is non-positive.")
             return
 
+        if not await self._enforce_balanced_positions("ROI wait start"):
+            self.logger.warning("Skipping ROI wait due to unresolved hedge imbalance.")
+            return
+
         hundred = Decimal('100')
         start_time = time.time()
         self.logger.info("⏳ Waiting for ROI targets before executing opposite GRVT cycle...")
 
         while not self.stop_flag:
+            if abs(self.grvt_position + self.bingx_position) > self.position_tolerance:
+                balanced = await self._enforce_balanced_positions("ROI wait loop")
+                if not balanced:
+                    self.logger.error("Stopping ROI wait due to persistent hedge imbalance.")
+                    return
+
             try:
                 best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
             except Exception as exc:
@@ -1522,6 +1567,11 @@ class HedgeBot:
                 "Unable to complete BingX hedge for GRVT %s fill; halting cycle to avoid exposure.",
                 trade_side.upper()
             )
+            self._reset_entry_state()
+            return False
+
+        balanced = await self._enforce_balanced_positions("post-cycle hedging")
+        if not balanced:
             self._reset_entry_state()
             return False
 
