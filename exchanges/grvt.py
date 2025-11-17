@@ -248,19 +248,26 @@ class GrvtClient(BaseExchangeClient):
 
         return best_bid, best_ask
 
-    async def place_post_only_order(self, contract_id: str, quantity: Decimal, price: Decimal,
-                                    side: str) -> OrderResult:
-        """Place a post only order with GRVT using official SDK."""
+    async def _create_limit_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        *,
+        post_only: bool = True
+    ) -> OrderInfo:
+        """Place a GRVT limit order with optional post-only flag."""
 
-        # Place the order using GRVT SDK
         order_result = self.rest_client.create_limit_order(
             symbol=contract_id,
             side=side,
             amount=quantity,
             price=price,
             params={
-                'post_only': True,
-                'order_duration_secs': 30 * 86400 - 1, # GRVT SDK: signature expired cap is 30 days (default 1 day)
+                'post_only': post_only,
+                # GRVT SDK: signature expired cap is 30 days (default 1 day)
+                'order_duration_secs': 30 * 86400 - 1,
             }
         )
         if not order_result:
@@ -274,7 +281,6 @@ class GrvtClient(BaseExchangeClient):
             order_status = order_info.status
 
         while order_status in ['PENDING'] and time.time() - order_status_start_time < 10:
-            # Check order status after a short delay
             await asyncio.sleep(0.05)
             order_info = await self.get_order_info(client_order_id=client_order_id)
             if order_info is not None:
@@ -282,8 +288,30 @@ class GrvtClient(BaseExchangeClient):
 
         if order_status == 'PENDING':
             raise Exception('Paradex Server Error: Order not processed after 10 seconds')
-        else:
-            return order_info
+        return order_info
+
+    async def place_post_only_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str
+    ) -> OrderInfo:
+        """Place a post only order with GRVT using official SDK."""
+        return await self._create_limit_order(contract_id, quantity, price, side, post_only=True)
+
+    async def place_aggressive_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str
+    ) -> OrderInfo:
+        """
+        Place a non-post-only limit order (marketable if price crosses) with GRVT.
+        Intended for fast position exits when maker fills stall.
+        """
+        return await self._create_limit_order(contract_id, quantity, price, side, post_only=False)
 
     async def get_order_price(self, direction: str) -> Decimal:
         """Get the price of an order with GRVT using official SDK."""
