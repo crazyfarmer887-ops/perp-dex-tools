@@ -297,6 +297,8 @@ python runbot.py --exchange extended --ticker ETH --quantity 0.1 --take-profit 0
 
 可选参数 `--tp-roi` 和 `--sl-roi` 允许你基于平均开仓价设定 ROI 百分比的止盈/止损目标；在达到目标之前，策略会等待而不是立即进入下一步。
 
+> ℹ️ 当使用 `grvt_bingx` 对冲模式并设置了 ROI 参数时，BingX 侧的对冲订单会自动按照相同百分比附带止盈/止损委托。如需关闭，可设置 `BINGX_HEDGE_ATTACH_TPSL=false`（或在构造 HedgeBot 时传入 `bingx_attach_tp_sl=False`）。
+
 ### 对冲模式优势
 
 - **风险降低**：通过同时持有相反头寸，降低单边市场风险
@@ -396,6 +398,13 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `BINGX_API_KEY`: 您的 BingX API Key
 - `BINGX_API_SECRET`: 您的 BingX API Secret
 - `BINGX_ENVIRONMENT`: 交易环境（`prod` 或 `testnet`，可选）
+
+#### GRVT + BingX 对冲配置（可选）
+
+- `BINGX_HEDGE_ATTACH_TPSL`: 是否强制给 BingX 对冲单附带 TP/SL（`true`/`false`），当设置 ROI 时默认会开启
+- `BINGX_HEDGE_ORDER_TYPE`: 对冲下单类型（`market` 或 `limit`，默认 `market`）
+- `BINGX_HEDGE_LIMIT_OFFSET_TICKS`: BingX 限价对冲的额外 tick 偏移（默认 `0`）
+- `BINGX_HEDGE_TIME_IN_FORCE`: 自定义 BingX 限价对冲的 TIF，例如 `IOC`、`FOK`、`GTC`
 
 #### Extended 配置
 

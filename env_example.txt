@@ -30,6 +30,10 @@ GRVT_ENVIRONMENT=prod # or testnet/staging/dev
 BINGX_API_KEY=your_bingx_api_key
 BINGX_API_SECRET=your_bingx_api_secret
 BINGX_ENVIRONMENT=prod # or testnet
+BINGX_HEDGE_ORDER_TYPE=market # market or limit
+BINGX_HEDGE_LIMIT_OFFSET_TICKS=0 # optional tick offset for limit hedges
+BINGX_HEDGE_TIME_IN_FORCE= # e.g. IOC / FOK / GTC (leave empty for default)
+BINGX_HEDGE_ATTACH_TPSL=true # auto-attach BingX TP/SL; defaults to true when ROI targets are set
 
 # Aster Configuration
 ASTER_API_KEY=your_aster_api_key
