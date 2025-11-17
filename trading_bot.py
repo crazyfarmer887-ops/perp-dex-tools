@@ -8,7 +8,7 @@ import asyncio
 import traceback
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Tuple
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
@@ -32,6 +32,8 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    tp_roi: Optional[Decimal] = None
+    sl_roi: Optional[Decimal] = None
 
     @property
     def close_order_side(self) -> str:
@@ -190,6 +192,49 @@ class TradingBot:
         else:
             return 1
 
+    def _compute_tp_sl_prices(self, entry_price: Decimal, close_side: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """Calculate TP/SL prices based on ROI settings and entry price."""
+        if self.config.tp_roi is None and self.config.sl_roi is None:
+            return None, None
+
+        if entry_price is None or entry_price <= 0:
+            self.logger.log("⚠️ Cannot compute TP/SL due to invalid entry price.", "WARNING")
+            return None, None
+
+        hundred = Decimal('100')
+        take_profit_price: Optional[Decimal] = None
+        stop_loss_price: Optional[Decimal] = None
+
+        # Calculate take profit price based on ROI
+        if self.config.tp_roi is not None:
+            tp_factor = self.config.tp_roi / hundred
+            if close_side == 'sell':
+                # For sell orders, TP is below entry (price goes down)
+                take_profit_price = entry_price * (Decimal('1') - tp_factor)
+            else:
+                # For buy orders, TP is above entry (price goes up)
+                take_profit_price = entry_price * (Decimal('1') + tp_factor)
+
+        # Calculate stop loss price based on ROI
+        if self.config.sl_roi is not None:
+            sl_factor = self.config.sl_roi / hundred
+            if close_side == 'sell':
+                # For sell orders, SL is above entry (price goes up, loss)
+                stop_loss_price = entry_price * (Decimal('1') + sl_factor)
+            else:
+                # For buy orders, SL is below entry (price goes down, loss)
+                stop_loss_price = entry_price * (Decimal('1') - sl_factor)
+
+        # Validate prices
+        if take_profit_price is not None and take_profit_price <= 0:
+            self.logger.log("⚠️ Computed take-profit price is non-positive; ignoring TP.", "WARNING")
+            take_profit_price = None
+        if stop_loss_price is not None and stop_loss_price <= 0:
+            self.logger.log("⚠️ Computed stop-loss price is non-positive; ignoring SL.", "WARNING")
+            stop_loss_price = None
+
+        return take_profit_price, stop_loss_price
+
     async def _place_and_monitor_open_order(self) -> bool:
         """Place an order and monitor its execution."""
         try:
@@ -240,17 +285,85 @@ class TradingBot:
                 self.last_open_order_time = time.time()
                 # Place close order
                 close_side = self.config.close_order_side
-                if close_side == 'sell':
-                    close_price = filled_price * (1 + self.config.take_profit/100)
+                
+                # Calculate TP/SL prices based on ROI if provided
+                take_profit_price, stop_loss_price = self._compute_tp_sl_prices(filled_price, close_side)
+                
+                # Use ROI-based TP price if available, otherwise use traditional take_profit
+                if take_profit_price is not None:
+                    close_price = take_profit_price
+                    if self.config.tp_roi is not None:
+                        self.logger.log(f"[CLOSE] Using ROI-based TP price: {close_price} ({self.config.tp_roi}% ROI)", "INFO")
                 else:
-                    close_price = filled_price * (1 - self.config.take_profit/100)
+                    # Fallback to traditional take_profit calculation
+                    if close_side == 'sell':
+                        close_price = filled_price * (1 + self.config.take_profit/100)
+                    else:
+                        close_price = filled_price * (1 - self.config.take_profit/100)
 
-                close_order_result = await self.exchange_client.place_close_order(
-                    self.config.contract_id,
-                    self.config.quantity,
-                    close_price,
-                    close_side
-                )
+                # For BingX, use place_limit_order with TP/SL if ROI is set
+                if self.config.exchange == "bingx" and hasattr(self.exchange_client, 'place_limit_order') and (take_profit_price is not None or stop_loss_price is not None):
+                    try:
+                        # Adjust price similar to place_close_order logic
+                        best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                        if best_bid > 0 and best_ask > 0:
+                            tick = self.config.tick_size
+                            adjusted_close_price = close_price
+                            if close_side.lower() == 'sell' and close_price <= best_bid:
+                                adjusted_close_price = best_bid + tick
+                            elif close_side.lower() == 'buy' and close_price >= best_ask:
+                                adjusted_close_price = best_ask - tick
+                            close_price = adjusted_close_price
+                        
+                        close_order_result = await self.exchange_client.place_limit_order(
+                            contract_id=self.config.contract_id,
+                            quantity=self.config.quantity,
+                            side=close_side,
+                            price=close_price,
+                            reduce_only=True,
+                            post_only=True,
+                            time_in_force='PO',
+                            take_profit_price=take_profit_price,
+                            stop_loss_price=stop_loss_price,
+                            tp_sl_order_type='limit'
+                        )
+                        if take_profit_price is not None:
+                            self.logger.log(f"[TP] Attached TP order @ {take_profit_price} ({self.config.tp_roi}% ROI)", "INFO")
+                        if stop_loss_price is not None:
+                            self.logger.log(f"[SL] Attached SL order @ {stop_loss_price} ({self.config.sl_roi}% ROI)", "INFO")
+                    except Exception as e:
+                        self.logger.log(f"[CLOSE] Failed to place order with TP/SL, falling back to regular close order: {e}", "WARNING")
+                        close_order_result = await self.exchange_client.place_close_order(
+                            self.config.contract_id,
+                            self.config.quantity,
+                            close_price,
+                            close_side
+                        )
+                else:
+                    close_order_result = await self.exchange_client.place_close_order(
+                        self.config.contract_id,
+                        self.config.quantity,
+                        close_price,
+                        close_side
+                    )
+                    
+                    # For exchanges that don't support native TP/SL, place separate SL order if needed
+                    if stop_loss_price is not None and self.config.exchange != "bingx":
+                        try:
+                            # Place stop loss order as a separate close order
+                            sl_order_result = await self.exchange_client.place_close_order(
+                                self.config.contract_id,
+                                self.config.quantity,
+                                stop_loss_price,
+                                close_side
+                            )
+                            if sl_order_result.success:
+                                self.logger.log(f"[SL] Placed stop loss order @ {stop_loss_price} ({self.config.sl_roi}% ROI)", "INFO")
+                            else:
+                                self.logger.log(f"[SL] Failed to place stop loss order: {sl_order_result.error_message}", "WARNING")
+                        except Exception as e:
+                            self.logger.log(f"[SL] Error placing stop loss order: {e}", "WARNING")
+                
                 if self.config.exchange == "lighter":
                     await asyncio.sleep(1)
 
@@ -338,17 +451,84 @@ class TradingBot:
                         close_side
                     )
                 else:
-                    if close_side == 'sell':
-                        close_price = filled_price * (1 + self.config.take_profit/100)
+                    # Calculate TP/SL prices based on ROI if provided
+                    take_profit_price, stop_loss_price = self._compute_tp_sl_prices(filled_price, close_side)
+                    
+                    # Use ROI-based TP price if available, otherwise use traditional take_profit
+                    if take_profit_price is not None:
+                        close_price = take_profit_price
+                        if self.config.tp_roi is not None:
+                            self.logger.log(f"[CLOSE] Using ROI-based TP price: {close_price} ({self.config.tp_roi}% ROI)", "INFO")
                     else:
-                        close_price = filled_price * (1 - self.config.take_profit/100)
+                        # Fallback to traditional take_profit calculation
+                        if close_side == 'sell':
+                            close_price = filled_price * (1 + self.config.take_profit/100)
+                        else:
+                            close_price = filled_price * (1 - self.config.take_profit/100)
 
-                    close_order_result = await self.exchange_client.place_close_order(
-                        self.config.contract_id,
-                        self.order_filled_amount,
-                        close_price,
-                        close_side
-                    )
+                    # For BingX, use place_limit_order with TP/SL if ROI is set
+                    if self.config.exchange == "bingx" and hasattr(self.exchange_client, 'place_limit_order') and (take_profit_price is not None or stop_loss_price is not None):
+                        try:
+                            # Adjust price similar to place_close_order logic
+                            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                            if best_bid > 0 and best_ask > 0:
+                                tick = self.config.tick_size
+                                adjusted_close_price = close_price
+                                if close_side.lower() == 'sell' and close_price <= best_bid:
+                                    adjusted_close_price = best_bid + tick
+                                elif close_side.lower() == 'buy' and close_price >= best_ask:
+                                    adjusted_close_price = best_ask - tick
+                                close_price = adjusted_close_price
+                            
+                            close_order_result = await self.exchange_client.place_limit_order(
+                                contract_id=self.config.contract_id,
+                                quantity=self.order_filled_amount,
+                                side=close_side,
+                                price=close_price,
+                                reduce_only=True,
+                                post_only=True,
+                                time_in_force='PO',
+                                take_profit_price=take_profit_price,
+                                stop_loss_price=stop_loss_price,
+                                tp_sl_order_type='limit'
+                            )
+                            if take_profit_price is not None:
+                                self.logger.log(f"[TP] Attached TP order @ {take_profit_price} ({self.config.tp_roi}% ROI)", "INFO")
+                            if stop_loss_price is not None:
+                                self.logger.log(f"[SL] Attached SL order @ {stop_loss_price} ({self.config.sl_roi}% ROI)", "INFO")
+                        except Exception as e:
+                            self.logger.log(f"[CLOSE] Failed to place order with TP/SL, falling back to regular close order: {e}", "WARNING")
+                            close_order_result = await self.exchange_client.place_close_order(
+                                self.config.contract_id,
+                                self.order_filled_amount,
+                                close_price,
+                                close_side
+                            )
+                    else:
+                        close_order_result = await self.exchange_client.place_close_order(
+                            self.config.contract_id,
+                            self.order_filled_amount,
+                            close_price,
+                            close_side
+                        )
+                        
+                        # For exchanges that don't support native TP/SL, place separate SL order if needed
+                        if stop_loss_price is not None and self.config.exchange != "bingx":
+                            try:
+                                # Place stop loss order as a separate close order
+                                sl_order_result = await self.exchange_client.place_close_order(
+                                    self.config.contract_id,
+                                    self.order_filled_amount,
+                                    stop_loss_price,
+                                    close_side
+                                )
+                                if sl_order_result.success:
+                                    self.logger.log(f"[SL] Placed stop loss order @ {stop_loss_price} ({self.config.sl_roi}% ROI)", "INFO")
+                                else:
+                                    self.logger.log(f"[SL] Failed to place stop loss order: {sl_order_result.error_message}", "WARNING")
+                            except Exception as e:
+                                self.logger.log(f"[SL] Error placing stop loss order: {e}", "WARNING")
+                    
                     if self.config.exchange == "lighter":
                         await asyncio.sleep(1)
 
@@ -498,6 +678,10 @@ class TradingBot:
             self.logger.log(f"Contract ID: {self.config.contract_id}", "INFO")
             self.logger.log(f"Quantity: {self.config.quantity}", "INFO")
             self.logger.log(f"Take Profit: {self.config.take_profit}%", "INFO")
+            if self.config.tp_roi is not None:
+                self.logger.log(f"TP ROI: {self.config.tp_roi}%", "INFO")
+            if self.config.sl_roi is not None:
+                self.logger.log(f"SL ROI: {self.config.sl_roi}%", "INFO")
             self.logger.log(f"Direction: {self.config.direction}", "INFO")
             self.logger.log(f"Max Orders: {self.config.max_orders}", "INFO")
             self.logger.log(f"Wait Time: {self.config.wait_time}s", "INFO")
