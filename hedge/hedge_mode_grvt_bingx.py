@@ -1124,6 +1124,86 @@ class HedgeBot:
         target = self._target_position_for_side(target_side)
         return target - self.grvt_position
 
+    async def _fetch_exchange_mids(self) -> Optional[Dict[str, Decimal]]:
+        if (
+            self.grvt_client is None
+            or self.bingx_client is None
+            or self.grvt_contract_id is None
+            or self.bingx_contract_id is None
+        ):
+            return None
+
+        try:
+            grvt_task = asyncio.create_task(self.grvt_client.fetch_bbo_prices(self.grvt_contract_id))
+            bingx_task = asyncio.create_task(self.bingx_client.fetch_bbo_prices(self.bingx_contract_id))
+            grvt_bid, grvt_ask = await grvt_task
+            bingx_bid, bingx_ask = await bingx_task
+        except Exception as exc:
+            self.logger.warning(f"⚠️ Failed to fetch exchange mids: {exc}")
+            return None
+
+        if min(grvt_bid, grvt_ask, bingx_bid, bingx_ask) <= 0:
+            return None
+
+        return {
+            'grvt_bid': grvt_bid,
+            'grvt_ask': grvt_ask,
+            'grvt_mid': (grvt_bid + grvt_ask) / Decimal('2'),
+            'bingx_bid': bingx_bid,
+            'bingx_ask': bingx_ask,
+            'bingx_mid': (bingx_bid + bingx_ask) / Decimal('2')
+        }
+
+    async def _plan_gap_trade(self) -> Optional[Tuple[str, Optional[Decimal]]]:
+        mids = await self._fetch_exchange_mids()
+        if mids is None:
+            return None
+
+        grvt_mid = mids['grvt_mid']
+        bingx_mid = mids['bingx_mid']
+        gap = abs(grvt_mid - bingx_mid)
+        threshold = self.bingx_tick_size or Decimal('0.01')
+
+        if gap <= threshold:
+            self.logger.info(
+                "Gap %.6f is within threshold %.6f; waiting for better opportunity.",
+                gap,
+                threshold
+            )
+            return None
+
+        combined_mid = (grvt_mid + bingx_mid) / Decimal('2')
+        grvt_tick = self.grvt_tick_size or Decimal('0.01')
+
+        if grvt_mid <= bingx_mid:
+            side = 'buy'
+            desired_price = combined_mid
+            cap_price = mids['grvt_ask'] - grvt_tick
+            price_override = min(desired_price, cap_price)
+        else:
+            side = 'sell'
+            desired_price = combined_mid
+            cap_price = mids['grvt_bid'] + grvt_tick
+            price_override = max(desired_price, cap_price)
+
+        if price_override <= 0:
+            price_override = None
+        else:
+            try:
+                price_override = self.grvt_client.round_to_tick(price_override)
+            except Exception:
+                pass
+
+        self.logger.info(
+            "Gap trade | grvt_mid=%s | bingx_mid=%s | gap=%s | side=%s | target_price=%s",
+            grvt_mid,
+            bingx_mid,
+            gap,
+            side.upper(),
+            price_override
+        )
+        return side, price_override
+
     def _schedule_next_grvt_order_price(self, trigger: str) -> None:
         if self.current_entry_side is None:
             return
@@ -1156,6 +1236,42 @@ class HedgeBot:
         self.logger.info(
             f"📌 Scheduling next GRVT {side.upper()} order @ {rounded_price} due to {trigger.replace('_', ' ')}"
         )
+
+    async def _close_grvt_position_with_roi(self, target_price: Optional[Decimal], trigger: str) -> bool:
+        quantity = abs(self.grvt_position)
+        if quantity <= self.position_tolerance:
+            self.logger.info("No GRVT position to close for ROI trigger %s.", trigger)
+            return True
+
+        side = 'sell' if self.grvt_position > 0 else 'buy'
+        if target_price is not None and target_price <= 0:
+            target_price = None
+
+        self.logger.info(
+            "[GRVT] Executing ROI %s via %s %s @ %s",
+            trigger,
+            side.upper(),
+            quantity,
+            target_price or 'AUTO'
+        )
+
+        fill = await self.place_grvt_order(
+            side,
+            quantity=quantity,
+            price_override=target_price
+        )
+        if not fill:
+            self.logger.error("[GRVT] ROI %s order failed; retaining position.", trigger)
+            return False
+
+        hedge_success = await self._ensure_bingx_hedge(fill)
+        if not hedge_success:
+            self.logger.error("[BINGX] ROI %s hedge failed; manual intervention required.", trigger)
+            return False
+
+        self._reset_entry_state()
+        self.logger.info("✅ ROI %s execution complete; positions hedged.", trigger)
+        return True
 
     def _per_exchange_positions_flat(
         self,
@@ -1473,14 +1589,24 @@ class HedgeBot:
                 if take_profit_hit:
                     self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
                     self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%)")
-                    self._schedule_next_grvt_order_price('take_profit')
-                    return
+                    success = await self._close_grvt_position_with_roi(
+                        self.current_take_profit_price,
+                        'take_profit'
+                    )
+                    if success:
+                        return
+                    self.logger.warning("ROI take profit execution failed; continuing to monitor.")
 
                 if stop_loss_hit:
                     self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
                     self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%)")
-                    self._schedule_next_grvt_order_price('stop_loss')
-                    return
+                    success = await self._close_grvt_position_with_roi(
+                        self.current_stop_loss_price,
+                        'stop_loss'
+                    )
+                    if success:
+                        return
+                    self.logger.warning("ROI stop loss execution failed; continuing to monitor.")
 
             elapsed = time.time() - start_time
             if elapsed >= self.max_roi_wait:
@@ -1491,14 +1617,14 @@ class HedgeBot:
 
             await asyncio.sleep(self.roi_poll_interval)
 
-    async def execute_cycle(self, side: str) -> bool:
-        price_override = None
+    async def execute_cycle(self, side: str, price_override: Optional[Decimal] = None) -> bool:
+        effective_price_override = price_override
         if self.pending_grvt_price and self.pending_grvt_price[0] == side:
-            price_override = self.pending_grvt_price[1]
-        elif self.entry_tick_price is not None:
+            effective_price_override = self.pending_grvt_price[1]
+        elif effective_price_override is None and self.entry_tick_price is not None:
             tick_override = await self._compute_entry_price_override(side)
             if tick_override is not None:
-                price_override = tick_override
+                effective_price_override = tick_override
 
         trade_delta = self._compute_trade_delta(side)
         if trade_delta == 0:
@@ -1526,25 +1652,33 @@ class HedgeBot:
                 trade_delta
             )
 
-        if price_override is not None and self.pending_grvt_price and self.pending_grvt_price[0] != trade_side:
+        if (
+            effective_price_override is not None
+            and self.pending_grvt_price
+            and self.pending_grvt_price[0] != trade_side
+        ):
             self.logger.warning(
                 "Pending GRVT price scheduled for %s but actual trade side is %s; ignoring override.",
                 self.pending_grvt_price[0].upper(),
                 trade_side.upper()
             )
-            price_override = None
+            effective_price_override = None
 
         parallel_bingx_task: Optional[asyncio.Task] = None
         if self.bingx_simultaneous_limit and trade_quantity > 0:
             hedge_side = 'sell' if trade_side == 'buy' else 'buy'
-            entry_hint = price_override
+            entry_hint = effective_price_override
             parallel_bingx_task = asyncio.create_task(
                 self._submit_parallel_bingx_limit(hedge_side, trade_quantity, entry_hint)
             )
 
         previous_position = self.grvt_position
 
-        fill = await self.place_grvt_order(trade_side, quantity=trade_quantity, price_override=price_override)
+        fill = await self.place_grvt_order(
+            trade_side,
+            quantity=trade_quantity,
+            price_override=effective_price_override
+        )
 
         if parallel_bingx_task is not None:
             try:
@@ -1557,7 +1691,11 @@ class HedgeBot:
             self._reset_entry_state()
             return False
 
-        if price_override is not None and self.pending_grvt_price and self.pending_grvt_price[0] == trade_side:
+        if (
+            effective_price_override is not None
+            and self.pending_grvt_price
+            and self.pending_grvt_price[0] == trade_side
+        ):
             self.pending_grvt_price = None
 
         self._register_entry(fill, previous_position)
@@ -1580,11 +1718,11 @@ class HedgeBot:
 
         return True
 
-    async def _run_cycle_phase(self, side: str) -> bool:
+    async def _run_cycle_phase(self, side: str, price_override: Optional[Decimal] = None) -> bool:
         attempt = 0
         while not self.stop_flag:
             attempt += 1
-            success = await self.execute_cycle(side)
+            success = await self.execute_cycle(side, price_override=price_override)
             if success:
                 return True
 
@@ -1631,18 +1769,25 @@ class HedgeBot:
         iteration = 0
         while not self.stop_flag and iteration < self.iterations:
             iteration += 1
-            self.logger.info(f"----- Iteration {iteration}/{self.iterations} -----")
+            self.logger.info(f"----- Gap Iteration {iteration}/{self.iterations} -----")
 
-            buy_completed = await self._run_cycle_phase('buy')
-            if self.stop_flag or not buy_completed:
-                break
+            if abs(self.grvt_position) > self.position_tolerance or abs(self.bingx_position) > self.position_tolerance:
+                self.logger.info(
+                    "Active positions detected (GRVT=%s | BingX=%s); waiting for ROI or manual close.",
+                    self.grvt_position,
+                    self.bingx_position
+                )
+                await asyncio.sleep(self.cycle_retry_delay)
+                continue
 
-            await self.wait_for_roi()
-            if self.stop_flag:
-                break
+            opportunity = await self._plan_gap_trade()
+            if opportunity is None:
+                await asyncio.sleep(self.cycle_retry_delay)
+                continue
 
-            sell_completed = await self._run_cycle_phase('sell')
-            if self.stop_flag or not sell_completed:
+            target_side, price_override = opportunity
+            cycle_completed = await self._run_cycle_phase(target_side, price_override=price_override)
+            if self.stop_flag or not cycle_completed:
                 break
 
             await self.wait_for_roi()
@@ -1650,14 +1795,16 @@ class HedgeBot:
                 break
 
             if not self._positions_are_flat():
-                self.logger.error(
-                    "Residual positions detected after iteration %s | GRVT=%s | BingX=%s. Halting to prevent compounding.",
-                    iteration,
-                    self.grvt_position,
-                    self.bingx_position
-                )
-                self.stop_flag = True
-                break
+                balanced = await self._enforce_balanced_positions("post-iteration")
+                if not balanced:
+                    self.logger.error(
+                        "Residual positions detected after iteration %s | GRVT=%s | BingX=%s. Halting to prevent compounding.",
+                        iteration,
+                        self.grvt_position,
+                        self.bingx_position
+                    )
+                    self.stop_flag = True
+                    break
 
         self.logger.info("Trading loop finished")
 

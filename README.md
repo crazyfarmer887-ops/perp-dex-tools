@@ -346,6 +346,11 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `--bingx-sim-limit` / `--no-bingx-sim-limit`: （仅限 grvt_bingx）是否在提交 GRVT maker 单的同时，在 BingX 上提交对冲用的限价单（默认关闭，可通过环境变量启用）
 - `--position-close`: （仅限 grvt_bingx）跳过正常交易循环，直接在两个交易所同时挂出限价 OPEN 单来平掉当前对冲仓位
 
+`grvt_bingx` 策略会实时比较两家交易所的中间价，当价差超过 BingX 的最小 tick 时：  
+- **GRVT 中间价更低 → 在 GRVT 做多（maker 限价），同时在 BingX 做空对冲**  
+- **GRVT 中间价更高 → 在 GRVT 做空，BingX 对冲做多**  
+并结合 `--tp-roi / --sl-roi` 指定的 ROI 目标：BingX 通过附带 TP/SL 完成退出；GRVT 则在触发 ROI 时自动提交反方向限价单来平掉已有仓位。
+
 当在 `grvt_bingx` 对冲模式中提供 `--tp-roi` 或 `--sl-roi` 时，系统会自动在 BingX 的对冲订单上附加相应的 take-profit/stop-loss 触发单；如果需要强制关闭该行为，可在环境变量中设置 `BINGX_HEDGE_ATTACH_TPSL=0`。
 
 ## 配置
