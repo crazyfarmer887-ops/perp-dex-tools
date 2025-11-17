@@ -104,16 +104,48 @@ class BingxClient(BaseExchangeClient):
     # --------------------------------------------------------------------- #
 
     def _get_tick_size(self) -> Decimal:
+        """
+        Determine the correct tick size for BingX markets.
+
+        Preference order:
+            1. Exchange-reported tickSize (most precise)
+            2. Price precision (10 ** -precision)
+            3. Minimum price limit (fallback – may be overly small)
+            4. Config default
+        """
+
+        def _sanitize_tick(value: Any) -> Optional[Decimal]:
+            if value in (None, ''):
+                return None
+            try:
+                tick_dec = _to_decimal(value)
+            except (InvalidOperation, ValueError, TypeError):
+                return None
+            if tick_dec <= 0:
+                return None
+            return tick_dec
+
         if self._market:
-            tick = self._market.get('limits', {}).get('price', {}).get('min')
+            tick = _sanitize_tick(self._market.get('info', {}).get('tickSize'))
             if tick:
-                return _to_decimal(tick)
-            tick = self._market.get('info', {}).get('tickSize')
-            if tick:
-                return _to_decimal(tick)
+                return tick
+
             precision = self._market.get('precision', {}).get('price')
             if precision is not None:
-                return Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
+                try:
+                    precision_int = int(precision)
+                    if precision_int >= 0:
+                        return Decimal('1') / (Decimal('10') ** precision_int)
+                except (ValueError, TypeError, InvalidOperation):
+                    pass
+
+            tick = _sanitize_tick(self._market.get('limits', {}).get('price', {}).get('min'))
+            if tick:
+                # Some markets expose extremely small min prices; cap to a sensible default
+                if tick.as_tuple().exponent < -10:
+                    return Decimal('0.00000001')
+                return tick
+
         return getattr(self.config, 'tick_size', Decimal('0.01'))
 
     def _quantize_amount(self, amount: Decimal) -> str:
