@@ -601,7 +601,18 @@ class HedgeBot:
         if quantity <= 0:
             return None
 
-        take_profit_price, stop_loss_price = self._compute_tp_sl_targets(hedge_side, entry_price)
+        best_bid = best_ask = None
+        try:
+            best_bid, best_ask = await self.bingx_client.fetch_bbo_prices(self.bingx_contract_id)
+        except Exception as exc:
+            self.logger.warning(f"[BINGX] Failed to fetch BBO before market hedge: {exc}")
+
+        take_profit_price, stop_loss_price = self._compute_tp_sl_targets(
+            hedge_side,
+            entry_price,
+            best_bid=best_bid,
+            best_ask=best_ask
+        )
         self.logger.info(
             "[BINGX] Hedging %s %s via market order (tp=%s, sl=%s)",
             hedge_side,
@@ -632,7 +643,10 @@ class HedgeBot:
     def _compute_tp_sl_targets(
         self,
         hedge_side: str,
-        entry_price: Optional[Decimal]
+        entry_price: Optional[Decimal],
+        *,
+        best_bid: Optional[Decimal] = None,
+        best_ask: Optional[Decimal] = None
     ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
         if not self.bingx_attach_tp_sl:
             return None, None
@@ -665,6 +679,62 @@ class HedgeBot:
         if stop_loss_price is not None and stop_loss_price <= 0:
             self.logger.warning("⚠️ Computed BingX stop-loss price is non-positive; ignoring SL.")
             stop_loss_price = None
+
+        reference_price = None
+        if hedge_side == 'sell':
+            reference_price = best_bid
+        elif hedge_side == 'buy':
+            reference_price = best_ask
+
+        tick_size = self.bingx_tick_size or getattr(self.bingx_client.config, 'tick_size', None) if self.bingx_client else None
+        tick = tick_size if isinstance(tick_size, Decimal) and tick_size > 0 else Decimal('0.01')
+
+        if reference_price is not None and reference_price > 0:
+            if hedge_side == 'sell' and take_profit_price is not None and take_profit_price >= reference_price:
+                adjusted_tp = reference_price - tick
+                if adjusted_tp > 0:
+                    self.logger.warning(
+                        "⚠️ BingX requires SHORT TP < last price (%.8f). Adjusting TP from %s to %s.",
+                        reference_price,
+                        take_profit_price,
+                        adjusted_tp
+                    )
+                    take_profit_price = adjusted_tp
+                else:
+                    self.logger.warning("⚠️ SHORT TP constraint adjustment failed; removing TP.")
+                    take_profit_price = None
+            if hedge_side == 'buy' and take_profit_price is not None and take_profit_price <= reference_price:
+                adjusted_tp = reference_price + tick
+                self.logger.warning(
+                    "⚠️ BingX requires LONG TP > last price (%.8f). Adjusting TP from %s to %s.",
+                    reference_price,
+                    take_profit_price,
+                    adjusted_tp
+                )
+                take_profit_price = adjusted_tp
+
+            if hedge_side == 'sell' and stop_loss_price is not None and stop_loss_price <= reference_price:
+                adjusted_sl = reference_price + tick
+                self.logger.warning(
+                    "⚠️ BingX requires SHORT SL > last price (%.8f). Adjusting SL from %s to %s.",
+                    reference_price,
+                    stop_loss_price,
+                    adjusted_sl
+                )
+                stop_loss_price = adjusted_sl
+            if hedge_side == 'buy' and stop_loss_price is not None and stop_loss_price >= reference_price:
+                adjusted_sl = reference_price - tick
+                if adjusted_sl > 0:
+                    self.logger.warning(
+                        "⚠️ BingX requires LONG SL < last price (%.8f). Adjusting SL from %s to %s.",
+                        reference_price,
+                        stop_loss_price,
+                        adjusted_sl
+                    )
+                    stop_loss_price = adjusted_sl
+                else:
+                    self.logger.warning("⚠️ LONG SL constraint adjustment failed; removing SL.")
+                    stop_loss_price = None
 
         return take_profit_price, stop_loss_price
 
@@ -704,7 +774,12 @@ class HedgeBot:
             self.logger.warning("[BINGX] Computed limit hedge price is non-positive; skipping limit hedge.")
             return None
 
-        take_profit_price, stop_loss_price = self._compute_tp_sl_targets(hedge_side, entry_price)
+        take_profit_price, stop_loss_price = self._compute_tp_sl_targets(
+            hedge_side,
+            entry_price,
+            best_bid=best_bid,
+            best_ask=best_ask
+        )
 
         time_in_force = self.bingx_hedge_time_in_force
         if time_in_force and time_in_force.upper() == 'PO':
