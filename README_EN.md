@@ -321,6 +321,8 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `--sl-roi`: Stop loss ROI percentage relative to the average entry price (optional)
 - `--position-close`: (grvt_bingx only) Skip the trading loop and submit limit OPEN orders on both exchanges to flatten existing hedge positions
 
+Tip: In `grvt_bingx` mode, providing either `--tp-roi` or `--sl-roi` automatically attaches matching ROI TP/SL instructions to each BingX hedge order. Set `BINGX_HEDGE_ATTACH_TPSL=false` in `.env` to disable or `true` to force-enable regardless of ROI.
+
 ## Configuration
 
 ### Environment Variables
@@ -373,6 +375,13 @@ python hedge_mode.py --exchange grvt_bingx --ticker BTC --size 0.05 --iter 1 --p
 - `BINGX_API_KEY`: Your BingX API key
 - `BINGX_API_SECRET`: Your BingX API secret
 - `BINGX_ENVIRONMENT`: Trading environment (`prod` or `testnet`, optional)
+
+##### Additional GRVT + BingX Hedge Settings (optional)
+
+- `BINGX_HEDGE_ORDER_TYPE`: Order type for BingX hedges (`market` or `limit`, default `market`)
+- `BINGX_HEDGE_LIMIT_OFFSET_TICKS`: Tick offset from the current book when placing limit hedges (default `0`)
+- `BINGX_HEDGE_TIME_IN_FORCE`: Time-in-force for limit hedges (default: `IOC` for limit mode, `None` for market mode)
+- `BINGX_HEDGE_ATTACH_TPSL`: Force-enable/disable attaching TP/SL (`true`/`false`). By default it auto-enables when ROI targets are set.
 
 #### Extended Configuration
 

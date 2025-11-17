@@ -141,15 +141,22 @@ class HedgeBot:
             tif_value = 'IOC' if self.bingx_hedge_order_type == 'limit' else None
         self.bingx_hedge_time_in_force = tif_value
 
+        attach_reason: Optional[str] = None
         if bingx_attach_tp_sl is not None:
             attach_value = bool(bingx_attach_tp_sl)
+            attach_reason = 'parameter'
         else:
             env_attach = _parse_bool(os.getenv('BINGX_HEDGE_ATTACH_TPSL'), 'BINGX_HEDGE_ATTACH_TPSL')
-            if env_attach is None:
-                attach_value = False
-            else:
+            if env_attach is not None:
                 attach_value = env_attach
+                attach_reason = 'environment'
+            elif self.tp_roi is not None or self.sl_roi is not None:
+                attach_value = True
+                attach_reason = 'roi_auto'
+            else:
+                attach_value = False
         self.bingx_attach_tp_sl = attach_value
+        self._bingx_attach_tp_sl_reason = attach_reason
 
         default_cycle_retry_delay = float(self.sleep_time) if self.sleep_time > 0 else 3.0
         self.cycle_retry_delay = max(
@@ -263,12 +270,20 @@ class HedgeBot:
         for message in config_warnings:
             self.logger.warning(message)
 
+        attach_note = ''
+        if self._bingx_attach_tp_sl_reason == 'roi_auto' and self.bingx_attach_tp_sl:
+            attach_note = ' (auto-enabled from ROI targets)'
+        elif self._bingx_attach_tp_sl_reason == 'environment':
+            attach_note = ' (set via BINGX_HEDGE_ATTACH_TPSL)'
+        elif self._bingx_attach_tp_sl_reason == 'parameter':
+            attach_note = ' (set via constructor)'
+
         self.logger.info(
             "BingX hedge config | type=%s | limit_offset_ticks=%s | time_in_force=%s | attach_tp_sl=%s",
             self.bingx_hedge_order_type,
             self.bingx_hedge_limit_offset_ticks,
             self.bingx_hedge_time_in_force or 'DEFAULT',
-            self.bingx_attach_tp_sl,
+            f"{self.bingx_attach_tp_sl}{attach_note}",
         )
         self.logger.info("Strict cycle mode: %s", "ENABLED" if self.strict_mode else "DISABLED")
         self.logger.info(
