@@ -8,7 +8,7 @@ import asyncio
 import traceback
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Tuple
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
@@ -32,6 +32,8 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    tp_roi: Optional[Decimal] = None
+    sl_roi: Optional[Decimal] = None
 
     @property
     def close_order_side(self) -> str:
@@ -160,6 +162,44 @@ class TradingBot:
         # Setup order update handler
         self.exchange_client.setup_order_update_handler(order_update_handler)
 
+    def _calculate_tp_sl_prices(self, entry_price: Decimal) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """Calculate take profit and stop loss prices based on ROI settings."""
+        hundred = Decimal('100')
+        take_profit_price: Optional[Decimal] = None
+        stop_loss_price: Optional[Decimal] = None
+
+        # Calculate TP price based on ROI or take_profit percentage
+        if self.config.tp_roi is not None:
+            tp_factor = self.config.tp_roi / hundred
+            if self.config.direction == 'buy':
+                take_profit_price = entry_price * (Decimal('1') + tp_factor)
+            else:  # sell
+                take_profit_price = entry_price * (Decimal('1') - tp_factor)
+        else:
+            # Use traditional take_profit percentage
+            if self.config.close_order_side == 'sell':
+                take_profit_price = entry_price * (1 + self.config.take_profit/100)
+            else:
+                take_profit_price = entry_price * (1 - self.config.take_profit/100)
+
+        # Calculate SL price based on ROI
+        if self.config.sl_roi is not None:
+            sl_factor = self.config.sl_roi / hundred
+            if self.config.direction == 'buy':
+                stop_loss_price = entry_price * (Decimal('1') - sl_factor)
+            else:  # sell
+                stop_loss_price = entry_price * (Decimal('1') + sl_factor)
+
+        # Validate prices
+        if take_profit_price is not None and take_profit_price <= 0:
+            self.logger.log("⚠️ Computed take-profit price is non-positive; using default", "WARNING")
+            take_profit_price = None
+        if stop_loss_price is not None and stop_loss_price <= 0:
+            self.logger.log("⚠️ Computed stop-loss price is non-positive; ignoring SL", "WARNING")
+            stop_loss_price = None
+
+        return take_profit_price, stop_loss_price
+
     def _calculate_wait_time(self) -> Decimal:
         """Calculate wait time between orders."""
         cool_down_time = self.config.wait_time
@@ -238,25 +278,49 @@ class TradingBot:
                 )
             else:
                 self.last_open_order_time = time.time()
-                # Place close order
+                # Calculate TP/SL prices based on ROI settings
+                take_profit_price, stop_loss_price = self._calculate_tp_sl_prices(filled_price)
+                
+                # Place take profit order
                 close_side = self.config.close_order_side
-                if close_side == 'sell':
-                    close_price = filled_price * (1 + self.config.take_profit/100)
+                if take_profit_price is not None:
+                    close_order_result = await self.exchange_client.place_close_order(
+                        self.config.contract_id,
+                        self.config.quantity,
+                        take_profit_price,
+                        close_side
+                    )
+                    if self.config.exchange == "lighter":
+                        await asyncio.sleep(1)
+
+                    if not close_order_result.success:
+                        self.logger.log(f"[CLOSE] Failed to place TP order: {close_order_result.error_message}", "ERROR")
+                        raise Exception(f"[CLOSE] Failed to place TP order: {close_order_result.error_message}")
+                    
+                    # Log TP/SL prices if ROI is set
+                    if self.config.tp_roi is not None:
+                        self.logger.log(f"🎯 TP order placed @ {take_profit_price} ({self.config.tp_roi}% ROI)", "INFO")
+                    if self.config.sl_roi is not None:
+                        self.logger.log(f"🛑 SL target @ {stop_loss_price} (-{self.config.sl_roi}% ROI)", "INFO")
                 else:
-                    close_price = filled_price * (1 - self.config.take_profit/100)
+                    # Fallback to default behavior if TP price calculation failed
+                    if close_side == 'sell':
+                        close_price = filled_price * (1 + self.config.take_profit/100)
+                    else:
+                        close_price = filled_price * (1 - self.config.take_profit/100)
 
-                close_order_result = await self.exchange_client.place_close_order(
-                    self.config.contract_id,
-                    self.config.quantity,
-                    close_price,
-                    close_side
-                )
-                if self.config.exchange == "lighter":
-                    await asyncio.sleep(1)
+                    close_order_result = await self.exchange_client.place_close_order(
+                        self.config.contract_id,
+                        self.config.quantity,
+                        close_price,
+                        close_side
+                    )
+                    if self.config.exchange == "lighter":
+                        await asyncio.sleep(1)
 
-                if not close_order_result.success:
-                    self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
-                    raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
+                    if not close_order_result.success:
+                        self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
+                        raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
 
                 return True
 
@@ -338,19 +402,40 @@ class TradingBot:
                         close_side
                     )
                 else:
-                    if close_side == 'sell':
-                        close_price = filled_price * (1 + self.config.take_profit/100)
-                    else:
-                        close_price = filled_price * (1 - self.config.take_profit/100)
+                    # Calculate TP/SL prices based on ROI settings
+                    take_profit_price, stop_loss_price = self._calculate_tp_sl_prices(filled_price)
+                    
+                    # Place take profit order
+                    if take_profit_price is not None:
+                        close_order_result = await self.exchange_client.place_close_order(
+                            self.config.contract_id,
+                            self.order_filled_amount,
+                            take_profit_price,
+                            close_side
+                        )
+                        if self.config.exchange == "lighter":
+                            await asyncio.sleep(1)
 
-                    close_order_result = await self.exchange_client.place_close_order(
-                        self.config.contract_id,
-                        self.order_filled_amount,
-                        close_price,
-                        close_side
-                    )
-                    if self.config.exchange == "lighter":
-                        await asyncio.sleep(1)
+                        # Log TP/SL prices if ROI is set
+                        if self.config.tp_roi is not None:
+                            self.logger.log(f"🎯 TP order placed @ {take_profit_price} ({self.config.tp_roi}% ROI)", "INFO")
+                        if self.config.sl_roi is not None:
+                            self.logger.log(f"🛑 SL target @ {stop_loss_price} (-{self.config.sl_roi}% ROI)", "INFO")
+                    else:
+                        # Fallback to default behavior
+                        if close_side == 'sell':
+                            close_price = filled_price * (1 + self.config.take_profit/100)
+                        else:
+                            close_price = filled_price * (1 - self.config.take_profit/100)
+
+                        close_order_result = await self.exchange_client.place_close_order(
+                            self.config.contract_id,
+                            self.order_filled_amount,
+                            close_price,
+                            close_side
+                        )
+                        if self.config.exchange == "lighter":
+                            await asyncio.sleep(1)
 
                 self.last_open_order_time = time.time()
                 if not close_order_result.success:
@@ -498,6 +583,10 @@ class TradingBot:
             self.logger.log(f"Contract ID: {self.config.contract_id}", "INFO")
             self.logger.log(f"Quantity: {self.config.quantity}", "INFO")
             self.logger.log(f"Take Profit: {self.config.take_profit}%", "INFO")
+            if self.config.tp_roi is not None:
+                self.logger.log(f"TP ROI: {self.config.tp_roi}%", "INFO")
+            if self.config.sl_roi is not None:
+                self.logger.log(f"SL ROI: {self.config.sl_roi}%", "INFO")
             self.logger.log(f"Direction: {self.config.direction}", "INFO")
             self.logger.log(f"Max Orders: {self.config.max_orders}", "INFO")
             self.logger.log(f"Wait Time: {self.config.wait_time}s", "INFO")
