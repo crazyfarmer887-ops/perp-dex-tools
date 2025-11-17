@@ -121,9 +121,8 @@ class HedgeBot:
         def _normalize_roi(raw_roi: Optional[Decimal]) -> Optional[Decimal]:
             if raw_roi is None:
                 return None
-            if self.leverage <= 0:
-                return raw_roi
-            adjusted = raw_roi / self.leverage
+            leverage_value = self.leverage if self.leverage and self.leverage > 0 else Decimal('1')
+            adjusted = raw_roi / leverage_value
             if adjusted <= 0:
                 return None
             return adjusted
