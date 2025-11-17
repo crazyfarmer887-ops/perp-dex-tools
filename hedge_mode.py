@@ -60,6 +60,8 @@ Examples:
                         help='Target ROI percentage for take profit based on average entry price')
     parser.add_argument('--sl-roi', type=Decimal, default=None,
                         help='Target ROI percentage for stop loss based on average entry price')
+    parser.add_argument('--entry-tick-price', type=Decimal, default=None,
+                        help='(grvt_bingx) Offset (in price units) applied around the combined mid price when submitting GRVT limit entries')
     parser.add_argument('--env-file', type=str, default=".env",
                         help=".env file path (default: .env)")
     parser.add_argument('--position-close', action='store_true',
@@ -134,15 +136,19 @@ async def main():
         tp_roi = args.tp_roi if args.tp_roi is not None else None
         sl_roi = args.sl_roi if args.sl_roi is not None else None
 
-        bot = HedgeBotClass(
-            ticker=args.ticker.upper(),
-            order_quantity=Decimal(args.size),
-            fill_timeout=args.fill_timeout,
-            iterations=args.iter,
-            sleep_time=args.sleep,
-            tp_roi=tp_roi,
-            sl_roi=sl_roi
-        )
+        bot_kwargs = {
+            'ticker': args.ticker.upper(),
+            'order_quantity': Decimal(args.size),
+            'fill_timeout': args.fill_timeout,
+            'iterations': args.iter,
+            'sleep_time': args.sleep,
+            'tp_roi': tp_roi,
+            'sl_roi': sl_roi,
+        }
+        if args.exchange.lower() == 'grvt_bingx':
+            bot_kwargs['entry_tick_price'] = args.entry_tick_price
+
+        bot = HedgeBotClass(**bot_kwargs)
         if args.position_close:
             if args.exchange.lower() != 'grvt_bingx':
                 print("--position-close is currently supported only for the grvt_bingx hedge mode.")

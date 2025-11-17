@@ -35,6 +35,7 @@ class HedgeBot:
         sleep_time: int = 0,
         tp_roi: Optional[Decimal] = None,
         sl_roi: Optional[Decimal] = None,
+        entry_tick_price: Optional[Decimal] = None,
         bingx_order_type: Optional[str] = None,
         bingx_limit_offset_ticks: Optional[Decimal] = None,
         bingx_attach_tp_sl: Optional[bool] = None,
@@ -140,6 +141,14 @@ class HedgeBot:
         else:
             tif_value = 'IOC' if self.bingx_hedge_order_type == 'limit' else None
         self.bingx_hedge_time_in_force = tif_value
+
+        if entry_tick_price is not None:
+            coerced_tick = _coerce_decimal(entry_tick_price, Decimal('0'), 'entry_tick_price')
+            self.entry_tick_price = coerced_tick if coerced_tick > 0 else None
+        else:
+            env_tick = os.getenv('GRVT_BINGX_ENTRY_TICK_PRICE')
+            tick_value = _coerce_decimal(env_tick, Decimal('0'), 'GRVT_BINGX_ENTRY_TICK_PRICE')
+            self.entry_tick_price = tick_value if tick_value > 0 else None
 
         self._auto_tp_sl_enabled = False
         if bingx_attach_tp_sl is not None:
@@ -272,6 +281,10 @@ class HedgeBot:
             self.bingx_hedge_time_in_force or 'DEFAULT',
             self.bingx_attach_tp_sl,
         )
+        if self.entry_tick_price is not None:
+            self.logger.info("Entry tick-price override enabled: %s", self.entry_tick_price)
+        else:
+            self.logger.info("Entry tick-price override disabled.")
         if self.bingx_attach_tp_sl:
             attachment_reason = "auto (ROI targets configured)" if self._auto_tp_sl_enabled else "explicit"
             self.logger.info("BingX TP/SL attachments ENABLED (%s).", attachment_reason)
@@ -918,6 +931,62 @@ class HedgeBot:
         if messages:
             self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
 
+    async def _compute_entry_price_override(self, trade_side: str) -> Optional[Decimal]:
+        if self.entry_tick_price is None or self.entry_tick_price <= 0:
+            return None
+        if (
+            self.grvt_client is None
+            or self.bingx_client is None
+            or self.grvt_contract_id is None
+            or self.bingx_contract_id is None
+        ):
+            return None
+
+        try:
+            grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+            bingx_bid, bingx_ask = await self.bingx_client.fetch_bbo_prices(self.bingx_contract_id)
+        except Exception as exc:
+            self.logger.warning("⚠️ Unable to fetch BBO data for tick-price override: %s", exc)
+            return None
+
+        mids: List[Decimal] = []
+        for bid, ask in ((grvt_bid, grvt_ask), (bingx_bid, bingx_ask)):
+            if bid is None or ask is None:
+                continue
+            if bid > 0 and ask > 0:
+                mids.append((bid + ask) / Decimal('2'))
+
+        if not mids:
+            self.logger.warning("⚠️ Unable to derive combined mid price for tick-price override; skipping.")
+            return None
+
+        combined_mid = sum(mids) / Decimal(len(mids))
+        offset = self.entry_tick_price
+
+        normalized_side = trade_side.strip().lower()
+        if normalized_side == 'buy':
+            target_price = combined_mid - offset
+        else:
+            target_price = combined_mid + offset
+
+        if target_price <= 0:
+            self.logger.warning("⚠️ Tick-price override produced non-positive price; skipping.")
+            return None
+
+        try:
+            rounded_price = self.grvt_client.round_to_tick(target_price)
+        except Exception:
+            rounded_price = target_price
+
+        self.logger.info(
+            "🎯 Tick-price override | side=%s | mid=%s | offset=%s | price=%s",
+            trade_side.upper(),
+            combined_mid,
+            offset,
+            rounded_price
+        )
+        return rounded_price
+
     def _target_position_for_side(self, side: str) -> Decimal:
         normalized = side.strip().lower()
         if normalized == 'buy':
@@ -1254,6 +1323,10 @@ class HedgeBot:
         price_override = None
         if self.pending_grvt_price and self.pending_grvt_price[0] == side:
             price_override = self.pending_grvt_price[1]
+          elif self.entry_tick_price is not None:
+              tick_override = await self._compute_entry_price_override(side)
+              if tick_override is not None:
+                  price_override = tick_override
 
         trade_delta = self._compute_trade_delta(side)
         if trade_delta == 0:
