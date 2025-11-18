@@ -73,6 +73,14 @@ class HedgeBot:
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
 
+        # PnL tracking
+        self.grvt_avg_entry_price: Optional[Decimal] = None
+        self.bingx_avg_entry_price: Optional[Decimal] = None
+        self.grvt_realized_pnl: Decimal = Decimal('0')
+        self.bingx_realized_pnl: Decimal = Decimal('0')
+        self.pnl_display_task: Optional[asyncio.Task] = None
+        self.pnl_display_interval: float = 2.0  # Update every 2 seconds
+
         config_warnings: List[str] = []
 
         def _coerce_decimal(value: Any, default: Decimal, label: str) -> Decimal:
@@ -239,6 +247,10 @@ class HedgeBot:
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
 
+        # Track position history for PnL calculation
+        self.grvt_position_history: List[Tuple[Decimal, Decimal, Decimal]] = []  # (size, price, timestamp)
+        self.bingx_position_history: List[Tuple[Decimal, Decimal, Decimal]] = []  # (size, price, timestamp)
+
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/grvt_bingx_{self.ticker.lower()}_hedge_log.txt"
 
@@ -330,6 +342,106 @@ class HedgeBot:
     # Order handling
     # ------------------------------------------------------------------ #
 
+    def _update_grvt_avg_entry_price(self, side: str, size: Decimal, price: Decimal) -> None:
+        """Update average entry price for GRVT position."""
+        if size <= 0:
+            return
+        
+        previous_position = self.grvt_position
+        if side == 'buy':
+            new_position = previous_position + size
+        else:
+            new_position = previous_position - size
+        
+        if abs(new_position) <= self.position_tolerance:
+            # Position flattened, reset average entry price
+            self.grvt_avg_entry_price = None
+            return
+        
+        if self.grvt_avg_entry_price is None or abs(previous_position) <= self.position_tolerance:
+            # New position or position flipped
+            self.grvt_avg_entry_price = price
+        else:
+            # Update weighted average
+            if (side == 'buy' and previous_position >= 0) or (side == 'sell' and previous_position <= 0):
+                # Adding to existing position
+                total_value = abs(previous_position) * self.grvt_avg_entry_price + size * price
+                self.grvt_avg_entry_price = total_value / abs(new_position)
+            else:
+                # Reducing position - calculate realized PnL
+                if abs(previous_position) > 0:
+                    if side == 'sell' and previous_position > 0:
+                        # Closing long position
+                        closed_size = min(size, abs(previous_position))
+                        realized_pnl = closed_size * (price - self.grvt_avg_entry_price)
+                        self.grvt_realized_pnl += realized_pnl
+                    elif side == 'buy' and previous_position < 0:
+                        # Closing short position
+                        closed_size = min(size, abs(previous_position))
+                        realized_pnl = closed_size * (self.grvt_avg_entry_price - price)
+                        self.grvt_realized_pnl += realized_pnl
+                
+                # Update average entry price for remaining position
+                if abs(new_position) > self.position_tolerance:
+                    if abs(new_position) < abs(previous_position):
+                        # Position reduced but not closed
+                        self.grvt_avg_entry_price = self.grvt_avg_entry_price  # Keep same entry price
+                    else:
+                        # Position flipped
+                        self.grvt_avg_entry_price = price
+                else:
+                    self.grvt_avg_entry_price = None
+
+    def _update_bingx_avg_entry_price(self, side: str, size: Decimal, price: Decimal) -> None:
+        """Update average entry price for BingX position."""
+        if size <= 0:
+            return
+        
+        previous_position = self.bingx_position
+        if side == 'buy':
+            new_position = previous_position + size
+        else:
+            new_position = previous_position - size
+        
+        if abs(new_position) <= self.position_tolerance:
+            # Position flattened, reset average entry price
+            self.bingx_avg_entry_price = None
+            return
+        
+        if self.bingx_avg_entry_price is None or abs(previous_position) <= self.position_tolerance:
+            # New position or position flipped
+            self.bingx_avg_entry_price = price
+        else:
+            # Update weighted average
+            if (side == 'buy' and previous_position >= 0) or (side == 'sell' and previous_position <= 0):
+                # Adding to existing position
+                total_value = abs(previous_position) * self.bingx_avg_entry_price + size * price
+                self.bingx_avg_entry_price = total_value / abs(new_position)
+            else:
+                # Reducing position - calculate realized PnL
+                if abs(previous_position) > 0:
+                    if side == 'sell' and previous_position > 0:
+                        # Closing long position
+                        closed_size = min(size, abs(previous_position))
+                        realized_pnl = closed_size * (price - self.bingx_avg_entry_price)
+                        self.bingx_realized_pnl += realized_pnl
+                    elif side == 'buy' and previous_position < 0:
+                        # Closing short position
+                        closed_size = min(size, abs(previous_position))
+                        realized_pnl = closed_size * (self.bingx_avg_entry_price - price)
+                        self.bingx_realized_pnl += realized_pnl
+                
+                # Update average entry price for remaining position
+                if abs(new_position) > self.position_tolerance:
+                    if abs(new_position) < abs(previous_position):
+                        # Position reduced but not closed
+                        self.bingx_avg_entry_price = self.bingx_avg_entry_price  # Keep same entry price
+                    else:
+                        # Position flipped
+                        self.bingx_avg_entry_price = price
+                else:
+                    self.bingx_avg_entry_price = None
+
     def _handle_grvt_order_update(self, message: Dict[str, Any]) -> None:
         if self.grvt_contract_id is None:
             return
@@ -345,10 +457,14 @@ class HedgeBot:
         order_id = message.get('order_id')
 
         if status == 'FILLED':
+            previous_position = self.grvt_position
             if side == 'buy':
                 self.grvt_position += filled_size
             else:
                 self.grvt_position -= filled_size
+
+            # Update average entry price and realized PnL
+            self._update_grvt_avg_entry_price(side, filled_size, price)
 
             self.last_grvt_fill = {
                 'order_id': order_id,
@@ -421,10 +537,13 @@ class HedgeBot:
 
         if order_result.status == 'FILLED':
             if order_result.size is not None:
+                previous_position = self.grvt_position
                 if side == 'buy':
                     self.grvt_position += order_result.size
                 else:
                     self.grvt_position -= order_result.size
+                # Update average entry price and realized PnL
+                self._update_grvt_avg_entry_price(side, order_result.size, order_result.price)
             self.last_grvt_fill = {
                 'order_id': order_result.order_id,
                 'side': side,
@@ -539,10 +658,19 @@ class HedgeBot:
                 order_result.status,
             )
 
+        previous_position = self.bingx_position
         if hedge_side == 'buy':
             self.bingx_position += total_executed
         else:
             self.bingx_position -= total_executed
+
+        # Update average entry price and realized PnL
+        # Use average price of executed orders
+        if executed_orders:
+            avg_price = sum(
+                Decimal(str(order_result.price)) for _, order_result in executed_orders
+            ) / len(executed_orders)
+            self._update_bingx_avg_entry_price(hedge_side, total_executed, avg_price)
 
         self.logger.info(
             "[BINGX] Hedge complete | side=%s | executed=%s | position=%s",
@@ -1262,6 +1390,111 @@ class HedgeBot:
         return False
 
     # ------------------------------------------------------------------ #
+    # PnL calculation and display
+    # ------------------------------------------------------------------ #
+
+    async def _calculate_unrealized_pnl(self) -> Tuple[Decimal, Decimal]:
+        """Calculate unrealized PnL for both exchanges."""
+        grvt_unrealized = Decimal('0')
+        bingx_unrealized = Decimal('0')
+
+        try:
+            # Get mark prices (use mid price from BBO)
+            if self.grvt_client and self.grvt_contract_id:
+                try:
+                    grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+                    grvt_mark = (grvt_bid + grvt_ask) / 2 if grvt_bid > 0 and grvt_ask > 0 else None
+                    
+                    if grvt_mark and self.grvt_avg_entry_price and abs(self.grvt_position) > self.position_tolerance:
+                        if self.grvt_position > 0:
+                            # Long position
+                            grvt_unrealized = self.grvt_position * (grvt_mark - self.grvt_avg_entry_price)
+                        else:
+                            # Short position
+                            grvt_unrealized = abs(self.grvt_position) * (self.grvt_avg_entry_price - grvt_mark)
+                except Exception as exc:
+                    self.logger.debug(f"Failed to calculate GRVT unrealized PnL: {exc}")
+
+            if self.bingx_client and self.bingx_contract_id:
+                try:
+                    bingx_bid, bingx_ask = await self.bingx_client.fetch_bbo_prices(self.bingx_contract_id)
+                    bingx_mark = (bingx_bid + bingx_ask) / 2 if bingx_bid > 0 and bingx_ask > 0 else None
+                    
+                    if bingx_mark and self.bingx_avg_entry_price and abs(self.bingx_position) > self.position_tolerance:
+                        if self.bingx_position > 0:
+                            # Long position
+                            bingx_unrealized = self.bingx_position * (bingx_mark - self.bingx_avg_entry_price)
+                        else:
+                            # Short position
+                            bingx_unrealized = abs(self.bingx_position) * (self.bingx_avg_entry_price - bingx_mark)
+                except Exception as exc:
+                    self.logger.debug(f"Failed to calculate BingX unrealized PnL: {exc}")
+
+        except Exception as exc:
+            self.logger.debug(f"Error calculating unrealized PnL: {exc}")
+
+        return grvt_unrealized, bingx_unrealized
+
+    async def _display_pnl(self) -> None:
+        """Display aggregated PnL information."""
+        try:
+            grvt_unrealized, bingx_unrealized = await self._calculate_unrealized_pnl()
+            
+            grvt_total = self.grvt_realized_pnl + grvt_unrealized
+            bingx_total = self.bingx_realized_pnl + bingx_unrealized
+            aggregated_pnl = grvt_total + bingx_total
+
+            # Format output - use carriage return to update in place
+            output_lines = [
+                "=" * 70,
+                f"📊 Aggregated PnL ({self.ticker})",
+                "=" * 70,
+                "GRVT:",
+                f"  Position: {self.grvt_position:>12.6f}",
+            ]
+            if self.grvt_avg_entry_price:
+                output_lines.append(f"  Avg Entry: {self.grvt_avg_entry_price:>11.2f}")
+            else:
+                output_lines.append(f"  Avg Entry: {'N/A':>11}")
+            output_lines.extend([
+                f"  Realized PnL: {self.grvt_realized_pnl:>10.4f} USDT",
+                f"  Unrealized PnL: {grvt_unrealized:>8.4f} USDT",
+                f"  Total PnL: {grvt_total:>12.4f} USDT",
+                "",
+                "BingX:",
+                f"  Position: {self.bingx_position:>12.6f}",
+            ])
+            if self.bingx_avg_entry_price:
+                output_lines.append(f"  Avg Entry: {self.bingx_avg_entry_price:>11.2f}")
+            else:
+                output_lines.append(f"  Avg Entry: {'N/A':>11}")
+            output_lines.extend([
+                f"  Realized PnL: {self.bingx_realized_pnl:>10.4f} USDT",
+                f"  Unrealized PnL: {bingx_unrealized:>8.4f} USDT",
+                f"  Total PnL: {bingx_total:>12.4f} USDT",
+                "",
+                f"{'Aggregated Total PnL:':<20} {aggregated_pnl:>12.4f} USDT",
+                "=" * 70,
+            ])
+            
+            # Print PnL display
+            print("\n".join(output_lines))
+        except Exception as exc:
+            self.logger.debug(f"Error displaying PnL: {exc}")
+
+    async def _pnl_display_loop(self) -> None:
+        """Background task to periodically display PnL."""
+        while not self.stop_flag:
+            try:
+                await self._display_pnl()
+                await asyncio.sleep(self.pnl_display_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.logger.debug(f"Error in PnL display loop: {exc}")
+                await asyncio.sleep(self.pnl_display_interval)
+
+    # ------------------------------------------------------------------ #
     # Main run loop
     # ------------------------------------------------------------------ #
 
@@ -1279,6 +1512,9 @@ class HedgeBot:
             return
 
         await asyncio.sleep(2)
+
+        # Start PnL display task
+        self.pnl_display_task = asyncio.create_task(self._pnl_display_loop())
 
         iteration = 0
         while not self.stop_flag and iteration < self.iterations:
@@ -1312,6 +1548,17 @@ class HedgeBot:
                 break
 
         self.logger.info("Trading loop finished")
+
+        # Stop PnL display task
+        if self.pnl_display_task and not self.pnl_display_task.done():
+            self.pnl_display_task.cancel()
+            try:
+                await self.pnl_display_task
+            except asyncio.CancelledError:
+                pass
+
+        # Final PnL display
+        await self._display_pnl()
 
     async def cleanup(self) -> None:
         if self.grvt_client:
