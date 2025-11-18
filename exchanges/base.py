@@ -6,7 +6,7 @@ All exchange implementations should inherit from this class.
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional, Tuple, Type, Union
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 
@@ -67,11 +67,26 @@ class BaseExchangeClient(ABC):
         self._validate_config()
 
     def round_to_tick(self, price) -> Decimal:
-        price = Decimal(price)
+        price_decimal = Decimal(price)
+        tick = getattr(self.config, 'tick_size', None)
+        if not tick:
+            return price_decimal
 
-        tick = self.config.tick_size
-        # quantize forces price to be a multiple of tick
-        return price.quantize(tick, rounding=ROUND_HALF_UP)
+        try:
+            tick_decimal = Decimal(str(tick))
+        except (InvalidOperation, ValueError):
+            return price_decimal
+
+        try:
+            return price_decimal.quantize(tick_decimal, rounding=ROUND_HALF_UP)
+        except InvalidOperation:
+            if tick_decimal == 0:
+                return price_decimal
+            try:
+                ratio = (price_decimal / tick_decimal).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+                return ratio * tick_decimal
+            except InvalidOperation:
+                return price_decimal
 
     @abstractmethod
     def _validate_config(self) -> None:
