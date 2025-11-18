@@ -65,6 +65,12 @@ class HedgeBot:
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
 
+        # PnL tracking
+        self.grvt_trades: List[Dict[str, Any]] = []
+        self.lighter_trades: List[Dict[str, Any]] = []
+        self.pnl_display_task: Optional[asyncio.Task] = None
+        self.pnl_display_interval: float = 1.0
+
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/grvt_{ticker}_hedge_mode_log.txt"
@@ -242,15 +248,25 @@ class HedgeBot:
                 order_data["side"] = "SHORT"
                 order_type = "OPEN"
                 self.lighter_position -= Decimal(order_data["filled_base_amount"])
+                lighter_side = "sell"
             else:
                 order_data["side"] = "LONG"
                 order_type = "CLOSE"
                 self.lighter_position += Decimal(order_data["filled_base_amount"])
+                lighter_side = "buy"
             
             client_order_index = order_data["client_order_id"]
 
             self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [FILLED]: "
                              f"{order_data['filled_base_amount']} @ {order_data['avg_filled_price']}")
+
+            # Track trade for PnL calculation
+            self.lighter_trades.append({
+                'side': lighter_side,
+                'size': Decimal(order_data["filled_base_amount"]),
+                'price': order_data["avg_filled_price"],
+                'timestamp': time.time()
+            })
 
             # Log Lighter trade to CSV
             self.log_trade_to_csv(
@@ -988,6 +1004,15 @@ class HedgeBot:
                         self.grvt_position += filled_size
                     else:
                         self.grvt_position -= filled_size
+                    
+                    # Track trade for PnL calculation
+                    self.grvt_trades.append({
+                        'side': side,
+                        'size': filled_size,
+                        'price': Decimal(str(price)),
+                        'timestamp': time.time()
+                    })
+                    
                     self.logger.info(f"[{order_id}] [{order_type}] [GRVT] [{status}]: {filled_size} @ {price}")
                     self.grvt_order_status = status
 
@@ -1032,6 +1057,111 @@ class HedgeBot:
         except Exception as e:
             self.logger.error(f"Could not setup GRVT WebSocket handlers: {e}")
 
+    def _calculate_realized_pnl(self) -> Decimal:
+        """Calculate realized PnL from closed positions."""
+        realized = Decimal('0')
+        
+        # Match GRVT and Lighter trades to calculate realized PnL
+        grvt_queue = [t.copy() for t in self.grvt_trades]
+        lighter_queue = [t.copy() for t in self.lighter_trades]
+        
+        while grvt_queue and lighter_queue:
+            grvt_trade = grvt_queue[0]
+            lighter_trade = lighter_queue[0]
+            
+            # Check if trades are opposite sides (hedged)
+            if (grvt_trade['side'] == 'buy' and lighter_trade['side'] == 'sell') or \
+               (grvt_trade['side'] == 'sell' and lighter_trade['side'] == 'buy'):
+                # Calculate PnL
+                size = min(grvt_trade['size'], lighter_trade['size'])
+                if grvt_trade['side'] == 'buy':
+                    # Bought on GRVT, sold on Lighter
+                    pnl = size * (lighter_trade['price'] - grvt_trade['price'])
+                else:
+                    # Sold on GRVT, bought on Lighter
+                    pnl = size * (grvt_trade['price'] - lighter_trade['price'])
+                
+                realized += pnl
+                
+                # Remove matched size
+                grvt_trade['size'] -= size
+                lighter_trade['size'] -= size
+                
+                if grvt_trade['size'] <= 0:
+                    grvt_queue.pop(0)
+                if lighter_trade['size'] <= 0:
+                    lighter_queue.pop(0)
+            else:
+                break
+        
+        return realized
+
+    async def _calculate_unrealized_pnl(self) -> Tuple[Decimal, Decimal]:
+        """Calculate unrealized PnL for GRVT and Lighter positions."""
+        grvt_unrealized = Decimal('0')
+        lighter_unrealized = Decimal('0')
+        
+        try:
+            # Get current market prices for GRVT
+            if self.grvt_client and self.grvt_contract_id:
+                grvt_best_bid, grvt_best_ask = await self.fetch_grvt_bbo_prices()
+                
+                if self.grvt_position != 0:
+                    grvt_entry_value = Decimal('0')
+                    grvt_entry_size = Decimal('0')
+                    for trade in self.grvt_trades:
+                        if (self.grvt_position > 0 and trade['side'] == 'buy') or \
+                           (self.grvt_position < 0 and trade['side'] == 'sell'):
+                            grvt_entry_value += trade['size'] * trade['price']
+                            grvt_entry_size += trade['size']
+                    
+                    if grvt_entry_size > 0:
+                        grvt_avg_entry = grvt_entry_value / grvt_entry_size
+                        if self.grvt_position > 0:
+                            grvt_unrealized = self.grvt_position * (grvt_best_bid - grvt_avg_entry)
+                        else:
+                            grvt_unrealized = abs(self.grvt_position) * (grvt_avg_entry - grvt_best_ask)
+            
+            # Get current market prices for Lighter
+            if self.lighter_order_book_ready:
+                lighter_best_bid, lighter_best_ask = self.get_lighter_best_levels()
+                
+                if lighter_best_bid and lighter_best_ask and self.lighter_position != 0:
+                    lighter_entry_value = Decimal('0')
+                    lighter_entry_size = Decimal('0')
+                    for trade in self.lighter_trades:
+                        if (self.lighter_position > 0 and trade['side'] == 'buy') or \
+                           (self.lighter_position < 0 and trade['side'] == 'sell'):
+                            lighter_entry_value += trade['size'] * trade['price']
+                            lighter_entry_size += trade['size']
+                    
+                    if lighter_entry_size > 0:
+                        lighter_avg_entry = lighter_entry_value / lighter_entry_size
+                        if self.lighter_position > 0:
+                            lighter_unrealized = self.lighter_position * (lighter_best_bid[0] - lighter_avg_entry)
+                        else:
+                            lighter_unrealized = abs(self.lighter_position) * (lighter_avg_entry - lighter_best_ask[0])
+        except Exception as exc:
+            self.logger.warning(f"Error calculating unrealized PnL: {exc}")
+        
+        return grvt_unrealized, lighter_unrealized
+
+    async def _display_pnl(self) -> None:
+        """Display aggregated cumulative PnL in real-time."""
+        while not self.stop_flag:
+            try:
+                realized = self._calculate_realized_pnl()
+                grvt_unrealized, lighter_unrealized = await self._calculate_unrealized_pnl()
+                total_pnl = realized + grvt_unrealized + lighter_unrealized
+                
+                print(f"\r[PnL] Realized: {realized:.4f} | GRVT Unrealized: {grvt_unrealized:.4f} | "
+                      f"Lighter Unrealized: {lighter_unrealized:.4f} | Total: {total_pnl:.4f} | "
+                      f"GRVT Pos: {self.grvt_position} | Lighter Pos: {self.lighter_position}", end='', flush=True)
+                
+                await asyncio.sleep(self.pnl_display_interval)
+            except Exception as exc:
+                self.logger.warning(f"Error displaying PnL: {exc}")
+                await asyncio.sleep(self.pnl_display_interval)
 
     async def trading_loop(self):
         """Main trading loop implementing the new strategy."""
@@ -1087,6 +1217,9 @@ class HedgeBot:
             return
 
         await asyncio.sleep(5)
+
+        # Start PnL display task
+        self.pnl_display_task = asyncio.create_task(self._display_pnl())
 
         iterations = 0
         while iterations < self.iterations and not self.stop_flag:
@@ -1202,6 +1335,27 @@ class HedgeBot:
                     self.logger.error("❌ Timeout waiting for trade completion")
                     break
 
+        # Stop PnL display task
+        if self.pnl_display_task and not self.pnl_display_task.done():
+            self.pnl_display_task.cancel()
+            try:
+                await self.pnl_display_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Final PnL summary
+        print()  # New line after the PnL display
+        realized = self._calculate_realized_pnl()
+        try:
+            grvt_unrealized, lighter_unrealized = await self._calculate_unrealized_pnl()
+            total_pnl = realized + grvt_unrealized + lighter_unrealized
+            self.logger.info(f"Final PnL Summary - Realized: {realized:.4f}, "
+                           f"GRVT Unrealized: {grvt_unrealized:.4f}, "
+                           f"Lighter Unrealized: {lighter_unrealized:.4f}, "
+                           f"Total: {total_pnl:.4f}")
+        except Exception as exc:
+            self.logger.warning(f"Error calculating final PnL: {exc}")
+
     async def run(self):
         """Run the hedge bot."""
         self.setup_signal_handlers()
@@ -1211,6 +1365,13 @@ class HedgeBot:
         except KeyboardInterrupt:
             self.logger.info("\n🛑 Received interrupt signal...")
         finally:
+            # Stop PnL display task if still running
+            if self.pnl_display_task and not self.pnl_display_task.done():
+                self.pnl_display_task.cancel()
+                try:
+                    await self.pnl_display_task
+                except asyncio.CancelledError:
+                    pass
             self.logger.info("🔄 Cleaning up...")
             self.shutdown()
 

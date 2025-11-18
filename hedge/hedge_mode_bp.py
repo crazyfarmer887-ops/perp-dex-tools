@@ -64,6 +64,12 @@ class HedgeBot:
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
 
+        # PnL tracking
+        self.backpack_trades: List[Dict[str, Any]] = []
+        self.lighter_trades: List[Dict[str, Any]] = []
+        self.pnl_display_task: Optional[asyncio.Task] = None
+        self.pnl_display_interval: float = 1.0
+
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/backpack_{ticker}_hedge_mode_log.txt"
@@ -229,15 +235,25 @@ class HedgeBot:
                 order_data["side"] = "SHORT"
                 order_type = "OPEN"
                 self.lighter_position -= Decimal(order_data["filled_base_amount"])
+                lighter_side = "sell"
             else:
                 order_data["side"] = "LONG"
                 order_type = "CLOSE"
                 self.lighter_position += Decimal(order_data["filled_base_amount"])
+                lighter_side = "buy"
             
             client_order_index = order_data["client_order_id"]
 
             self.logger.info(f"[{client_order_index}] [{order_type}] [Lighter] [FILLED]: "
                              f"{order_data['filled_base_amount']} @ {order_data['avg_filled_price']}")
+
+            # Track trade for PnL calculation
+            self.lighter_trades.append({
+                'side': lighter_side,
+                'size': Decimal(order_data["filled_base_amount"]),
+                'price': order_data["avg_filled_price"],
+                'timestamp': time.time()
+            })
 
             # Log Lighter trade to CSV
             self.log_trade_to_csv(
@@ -1025,6 +1041,15 @@ class HedgeBot:
                         self.backpack_position += filled_size
                     else:
                         self.backpack_position -= filled_size
+                    
+                    # Track trade for PnL calculation
+                    self.backpack_trades.append({
+                        'side': side,
+                        'size': filled_size,
+                        'price': Decimal(str(price)),
+                        'timestamp': time.time()
+                    })
+                    
                     self.logger.info(f"[{order_id}] [{order_type}] [Backpack] [{status}]: {filled_size} @ {price}")
                     self.backpack_order_status = status
 
@@ -1129,6 +1154,112 @@ class HedgeBot:
         except Exception as e:
             self.logger.error(f"Could not setup Backpack depth WebSocket: {e}")
 
+    def _calculate_realized_pnl(self) -> Decimal:
+        """Calculate realized PnL from closed positions."""
+        realized = Decimal('0')
+        
+        # Match Backpack and Lighter trades to calculate realized PnL
+        backpack_queue = [t.copy() for t in self.backpack_trades]
+        lighter_queue = [t.copy() for t in self.lighter_trades]
+        
+        while backpack_queue and lighter_queue:
+            backpack_trade = backpack_queue[0]
+            lighter_trade = lighter_queue[0]
+            
+            # Check if trades are opposite sides (hedged)
+            if (backpack_trade['side'] == 'buy' and lighter_trade['side'] == 'sell') or \
+               (backpack_trade['side'] == 'sell' and lighter_trade['side'] == 'buy'):
+                # Calculate PnL
+                size = min(backpack_trade['size'], lighter_trade['size'])
+                if backpack_trade['side'] == 'buy':
+                    # Bought on Backpack, sold on Lighter
+                    pnl = size * (lighter_trade['price'] - backpack_trade['price'])
+                else:
+                    # Sold on Backpack, bought on Lighter
+                    pnl = size * (backpack_trade['price'] - lighter_trade['price'])
+                
+                realized += pnl
+                
+                # Remove matched size
+                backpack_trade['size'] -= size
+                lighter_trade['size'] -= size
+                
+                if backpack_trade['size'] <= 0:
+                    backpack_queue.pop(0)
+                if lighter_trade['size'] <= 0:
+                    lighter_queue.pop(0)
+            else:
+                break
+        
+        return realized
+
+    async def _calculate_unrealized_pnl(self) -> Tuple[Decimal, Decimal]:
+        """Calculate unrealized PnL for Backpack and Lighter positions."""
+        backpack_unrealized = Decimal('0')
+        lighter_unrealized = Decimal('0')
+        
+        try:
+            # Get current market prices for Backpack
+            if self.backpack_client and self.backpack_contract_id:
+                backpack_best_bid, backpack_best_ask = await self.fetch_backpack_bbo_prices()
+                
+                if self.backpack_position != 0:
+                    backpack_entry_value = Decimal('0')
+                    backpack_entry_size = Decimal('0')
+                    for trade in self.backpack_trades:
+                        if (self.backpack_position > 0 and trade['side'] == 'buy') or \
+                           (self.backpack_position < 0 and trade['side'] == 'sell'):
+                            backpack_entry_value += trade['size'] * trade['price']
+                            backpack_entry_size += trade['size']
+                    
+                    if backpack_entry_size > 0:
+                        backpack_avg_entry = backpack_entry_value / backpack_entry_size
+                        if self.backpack_position > 0:
+                            backpack_unrealized = self.backpack_position * (backpack_best_bid - backpack_avg_entry)
+                        else:
+                            backpack_unrealized = abs(self.backpack_position) * (backpack_avg_entry - backpack_best_ask)
+            
+            # Get current market prices for Lighter
+            if self.lighter_order_book_ready:
+                lighter_best_bid, lighter_best_ask = self.get_lighter_best_levels()
+                
+                if lighter_best_bid and lighter_best_ask and self.lighter_position != 0:
+                    lighter_entry_value = Decimal('0')
+                    lighter_entry_size = Decimal('0')
+                    for trade in self.lighter_trades:
+                        if (self.lighter_position > 0 and trade['side'] == 'buy') or \
+                           (self.lighter_position < 0 and trade['side'] == 'sell'):
+                            lighter_entry_value += trade['size'] * trade['price']
+                            lighter_entry_size += trade['size']
+                    
+                    if lighter_entry_size > 0:
+                        lighter_avg_entry = lighter_entry_value / lighter_entry_size
+                        if self.lighter_position > 0:
+                            lighter_unrealized = self.lighter_position * (lighter_best_bid[0] - lighter_avg_entry)
+                        else:
+                            lighter_unrealized = abs(self.lighter_position) * (lighter_avg_entry - lighter_best_ask[0])
+        except Exception as exc:
+            self.logger.warning(f"Error calculating unrealized PnL: {exc}")
+        
+        return backpack_unrealized, lighter_unrealized
+
+    async def _display_pnl(self) -> None:
+        """Display aggregated cumulative PnL in real-time."""
+        while not self.stop_flag:
+            try:
+                realized = self._calculate_realized_pnl()
+                backpack_unrealized, lighter_unrealized = await self._calculate_unrealized_pnl()
+                total_pnl = realized + backpack_unrealized + lighter_unrealized
+                
+                print(f"\r[PnL] Realized: {realized:.4f} | Backpack Unrealized: {backpack_unrealized:.4f} | "
+                      f"Lighter Unrealized: {lighter_unrealized:.4f} | Total: {total_pnl:.4f} | "
+                      f"Backpack Pos: {self.backpack_position} | Lighter Pos: {self.lighter_position}", end='', flush=True)
+                
+                await asyncio.sleep(self.pnl_display_interval)
+            except Exception as exc:
+                self.logger.warning(f"Error displaying PnL: {exc}")
+                await asyncio.sleep(self.pnl_display_interval)
+
     async def trading_loop(self):
         """Main trading loop implementing the new strategy."""
         self.logger.info(f"🚀 Starting hedge bot for {self.ticker}")
@@ -1198,6 +1329,9 @@ class HedgeBot:
             return
 
         await asyncio.sleep(5)
+
+        # Start PnL display task
+        self.pnl_display_task = asyncio.create_task(self._display_pnl())
 
         iterations = 0
         while iterations < self.iterations and not self.stop_flag:
@@ -1313,6 +1447,27 @@ class HedgeBot:
                     self.logger.error("❌ Timeout waiting for trade completion")
                     break
 
+        # Stop PnL display task
+        if self.pnl_display_task and not self.pnl_display_task.done():
+            self.pnl_display_task.cancel()
+            try:
+                await self.pnl_display_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Final PnL summary
+        print()  # New line after the PnL display
+        realized = self._calculate_realized_pnl()
+        try:
+            backpack_unrealized, lighter_unrealized = await self._calculate_unrealized_pnl()
+            total_pnl = realized + backpack_unrealized + lighter_unrealized
+            self.logger.info(f"Final PnL Summary - Realized: {realized:.4f}, "
+                           f"Backpack Unrealized: {backpack_unrealized:.4f}, "
+                           f"Lighter Unrealized: {lighter_unrealized:.4f}, "
+                           f"Total: {total_pnl:.4f}")
+        except Exception as exc:
+            self.logger.warning(f"Error calculating final PnL: {exc}")
+
     async def run(self):
         """Run the hedge bot."""
         self.setup_signal_handlers()
@@ -1322,6 +1477,13 @@ class HedgeBot:
         except KeyboardInterrupt:
             self.logger.info("\n🛑 Received interrupt signal...")
         finally:
+            # Stop PnL display task if still running
+            if self.pnl_display_task and not self.pnl_display_task.done():
+                self.pnl_display_task.cancel()
+                try:
+                    await self.pnl_display_task
+                except asyncio.CancelledError:
+                    pass
             self.logger.info("🔄 Cleaning up...")
             self.shutdown()
 

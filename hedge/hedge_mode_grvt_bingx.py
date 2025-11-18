@@ -73,6 +73,13 @@ class HedgeBot:
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
 
+        # PnL tracking
+        self.grvt_trades: List[Dict[str, Any]] = []  # List of {side, size, price, timestamp}
+        self.bingx_trades: List[Dict[str, Any]] = []  # List of {side, size, price, timestamp}
+        self.realized_pnl: Decimal = Decimal('0')
+        self.pnl_display_task: Optional[asyncio.Task] = None
+        self.pnl_display_interval: float = 1.0  # Update every second
+
         config_warnings: List[str] = []
 
         def _coerce_decimal(value: Any, default: Decimal, label: str) -> Decimal:
@@ -350,6 +357,14 @@ class HedgeBot:
             else:
                 self.grvt_position -= filled_size
 
+            # Track trade for PnL calculation
+            self.grvt_trades.append({
+                'side': side,
+                'size': filled_size,
+                'price': price,
+                'timestamp': time.time()
+            })
+
             self.last_grvt_fill = {
                 'order_id': order_id,
                 'side': side,
@@ -543,6 +558,28 @@ class HedgeBot:
             self.bingx_position += total_executed
         else:
             self.bingx_position -= total_executed
+
+        # Track trade for PnL calculation (use average price if multiple orders)
+        avg_price = entry_price if entry_price else Decimal('0')
+        if executed_orders:
+            total_value = Decimal('0')
+            total_size = Decimal('0')
+            for order_type, order_result in executed_orders:
+                filled_size = self._extract_filled_size(order_result)
+                if filled_size is None or filled_size <= 0:
+                    filled_size = order_result.size or Decimal('0')
+                if filled_size > 0:
+                    total_value += filled_size * order_result.price
+                    total_size += filled_size
+            if total_size > 0:
+                avg_price = total_value / total_size
+
+        self.bingx_trades.append({
+            'side': hedge_side,
+            'size': total_executed,
+            'price': avg_price,
+            'timestamp': time.time()
+        })
 
         self.logger.info(
             "[BINGX] Hedge complete | side=%s | executed=%s | position=%s",
@@ -1262,6 +1299,120 @@ class HedgeBot:
         return False
 
     # ------------------------------------------------------------------ #
+    # PnL calculation and display
+    # ------------------------------------------------------------------ #
+
+    def _calculate_realized_pnl(self) -> Decimal:
+        """Calculate realized PnL from closed positions."""
+        realized = Decimal('0')
+        
+        # Match GRVT and BingX trades to calculate realized PnL
+        # Simple FIFO matching
+        grvt_queue = self.grvt_trades.copy()
+        bingx_queue = self.bingx_trades.copy()
+        
+        while grvt_queue and bingx_queue:
+            grvt_trade = grvt_queue[0]
+            bingx_trade = bingx_queue[0]
+            
+            # Check if trades are opposite sides (hedged)
+            if (grvt_trade['side'] == 'buy' and bingx_trade['side'] == 'sell') or \
+               (grvt_trade['side'] == 'sell' and bingx_trade['side'] == 'buy'):
+                # Calculate PnL
+                size = min(grvt_trade['size'], bingx_trade['size'])
+                if grvt_trade['side'] == 'buy':
+                    # Bought on GRVT, sold on BingX
+                    pnl = size * (bingx_trade['price'] - grvt_trade['price'])
+                else:
+                    # Sold on GRVT, bought on BingX
+                    pnl = size * (grvt_trade['price'] - bingx_trade['price'])
+                
+                realized += pnl
+                
+                # Remove matched size
+                grvt_trade['size'] -= size
+                bingx_trade['size'] -= size
+                
+                if grvt_trade['size'] <= 0:
+                    grvt_queue.pop(0)
+                if bingx_trade['size'] <= 0:
+                    bingx_queue.pop(0)
+            else:
+                # Not hedged, can't calculate realized PnL yet
+                break
+        
+        return realized
+
+    async def _calculate_unrealized_pnl(self) -> Tuple[Decimal, Decimal]:
+        """Calculate unrealized PnL for GRVT and BingX positions."""
+        grvt_unrealized = Decimal('0')
+        bingx_unrealized = Decimal('0')
+        
+        try:
+            # Get current market prices
+            if self.grvt_client and self.grvt_contract_id:
+                grvt_best_bid, grvt_best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+                
+                # Calculate average entry price for GRVT position
+                if self.grvt_position != 0:
+                    grvt_entry_value = Decimal('0')
+                    grvt_entry_size = Decimal('0')
+                    for trade in self.grvt_trades:
+                        if (self.grvt_position > 0 and trade['side'] == 'buy') or \
+                           (self.grvt_position < 0 and trade['side'] == 'sell'):
+                            grvt_entry_value += trade['size'] * trade['price']
+                            grvt_entry_size += trade['size']
+                    
+                    if grvt_entry_size > 0:
+                        grvt_avg_entry = grvt_entry_value / grvt_entry_size
+                        if self.grvt_position > 0:
+                            grvt_unrealized = self.grvt_position * (grvt_best_bid - grvt_avg_entry)
+                        else:
+                            grvt_unrealized = abs(self.grvt_position) * (grvt_avg_entry - grvt_best_ask)
+            
+            if self.bingx_client and self.bingx_contract_id:
+                bingx_best_bid, bingx_best_ask = await self.bingx_client.fetch_bbo_prices(self.bingx_contract_id)
+                
+                # Calculate average entry price for BingX position
+                if self.bingx_position != 0:
+                    bingx_entry_value = Decimal('0')
+                    bingx_entry_size = Decimal('0')
+                    for trade in self.bingx_trades:
+                        if (self.bingx_position > 0 and trade['side'] == 'buy') or \
+                           (self.bingx_position < 0 and trade['side'] == 'sell'):
+                            bingx_entry_value += trade['size'] * trade['price']
+                            bingx_entry_size += trade['size']
+                    
+                    if bingx_entry_size > 0:
+                        bingx_avg_entry = bingx_entry_value / bingx_entry_size
+                        if self.bingx_position > 0:
+                            bingx_unrealized = self.bingx_position * (bingx_best_bid - bingx_avg_entry)
+                        else:
+                            bingx_unrealized = abs(self.bingx_position) * (bingx_avg_entry - bingx_best_ask)
+        except Exception as exc:
+            self.logger.warning(f"Error calculating unrealized PnL: {exc}")
+        
+        return grvt_unrealized, bingx_unrealized
+
+    async def _display_pnl(self) -> None:
+        """Display aggregated cumulative PnL in real-time."""
+        while not self.stop_flag:
+            try:
+                realized = self._calculate_realized_pnl()
+                grvt_unrealized, bingx_unrealized = await self._calculate_unrealized_pnl()
+                total_pnl = realized + grvt_unrealized + bingx_unrealized
+                
+                # Clear line and display PnL
+                print(f"\r[PnL] Realized: {realized:.4f} | GRVT Unrealized: {grvt_unrealized:.4f} | "
+                      f"BingX Unrealized: {bingx_unrealized:.4f} | Total: {total_pnl:.4f} | "
+                      f"GRVT Pos: {self.grvt_position} | BingX Pos: {self.bingx_position}", end='', flush=True)
+                
+                await asyncio.sleep(self.pnl_display_interval)
+            except Exception as exc:
+                self.logger.warning(f"Error displaying PnL: {exc}")
+                await asyncio.sleep(self.pnl_display_interval)
+
+    # ------------------------------------------------------------------ #
     # Main run loop
     # ------------------------------------------------------------------ #
 
@@ -1279,6 +1430,9 @@ class HedgeBot:
             return
 
         await asyncio.sleep(2)
+
+        # Start PnL display task
+        self.pnl_display_task = asyncio.create_task(self._display_pnl())
 
         iteration = 0
         while not self.stop_flag and iteration < self.iterations:
@@ -1312,6 +1466,27 @@ class HedgeBot:
                 break
 
         self.logger.info("Trading loop finished")
+        
+        # Stop PnL display task
+        if self.pnl_display_task and not self.pnl_display_task.done():
+            self.pnl_display_task.cancel()
+            try:
+                await self.pnl_display_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Final PnL summary
+        print()  # New line after the PnL display
+        realized = self._calculate_realized_pnl()
+        try:
+            grvt_unrealized, bingx_unrealized = await self._calculate_unrealized_pnl()
+            total_pnl = realized + grvt_unrealized + bingx_unrealized
+            self.logger.info(f"Final PnL Summary - Realized: {realized:.4f}, "
+                           f"GRVT Unrealized: {grvt_unrealized:.4f}, "
+                           f"BingX Unrealized: {bingx_unrealized:.4f}, "
+                           f"Total: {total_pnl:.4f}")
+        except Exception as exc:
+            self.logger.warning(f"Error calculating final PnL: {exc}")
 
     async def cleanup(self) -> None:
         if self.grvt_client:
@@ -1335,6 +1510,13 @@ class HedgeBot:
         except Exception as exc:
             self.logger.error(f"Unexpected error: {exc}")
         finally:
+            # Stop PnL display task if still running
+            if self.pnl_display_task and not self.pnl_display_task.done():
+                self.pnl_display_task.cancel()
+                try:
+                    await self.pnl_display_task
+                except asyncio.CancelledError:
+                    pass
             await self.cleanup()
             elapsed = time.time() - start_time
             self.logger.info(f"Hedge bot stopped after {elapsed:.1f}s")
