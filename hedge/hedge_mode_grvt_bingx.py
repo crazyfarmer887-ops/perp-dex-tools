@@ -11,6 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exchanges.grvt import GrvtClient
 from exchanges.bingx import BingxClient
+from helpers.pnl_tracker import HedgePnLAggregator
 
 
 class Config:
@@ -72,6 +73,7 @@ class HedgeBot:
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
+        self.pnl_tracker = HedgePnLAggregator('GRVT', 'BingX')
 
         config_warnings: List[str] = []
 
@@ -279,6 +281,69 @@ class HedgeBot:
         )
 
     # ------------------------------------------------------------------ #
+    # PnL tracking helpers
+    # ------------------------------------------------------------------ #
+
+    def _format_decimal(self, value: Decimal, places: int = 6) -> str:
+        try:
+            return format(value, f'.{places}f')
+        except Exception:
+            return str(value)
+
+    def _log_pnl_update(
+        self,
+        side: str,
+        size: Decimal,
+        price: Decimal,
+        context: str,
+        update
+    ) -> None:
+        if not update:
+            return
+
+        per_exchange = update.per_exchange
+        grvt_total = per_exchange.get('GRVT', Decimal('0'))
+        bingx_total = per_exchange.get('BingX', Decimal('0'))
+        net_total = update.net
+        position_info = ""
+        if update.position != 0:
+            position_info = (
+                f" | {update.exchange} pos={self._format_decimal(update.position)}"
+                f" @ {self._format_decimal(update.avg_entry_price, 4)}"
+            )
+
+        self.logger.info(
+            "💰 PnL Update [%s] Δ=%s | GRVT=%s | BingX=%s | Net=%s (last %s %s @ %s)%s",
+            context,
+            self._format_decimal(update.delta),
+            self._format_decimal(grvt_total),
+            self._format_decimal(bingx_total),
+            self._format_decimal(net_total),
+            side.upper(),
+            self._format_decimal(size),
+            self._format_decimal(price, 2),
+            position_info
+        )
+
+    def _handle_pnl_update(self, exchange: str, fill: Dict[str, Any], context: str) -> None:
+        if not fill:
+            return
+        side = str(fill.get('side', '')).lower()
+        size_raw = fill.get('size')
+        price_raw = fill.get('price')
+        try:
+            size = Decimal(str(size_raw))
+            price = Decimal(str(price_raw))
+        except (InvalidOperation, ValueError, TypeError):
+            return
+        if size <= 0 or price <= 0:
+            return
+        update = self.pnl_tracker.record_fill(exchange, side, size, price)
+        if update is None:
+            return
+        self._log_pnl_update(side, size, price, context, update)
+
+    # ------------------------------------------------------------------ #
     # Initialization helpers
     # ------------------------------------------------------------------ #
 
@@ -432,6 +497,7 @@ class HedgeBot:
                 'price': order_result.price
             }
             self.grvt_fill_event.set()
+            self._handle_pnl_update('GRVT', self.last_grvt_fill, context='GRVT fill')
             return self.last_grvt_fill
 
         try:
@@ -443,6 +509,8 @@ class HedgeBot:
                 self.logger.error(f"[GRVT] Failed to cancel order {order_result.order_id}: {cancel_result.error_message}")
             return None
 
+        if self.last_grvt_fill:
+            self._handle_pnl_update('GRVT', self.last_grvt_fill, context='GRVT fill')
         return self.last_grvt_fill
 
     async def place_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
@@ -538,6 +606,14 @@ class HedgeBot:
                 order_result.price,
                 order_result.status,
             )
+            if filled_size > 0 and order_result.price:
+                hedge_fill = {
+                    'side': hedge_side,
+                    'size': filled_size,
+                    'price': order_result.price
+                }
+                context = f"BingX hedge ({order_type})"
+                self._handle_pnl_update('BingX', hedge_fill, context=context)
 
         if hedge_side == 'buy':
             self.bingx_position += total_executed
