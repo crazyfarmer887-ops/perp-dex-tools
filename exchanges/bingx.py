@@ -334,21 +334,36 @@ class BingxClient(BaseExchangeClient):
         tp_sl_order_type: str = 'market'
     ) -> OrderResult:
         extra_params: Dict[str, Any] = {}
-        tp_sl_mode = 'limit' if (tp_sl_order_type or '').strip().lower() == 'limit' else 'market'
+          normalized_tp_sl = (tp_sl_order_type or '').strip().lower()
+          tp_sl_mode = 'limit' if normalized_tp_sl == 'limit' else 'market'
 
-        if take_profit_price is not None:
+        if take_profit_price is not None and tp_sl_mode == 'limit':
             extra_params['takeProfit'] = self._build_tp_sl_payload(
                 'take_profit',
                 quantity,
                 take_profit_price,
-                tp_sl_mode
+                'limit'
             )
-        if stop_loss_price is not None:
+        elif take_profit_price is not None:
+            extra_params['takeProfit'] = self._build_tp_sl_payload(
+                'take_profit',
+                quantity,
+                take_profit_price,
+                'market'
+            )
+        if stop_loss_price is not None and tp_sl_mode == 'limit':
             extra_params['stopLoss'] = self._build_tp_sl_payload(
                 'stop_loss',
                 quantity,
                 stop_loss_price,
-                tp_sl_mode
+                'limit'
+            )
+        elif stop_loss_price is not None:
+            extra_params['stopLoss'] = self._build_tp_sl_payload(
+                'stop_loss',
+                quantity,
+                stop_loss_price,
+                'market'
             )
 
         return await self._create_limit_order(
@@ -376,19 +391,33 @@ class BingxClient(BaseExchangeClient):
         params: Dict[str, Any] = {'reduceOnly': side.lower() == self.config.close_order_side}
         tp_sl_mode = 'limit' if (tp_sl_order_type or '').strip().lower() == 'limit' else 'market'
 
-        if take_profit_price is not None:
+        if take_profit_price is not None and tp_sl_mode == 'limit':
             params['takeProfit'] = self._build_tp_sl_payload(
                 'take_profit',
                 quantity,
                 take_profit_price,
-                tp_sl_mode
+                'limit'
             )
-        if stop_loss_price is not None:
+        elif take_profit_price is not None:
+            params['takeProfit'] = self._build_tp_sl_payload(
+                'take_profit',
+                quantity,
+                take_profit_price,
+                'market'
+            )
+        if stop_loss_price is not None and tp_sl_mode == 'limit':
             params['stopLoss'] = self._build_tp_sl_payload(
                 'stop_loss',
                 quantity,
                 stop_loss_price,
-                tp_sl_mode
+                'limit'
+            )
+        elif stop_loss_price is not None:
+            params['stopLoss'] = self._build_tp_sl_payload(
+                'stop_loss',
+                quantity,
+                stop_loss_price,
+                'market'
             )
 
         try:
