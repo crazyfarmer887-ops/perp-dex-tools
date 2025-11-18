@@ -334,8 +334,8 @@ class BingxClient(BaseExchangeClient):
         tp_sl_order_type: str = 'market'
     ) -> OrderResult:
         extra_params: Dict[str, Any] = {}
-          normalized_tp_sl = (tp_sl_order_type or '').strip().lower()
-          tp_sl_mode = 'limit' if normalized_tp_sl == 'limit' else 'market'
+        normalized_tp_sl = (tp_sl_order_type or '').strip().lower()
+        tp_sl_mode = 'limit' if normalized_tp_sl == 'limit' else 'market'
 
         if take_profit_price is not None and tp_sl_mode == 'limit':
             extra_params['takeProfit'] = self._build_tp_sl_payload(

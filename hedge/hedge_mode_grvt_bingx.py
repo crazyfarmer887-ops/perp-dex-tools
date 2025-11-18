@@ -80,6 +80,7 @@ class HedgeBot:
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
         self.parallel_bingx_order: Optional[Dict[str, Any]] = None
+        self.grvt_exit_order_ids: Dict[str, Optional[str]] = {'tp': None, 'sl': None}
 
         config_warnings: List[str] = []
 
@@ -1430,9 +1431,99 @@ class HedgeBot:
             self.logger.error("[BINGX] ROI %s hedge failed; manual intervention required.", trigger)
             return False
 
+        await self._cancel_grvt_exit_orders(f"ROI {trigger}")
         self._reset_entry_state()
         self.logger.info("✅ ROI %s execution complete; positions hedged.", trigger)
         return True
+
+    async def _cancel_grvt_exit_orders(self, reason: str = "") -> None:
+        if not any(self.grvt_exit_order_ids.values()):
+            return
+        if self.grvt_client is None:
+            self.grvt_exit_order_ids = {'tp': None, 'sl': None}
+            return
+        for label, order_id in list(self.grvt_exit_order_ids.items()):
+            if not order_id:
+                continue
+            try:
+                await self.grvt_client.cancel_order(order_id)
+                self.logger.info(
+                    "[GRVT] Cancelled %s exit order %s (%s).",
+                    label.upper(),
+                    order_id,
+                    reason or 'cleanup'
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "[GRVT] Failed to cancel %s exit order %s: %s",
+                    label.upper(),
+                    order_id,
+                    exc
+                )
+        self.grvt_exit_order_ids = {'tp': None, 'sl': None}
+
+    async def _submit_grvt_exit_order(
+        self,
+        label: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal
+    ) -> None:
+        if price <= 0 or quantity <= 0:
+            return
+        if self.grvt_client is None or self.grvt_contract_id is None:
+            return
+        try:
+            result = await self.grvt_client.place_open_order(
+                contract_id=self.grvt_contract_id,
+                quantity=quantity,
+                direction=side,
+                price=price
+            )
+        except Exception as exc:
+            self.logger.warning("[GRVT] Failed to submit %s exit order: %s", label.upper(), exc)
+            return
+
+        if not result.success or not result.order_id:
+            self.logger.warning(
+                "[GRVT] %s exit order rejected: %s",
+                label.upper(),
+                getattr(result, 'error_message', 'unknown error')
+            )
+            return
+
+        self.grvt_exit_order_ids[label] = result.order_id
+        self.logger.info(
+            "[GRVT] %s exit order submitted | side=%s | qty=%s | price=%s | id=%s",
+            label.upper(),
+            side.upper(),
+            quantity,
+            price,
+            result.order_id
+        )
+
+    async def _refresh_grvt_exit_orders(self) -> None:
+        await self._cancel_grvt_exit_orders("refresh")
+
+        if (
+            self.current_entry_side is None
+            or self.current_entry_size is None
+            or self.current_entry_size <= 0
+            or self.grvt_client is None
+        ):
+            return
+
+        exit_side = 'sell' if self.current_entry_side == 'buy' else 'buy'
+        quantity = self.current_entry_size
+
+        if self.current_take_profit_price and self.current_take_profit_price > 0:
+            await self._submit_grvt_exit_order('tp', exit_side, quantity, self.current_take_profit_price)
+        if self.current_stop_loss_price and self.current_stop_loss_price > 0:
+            await self._submit_grvt_exit_order('sl', exit_side, quantity, self.current_stop_loss_price)
+
+    async def _clear_entry_state(self, reason: str = "") -> None:
+        await self._cancel_grvt_exit_orders(reason or "reset")
+        self._reset_entry_state()
 
     def _per_exchange_positions_flat(
         self,
@@ -1454,6 +1545,7 @@ class HedgeBot:
         grvt_position, bingx_position = await self._sync_positions_from_exchanges()
         net_exposure = grvt_position + bingx_position
         if abs(net_exposure) <= self.position_tolerance:
+            await self._cancel_grvt_exit_orders("positions balanced")
             return True
 
         self.logger.warning(
@@ -1855,7 +1947,7 @@ class HedgeBot:
 
         if not fill or self.stop_flag:
             await self._cancel_parallel_bingx_order("GRVT order failed or bot stopping.")
-            self._reset_entry_state()
+            await self._clear_entry_state("GRVT order failure")
             return False
 
         if (
@@ -1866,18 +1958,19 @@ class HedgeBot:
             self.pending_grvt_price = None
 
         self._register_entry(fill, previous_position)
+        await self._refresh_grvt_exit_orders()
         hedge_success = await self._ensure_bingx_hedge(fill)
         if not hedge_success:
             self.logger.error(
                 "Unable to complete BingX hedge for GRVT %s fill; halting cycle to avoid exposure.",
                 trade_side.upper()
             )
-            self._reset_entry_state()
+            await self._clear_entry_state("hedge failure")
             return False
 
         balanced = await self._enforce_balanced_positions("post-cycle hedging")
         if not balanced:
-            self._reset_entry_state()
+            await self._clear_entry_state("hedge imbalance")
             return False
 
         if self.sleep_time > 0 and not self.stop_flag:
