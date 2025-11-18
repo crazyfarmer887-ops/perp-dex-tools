@@ -3,6 +3,7 @@ import os
 import signal
 import sys
 import time
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 import logging
@@ -20,6 +21,86 @@ class Config:
         for key, value in config_dict.items():
             setattr(self, key, value)
 
+
+@dataclass
+class HedgeExecutionSummary:
+    side: str
+    total_size: Decimal
+    average_price: Optional[Decimal]
+    legs: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class AggregatedPnlTracker:
+    """Track and log aggregated PnL between GRVT and BingX legs."""
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.cumulative_pnl = Decimal('0')
+        self.total_size = Decimal('0')
+        self.trade_count = 0
+
+    def record_trade(
+        self,
+        grvt_side: str,
+        grvt_price: Optional[Decimal],
+        grvt_size: Optional[Decimal],
+        hedge_side: str,
+        hedge_price: Optional[Decimal],
+        hedge_size: Optional[Decimal],
+    ) -> None:
+        if grvt_price is None or hedge_price is None:
+            self.logger.debug("Skipping PnL calculation due to missing prices (GRVT=%s, BingX=%s).", grvt_price, hedge_price)
+            return
+        if grvt_size is None or hedge_size is None:
+            self.logger.debug("Skipping PnL calculation due to missing sizes (GRVT=%s, BingX=%s).", grvt_size, hedge_size)
+            return
+        if grvt_size <= 0 or hedge_size <= 0:
+            self.logger.debug("Skipping PnL calculation due to non-positive trade size (GRVT=%s, BingX=%s).", grvt_size, hedge_size)
+            return
+
+        normalized_side = grvt_side.strip().lower()
+        if normalized_side not in {'buy', 'sell'}:
+            self.logger.debug("Skipping PnL calculation due to unknown GRVT side '%s'.", grvt_side)
+            return
+
+        trade_size = min(grvt_size, hedge_size)
+        if trade_size <= 0:
+            return
+
+        direction = Decimal('1') if normalized_side == 'buy' else Decimal('-1')
+        spread = hedge_price - grvt_price
+        net_pnl = spread * trade_size * direction
+
+        self.cumulative_pnl += net_pnl
+        self.total_size += trade_size
+        self.trade_count += 1
+
+        readable_size = self._format_decimal(trade_size, digits=6)
+        readable_grvt_price = self._format_decimal(grvt_price)
+        readable_bingx_price = self._format_decimal(hedge_price)
+        readable_spread = self._format_decimal(spread * direction, digits=6, signed=True)
+
+        self.logger.info(
+            "📈 Hedge PnL #%s | last=%+0.4f USDT | cum=%+0.4f USDT | size=%s | spread=%s | GRVT %s @ %s ↔ BingX %s @ %s",
+            self.trade_count,
+            net_pnl,
+            self.cumulative_pnl,
+            readable_size,
+            readable_spread,
+            normalized_side.upper(),
+            readable_grvt_price,
+            hedge_side.upper(),
+            readable_bingx_price,
+        )
+
+    @staticmethod
+    def _format_decimal(value: Decimal, digits: int = 4, signed: bool = False) -> str:
+        try:
+            sign_flag = '+' if signed else ''
+            fmt = f"{{:{sign_flag}.{digits}f}}"
+            return fmt.format(value)
+        except Exception:
+            return str(value)
 
 class HedgeBot:
     """
@@ -72,6 +153,7 @@ class HedgeBot:
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
+        self.pnl_tracker: Optional[AggregatedPnlTracker] = None
 
         config_warnings: List[str] = []
 
@@ -260,6 +342,8 @@ class HedgeBot:
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
 
+        self.pnl_tracker = AggregatedPnlTracker(self.logger)
+
         for message in config_warnings:
             self.logger.warning(message)
 
@@ -445,7 +529,7 @@ class HedgeBot:
 
         return self.last_grvt_fill
 
-    async def place_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
+    async def place_bingx_hedge(self, fill: Dict[str, Any]) -> Optional[HedgeExecutionSummary]:
         assert self.bingx_client is not None
         assert self.bingx_contract_id is not None
 
@@ -524,7 +608,7 @@ class HedgeBot:
 
         if total_executed <= 0:
             self.logger.error("[BINGX] Failed to execute hedge order for %s %s.", hedge_side, size)
-            return False
+            return None
 
         for order_type, order_result in executed_orders:
             filled_size = self._extract_filled_size(order_result)
@@ -550,16 +634,58 @@ class HedgeBot:
             total_executed,
             self.bingx_position
         )
-        return True
+        return self._build_hedge_summary(hedge_side, executed_orders, total_executed)
 
-    async def _ensure_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
+    def _build_hedge_summary(
+        self,
+        hedge_side: str,
+        executed_orders: List[Tuple[str, Any]],
+        total_executed: Decimal
+    ) -> HedgeExecutionSummary:
+        legs: List[Dict[str, Any]] = []
+        total_quote = Decimal('0')
+        total_size_for_avg = Decimal('0')
+
+        for order_type, order_result in executed_orders:
+            filled_size = self._extract_filled_size(order_result)
+            price_value = getattr(order_result, 'price', None)
+            price_decimal: Optional[Decimal] = None
+            if price_value is not None:
+                try:
+                    price_decimal = Decimal(str(price_value))
+                except (InvalidOperation, ValueError, TypeError):
+                    price_decimal = None
+
+            legs.append({
+                'type': order_type,
+                'status': getattr(order_result, 'status', 'UNKNOWN'),
+                'size': filled_size,
+                'price': price_decimal
+            })
+
+            if filled_size is not None and filled_size > 0 and price_decimal is not None:
+                total_quote += price_decimal * filled_size
+                total_size_for_avg += filled_size
+
+        average_price = None
+        if total_size_for_avg > 0:
+            average_price = total_quote / total_size_for_avg
+
+        return HedgeExecutionSummary(
+            side=hedge_side,
+            total_size=total_executed,
+            average_price=average_price,
+            legs=legs
+        )
+
+    async def _ensure_bingx_hedge(self, fill: Dict[str, Any]) -> Optional[HedgeExecutionSummary]:
         attempts = 0
         while not self.stop_flag:
             attempts += 1
 
-            hedge_success = await self.place_bingx_hedge(fill)
-            if hedge_success:
-                return True
+            hedge_summary = await self.place_bingx_hedge(fill)
+            if hedge_summary is not None:
+                return hedge_summary
 
             self.logger.warning(
                 "[BINGX] Hedge attempt %s failed for %s %s. GRVT position=%s | BingX position=%s",
@@ -576,11 +702,11 @@ class HedgeBot:
                     self.max_hedge_retries
                 )
                 self.stop_flag = True
-                return False
+                return None
 
             await asyncio.sleep(self.hedge_retry_delay)
 
-        return False
+        return None
 
     async def _place_bingx_market_hedge(
         self,
@@ -805,6 +931,41 @@ class HedgeBot:
             self._update_roi_targets(side, self.current_entry_price)
         else:
             self.logger.warning("⚠️ ROI targets disabled due to missing entry price for %s position.", side.upper())
+
+    def _record_aggregated_pnl(self, fill: Dict[str, Any], hedge_summary: HedgeExecutionSummary) -> None:
+        if self.pnl_tracker is None or hedge_summary is None:
+            return
+
+        try:
+            grvt_price = Decimal(str(fill.get('price')))
+            grvt_size = Decimal(str(fill.get('size')))
+        except (InvalidOperation, ValueError, TypeError):
+            self.logger.debug("Skipping aggregated PnL update due to invalid GRVT fill payload: %s", fill)
+            return
+
+        if grvt_price <= 0 or grvt_size <= 0:
+            self.logger.debug(
+                "Skipping aggregated PnL update due to non-positive GRVT fill metrics (price=%s, size=%s).",
+                grvt_price,
+                grvt_size
+            )
+            return
+
+        grvt_side = str(fill.get('side', '')).lower()
+        if hedge_summary.average_price is None:
+            self.logger.debug(
+                "Hedge summary missing average price for %s leg; aggregated PnL may be incomplete.",
+                hedge_summary.side.upper()
+            )
+
+        self.pnl_tracker.record_trade(
+            grvt_side=grvt_side,
+            grvt_price=grvt_price,
+            grvt_size=grvt_size,
+            hedge_side=hedge_summary.side,
+            hedge_price=hedge_summary.average_price,
+            hedge_size=hedge_summary.total_size
+        )
 
     def _update_roi_targets(self, side: str, entry_price: Decimal) -> None:
         self.current_take_profit_price = None
@@ -1218,14 +1379,15 @@ class HedgeBot:
             self.pending_grvt_price = None
 
         self._register_entry(fill, previous_position)
-        hedge_success = await self._ensure_bingx_hedge(fill)
-        if not hedge_success:
+        hedge_summary = await self._ensure_bingx_hedge(fill)
+        if not hedge_summary:
             self.logger.error(
                 "Unable to complete BingX hedge for GRVT %s fill; halting cycle to avoid exposure.",
                 trade_side.upper()
             )
             self._reset_entry_state()
             return False
+        self._record_aggregated_pnl(fill, hedge_summary)
 
         if self.sleep_time > 0 and not self.stop_flag:
             await asyncio.sleep(self.sleep_time)
