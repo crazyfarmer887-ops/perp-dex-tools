@@ -73,6 +73,13 @@ class HedgeBot:
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
 
+        # PnL tracking
+        self.grvt_avg_entry_price: Decimal = Decimal('0')
+        self.bingx_avg_entry_price: Decimal = Decimal('0')
+        self.realized_pnl: Decimal = Decimal('0')
+        self.pnl_display_task: Optional[asyncio.Task] = None
+        self.last_pnl_display: str = ""
+
         config_warnings: List[str] = []
 
         def _coerce_decimal(value: Any, default: Decimal, label: str) -> Decimal:
@@ -345,10 +352,14 @@ class HedgeBot:
         order_id = message.get('order_id')
 
         if status == 'FILLED':
+            previous_position = self.grvt_position
             if side == 'buy':
                 self.grvt_position += filled_size
             else:
                 self.grvt_position -= filled_size
+
+            # Update average entry price
+            self._update_avg_entry_price('grvt', side, filled_size, price, previous_position)
 
             self.last_grvt_fill = {
                 'order_id': order_id,
@@ -421,10 +432,13 @@ class HedgeBot:
 
         if order_result.status == 'FILLED':
             if order_result.size is not None:
+                previous_position = self.grvt_position
                 if side == 'buy':
                     self.grvt_position += order_result.size
                 else:
                     self.grvt_position -= order_result.size
+                # Update average entry price
+                self._update_avg_entry_price('grvt', side, order_result.size, order_result.price, previous_position)
             self.last_grvt_fill = {
                 'order_id': order_result.order_id,
                 'side': side,
@@ -539,10 +553,25 @@ class HedgeBot:
                 order_result.status,
             )
 
+        previous_position = self.bingx_position
         if hedge_side == 'buy':
             self.bingx_position += total_executed
         else:
             self.bingx_position -= total_executed
+
+        # Calculate average entry price for BingX hedge
+        # Use the average price from executed orders
+        avg_price = Decimal('0')
+        total_value = Decimal('0')
+        for order_type, order_result in executed_orders:
+            filled_size = self._extract_filled_size(order_result)
+            if filled_size is None or filled_size <= 0:
+                filled_size = order_result.size or Decimal('0')
+            if filled_size > 0:
+                total_value += filled_size * order_result.price
+        if total_executed > 0:
+            avg_price = total_value / total_executed
+            self._update_avg_entry_price('bingx', hedge_side, total_executed, avg_price, previous_position)
 
         self.logger.info(
             "[BINGX] Hedge complete | side=%s | executed=%s | position=%s",
@@ -760,6 +789,93 @@ class HedgeBot:
         self.current_stop_loss_price = None
         self.last_roi_reason = None
         self.pending_grvt_price = None
+
+    def _update_avg_entry_price(
+        self,
+        exchange: str,
+        side: str,
+        size: Decimal,
+        price: Decimal,
+        previous_position: Decimal
+    ) -> None:
+        """Update average entry price for a position."""
+        if exchange == 'grvt':
+            current_position = self.grvt_position
+            avg_entry = self.grvt_avg_entry_price
+        elif exchange == 'bingx':
+            current_position = self.bingx_position
+            avg_entry = self.bingx_avg_entry_price
+        else:
+            return
+
+        # Calculate realized PnL if position is being closed or reversed
+        if abs(previous_position) > self.position_tolerance and avg_entry > 0:
+            if (previous_position > 0 and current_position <= 0) or (previous_position < 0 and current_position >= 0):
+                # Position reversed or fully closed - calculate realized PnL for entire previous position
+                closed_size = abs(previous_position)
+                if previous_position > 0:
+                    # Was long, now flat or short
+                    if side == 'sell':
+                        # Closing long position
+                        realized = (price - avg_entry) * closed_size
+                        self.realized_pnl += realized
+                elif previous_position < 0:
+                    # Was short, now flat or long
+                    if side == 'buy':
+                        # Closing short position
+                        realized = (avg_entry - price) * closed_size
+                        self.realized_pnl += realized
+            elif (previous_position > 0 and side == 'sell' and current_position > 0) or \
+                 (previous_position < 0 and side == 'buy' and current_position < 0):
+                # Partial close - calculate realized PnL for closed portion
+                closed_size = size  # The size being closed
+                if previous_position > 0:
+                    # Partial close of long position
+                    realized = (price - avg_entry) * closed_size
+                    self.realized_pnl += realized
+                elif previous_position < 0:
+                    # Partial close of short position
+                    realized = (avg_entry - price) * closed_size
+                    self.realized_pnl += realized
+
+        # Update average entry price
+        if abs(current_position) <= self.position_tolerance:
+            # Position is flat
+            if exchange == 'grvt':
+                self.grvt_avg_entry_price = Decimal('0')
+            else:
+                self.bingx_avg_entry_price = Decimal('0')
+        else:
+            # Calculate weighted average entry price
+            if abs(previous_position) <= self.position_tolerance:
+                # New position
+                if exchange == 'grvt':
+                    self.grvt_avg_entry_price = price
+                else:
+                    self.bingx_avg_entry_price = price
+            else:
+                # Existing position - update weighted average
+                if (previous_position > 0 and side == 'buy') or (previous_position < 0 and side == 'sell'):
+                    # Increasing position
+                    total_value = abs(previous_position) * avg_entry + size * price
+                    total_size = abs(previous_position) + size
+                    if total_size > 0:
+                        new_avg = total_value / total_size
+                        if exchange == 'grvt':
+                            self.grvt_avg_entry_price = new_avg
+                        else:
+                            self.bingx_avg_entry_price = new_avg
+                elif (previous_position > 0 and side == 'sell' and current_position > 0) or \
+                     (previous_position < 0 and side == 'buy' and current_position < 0):
+                    # Partial close - average entry price stays the same
+                    pass
+                elif (previous_position > 0 and side == 'sell' and current_position <= 0) or \
+                     (previous_position < 0 and side == 'buy' and current_position >= 0):
+                    # Position reversed - new position with new entry price
+                    if exchange == 'grvt':
+                        self.grvt_avg_entry_price = price
+                    else:
+                        self.bingx_avg_entry_price = price
 
     def _register_entry(self, fill: Dict[str, Any], previous_position: Decimal) -> None:
         tolerance = self.position_tolerance
@@ -1265,6 +1381,67 @@ class HedgeBot:
     # Main run loop
     # ------------------------------------------------------------------ #
 
+    async def _display_pnl(self) -> None:
+        """Periodically display aggregated cumulative PnL."""
+        while not self.stop_flag:
+            try:
+                # Get current market prices
+                grvt_price = None
+                bingx_price = None
+                
+                if self.grvt_client and self.grvt_contract_id:
+                    try:
+                        best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+                        grvt_price = (best_bid + best_ask) / Decimal('2') if best_bid > 0 and best_ask > 0 else None
+                    except Exception:
+                        pass
+                
+                if self.bingx_client and self.bingx_contract_id:
+                    try:
+                        best_bid, best_ask = await self.bingx_client.fetch_bbo_prices(self.bingx_contract_id)
+                        bingx_price = (best_bid + best_ask) / Decimal('2') if best_bid > 0 and best_ask > 0 else None
+                    except Exception:
+                        pass
+
+                # Calculate unrealized PnL
+                grvt_unrealized = Decimal('0')
+                bingx_unrealized = Decimal('0')
+                
+                if abs(self.grvt_position) > self.position_tolerance and grvt_price and self.grvt_avg_entry_price > 0:
+                    if self.grvt_position > 0:
+                        grvt_unrealized = (grvt_price - self.grvt_avg_entry_price) * self.grvt_position
+                    else:
+                        grvt_unrealized = (self.grvt_avg_entry_price - grvt_price) * abs(self.grvt_position)
+                
+                if abs(self.bingx_position) > self.position_tolerance and bingx_price and self.bingx_avg_entry_price > 0:
+                    if self.bingx_position > 0:
+                        bingx_unrealized = (bingx_price - self.bingx_avg_entry_price) * self.bingx_position
+                    else:
+                        bingx_unrealized = (self.bingx_avg_entry_price - bingx_price) * abs(self.bingx_position)
+
+                # Calculate total PnL
+                total_pnl = self.realized_pnl + grvt_unrealized + bingx_unrealized
+
+                # Format display - use ANSI escape codes to clear line and update
+                display = (
+                    f"\r\x1b[K💰 PnL | Realized: {self.realized_pnl:.4f} | "
+                    f"GRVT Unrealized: {grvt_unrealized:.4f} | "
+                    f"BingX Unrealized: {bingx_unrealized:.4f} | "
+                    f"Total: {total_pnl:.4f} | "
+                    f"Positions: GRVT={self.grvt_position:.4f} BingX={self.bingx_position:.4f}"
+                )
+                
+                # Only update if changed to avoid flickering
+                if display != self.last_pnl_display:
+                    print(display, end='', flush=True)
+                    self.last_pnl_display = display
+
+            except Exception as exc:
+                # Silently handle errors to avoid disrupting trading
+                pass
+
+            await asyncio.sleep(1.0)  # Update every second
+
     async def trading_loop(self) -> None:
         self.logger.info(f"Starting GRVT+BingX hedge bot | ticker={self.ticker} | size={self.order_quantity}")
 
@@ -1277,6 +1454,9 @@ class HedgeBot:
             self.logger.error(f"Initialization failed: {exc}")
             self.stop_flag = True
             return
+
+        # Start PnL display task
+        self.pnl_display_task = asyncio.create_task(self._display_pnl())
 
         await asyncio.sleep(2)
 
@@ -1312,6 +1492,18 @@ class HedgeBot:
                 break
 
         self.logger.info("Trading loop finished")
+        
+        # Stop PnL display task
+        if self.pnl_display_task and not self.pnl_display_task.done():
+            self.pnl_display_task.cancel()
+            try:
+                await self.pnl_display_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Final PnL display - clear the line and print final PnL
+        print("\r\x1b[K", end='', flush=True)  # Clear the PnL display line
+        self.logger.info(f"Final PnL | Realized: {self.realized_pnl:.4f}")
 
     async def cleanup(self) -> None:
         if self.grvt_client:
