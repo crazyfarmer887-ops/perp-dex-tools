@@ -73,6 +73,13 @@ class HedgeBot:
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
 
+        # PnL tracking
+        self.grvt_entry_prices: List[Tuple[Decimal, Decimal]] = []  # List of (size, price) tuples
+        self.bingx_entry_prices: List[Tuple[Decimal, Decimal]] = []  # List of (size, price) tuples
+        self.cumulative_realized_pnl: Decimal = Decimal('0')
+        self.pnl_display_task: Optional[asyncio.Task] = None
+        self.pnl_display_interval: float = 2.0  # Update every 2 seconds
+
         config_warnings: List[str] = []
 
         def _coerce_decimal(value: Any, default: Decimal, label: str) -> Decimal:
@@ -345,10 +352,75 @@ class HedgeBot:
         order_id = message.get('order_id')
 
         if status == 'FILLED':
+            previous_position = self.grvt_position
             if side == 'buy':
-                self.grvt_position += filled_size
+                # GRVT is buying (going long or closing short)
+                if self.grvt_position < 0:
+                    # We have a short position, so this buy is closing shorts
+                    remaining_to_close = min(filled_size, abs(self.grvt_position))
+                    closed = Decimal('0')
+                    while remaining_to_close > 0 and self.grvt_entry_prices:
+                        entry_size, entry_price = self.grvt_entry_prices[0]
+                        if entry_size <= remaining_to_close:
+                            # Fully close this entry (short position, so reverse calculation)
+                            realized_pnl = (entry_price - price) * entry_size
+                            self.cumulative_realized_pnl += realized_pnl
+                            remaining_to_close -= entry_size
+                            closed += entry_size
+                            self.grvt_entry_prices.pop(0)
+                        else:
+                            # Partially close this entry
+                            realized_pnl = (entry_price - price) * remaining_to_close
+                            self.cumulative_realized_pnl += realized_pnl
+                            closed += remaining_to_close
+                            self.grvt_entry_prices[0] = (entry_size - remaining_to_close, entry_price)
+                            remaining_to_close = Decimal('0')
+                    
+                    self.grvt_position += closed
+                    
+                    # If there's remaining quantity, it's opening a long position
+                    remaining_long = filled_size - closed
+                    if remaining_long > 0:
+                        self.grvt_position += remaining_long
+                        self.grvt_entry_prices.append((remaining_long, price))
+                else:
+                    # Opening or increasing long position
+                    self.grvt_position += filled_size
+                    self.grvt_entry_prices.append((filled_size, price))
             else:
-                self.grvt_position -= filled_size
+                # GRVT is selling (going short or closing long)
+                if self.grvt_position > 0:
+                    # We have a long position, so this sell is closing longs
+                    remaining_to_close = min(filled_size, self.grvt_position)
+                    closed = Decimal('0')
+                    while remaining_to_close > 0 and self.grvt_entry_prices:
+                        entry_size, entry_price = self.grvt_entry_prices[0]
+                        if entry_size <= remaining_to_close:
+                            # Fully close this entry
+                            realized_pnl = (price - entry_price) * entry_size
+                            self.cumulative_realized_pnl += realized_pnl
+                            remaining_to_close -= entry_size
+                            closed += entry_size
+                            self.grvt_entry_prices.pop(0)
+                        else:
+                            # Partially close this entry
+                            realized_pnl = (price - entry_price) * remaining_to_close
+                            self.cumulative_realized_pnl += realized_pnl
+                            closed += remaining_to_close
+                            self.grvt_entry_prices[0] = (entry_size - remaining_to_close, entry_price)
+                            remaining_to_close = Decimal('0')
+                    
+                    self.grvt_position -= closed
+                    
+                    # If there's remaining quantity, it's opening a short position
+                    remaining_short = filled_size - closed
+                    if remaining_short > 0:
+                        self.grvt_position -= remaining_short
+                        self.grvt_entry_prices.append((remaining_short, price))
+                else:
+                    # Opening or increasing short position
+                    self.grvt_position -= filled_size
+                    self.grvt_entry_prices.append((filled_size, price))
 
             self.last_grvt_fill = {
                 'order_id': order_id,
@@ -421,10 +493,67 @@ class HedgeBot:
 
         if order_result.status == 'FILLED':
             if order_result.size is not None:
+                previous_position = self.grvt_position
                 if side == 'buy':
-                    self.grvt_position += order_result.size
+                    # GRVT is buying (going long or closing short)
+                    if self.grvt_position < 0:
+                        # We have a short position, so this buy is closing shorts
+                        remaining_to_close = min(order_result.size, abs(self.grvt_position))
+                        closed = Decimal('0')
+                        while remaining_to_close > 0 and self.grvt_entry_prices:
+                            entry_size, entry_price = self.grvt_entry_prices[0]
+                            if entry_size <= remaining_to_close:
+                                realized_pnl = (entry_price - order_result.price) * entry_size
+                                self.cumulative_realized_pnl += realized_pnl
+                                remaining_to_close -= entry_size
+                                closed += entry_size
+                                self.grvt_entry_prices.pop(0)
+                            else:
+                                realized_pnl = (entry_price - order_result.price) * remaining_to_close
+                                self.cumulative_realized_pnl += realized_pnl
+                                closed += remaining_to_close
+                                self.grvt_entry_prices[0] = (entry_size - remaining_to_close, entry_price)
+                                remaining_to_close = Decimal('0')
+                        
+                        self.grvt_position += closed
+                        remaining_long = order_result.size - closed
+                        if remaining_long > 0:
+                            self.grvt_position += remaining_long
+                            self.grvt_entry_prices.append((remaining_long, order_result.price))
+                    else:
+                        # Opening or increasing long position
+                        self.grvt_position += order_result.size
+                        self.grvt_entry_prices.append((order_result.size, order_result.price))
                 else:
-                    self.grvt_position -= order_result.size
+                    # GRVT is selling (going short or closing long)
+                    if self.grvt_position > 0:
+                        # We have a long position, so this sell is closing longs
+                        remaining_to_close = min(order_result.size, self.grvt_position)
+                        closed = Decimal('0')
+                        while remaining_to_close > 0 and self.grvt_entry_prices:
+                            entry_size, entry_price = self.grvt_entry_prices[0]
+                            if entry_size <= remaining_to_close:
+                                realized_pnl = (order_result.price - entry_price) * entry_size
+                                self.cumulative_realized_pnl += realized_pnl
+                                remaining_to_close -= entry_size
+                                closed += entry_size
+                                self.grvt_entry_prices.pop(0)
+                            else:
+                                realized_pnl = (order_result.price - entry_price) * remaining_to_close
+                                self.cumulative_realized_pnl += realized_pnl
+                                closed += remaining_to_close
+                                self.grvt_entry_prices[0] = (entry_size - remaining_to_close, entry_price)
+                                remaining_to_close = Decimal('0')
+                        
+                        self.grvt_position -= closed
+                        remaining_short = order_result.size - closed
+                        if remaining_short > 0:
+                            self.grvt_position -= remaining_short
+                            self.grvt_entry_prices.append((remaining_short, order_result.price))
+                    else:
+                        # Opening or increasing short position
+                        self.grvt_position -= order_result.size
+                        self.grvt_entry_prices.append((order_result.size, order_result.price))
             self.last_grvt_fill = {
                 'order_id': order_result.order_id,
                 'side': side,
@@ -539,10 +668,79 @@ class HedgeBot:
                 order_result.status,
             )
 
+        previous_position = self.bingx_position
+        hedge_price = entry_price if entry_price else Decimal('0')
+        
         if hedge_side == 'buy':
-            self.bingx_position += total_executed
+            # BingX is buying (hedging against GRVT sell)
+            # This means BingX is going long or closing short
+            if self.bingx_position < 0:
+                # We have a short position, so this buy is closing shorts
+                remaining_to_close = min(total_executed, abs(self.bingx_position))
+                closed = Decimal('0')
+                while remaining_to_close > 0 and self.bingx_entry_prices:
+                    entry_size, entry_price_val = self.bingx_entry_prices[0]
+                    if entry_size <= remaining_to_close:
+                        # Fully close this entry (short position, so reverse calculation)
+                        realized_pnl = (entry_price_val - hedge_price) * entry_size
+                        self.cumulative_realized_pnl += realized_pnl
+                        remaining_to_close -= entry_size
+                        closed += entry_size
+                        self.bingx_entry_prices.pop(0)
+                    else:
+                        # Partially close this entry
+                        realized_pnl = (entry_price_val - hedge_price) * remaining_to_close
+                        self.cumulative_realized_pnl += realized_pnl
+                        closed += remaining_to_close
+                        self.bingx_entry_prices[0] = (entry_size - remaining_to_close, entry_price_val)
+                        remaining_to_close = Decimal('0')
+                
+                self.bingx_position += closed
+                
+                # If there's remaining quantity, it's opening a long position
+                remaining_long = total_executed - closed
+                if remaining_long > 0:
+                    self.bingx_position += remaining_long
+                    self.bingx_entry_prices.append((remaining_long, hedge_price))
+            else:
+                # Opening or increasing long position
+                self.bingx_position += total_executed
+                self.bingx_entry_prices.append((total_executed, hedge_price))
         else:
-            self.bingx_position -= total_executed
+            # BingX is selling (hedging against GRVT buy)
+            # This means BingX is going short or closing long
+            if self.bingx_position > 0:
+                # We have a long position, so this sell is closing longs
+                remaining_to_close = min(total_executed, self.bingx_position)
+                closed = Decimal('0')
+                while remaining_to_close > 0 and self.bingx_entry_prices:
+                    entry_size, entry_price_val = self.bingx_entry_prices[0]
+                    if entry_size <= remaining_to_close:
+                        # Fully close this entry
+                        realized_pnl = (hedge_price - entry_price_val) * entry_size
+                        self.cumulative_realized_pnl += realized_pnl
+                        remaining_to_close -= entry_size
+                        closed += entry_size
+                        self.bingx_entry_prices.pop(0)
+                    else:
+                        # Partially close this entry
+                        realized_pnl = (hedge_price - entry_price_val) * remaining_to_close
+                        self.cumulative_realized_pnl += realized_pnl
+                        closed += remaining_to_close
+                        self.bingx_entry_prices[0] = (entry_size - remaining_to_close, entry_price_val)
+                        remaining_to_close = Decimal('0')
+                
+                self.bingx_position -= closed
+                
+                # If there's remaining quantity, it's opening a short position
+                remaining_short = total_executed - closed
+                if remaining_short > 0:
+                    self.bingx_position -= remaining_short
+                    self.bingx_entry_prices.append((remaining_short, hedge_price))
+            else:
+                # Opening or increasing short position
+                self.bingx_position -= total_executed
+                self.bingx_entry_prices.append((total_executed, hedge_price))
 
         self.logger.info(
             "[BINGX] Hedge complete | side=%s | executed=%s | position=%s",
@@ -1262,6 +1460,78 @@ class HedgeBot:
         return False
 
     # ------------------------------------------------------------------ #
+    # PnL calculation and display
+    # ------------------------------------------------------------------ #
+
+    async def _calculate_unrealized_pnl(self, position: Decimal, entry_prices: List[Tuple[Decimal, Decimal]], current_price: Decimal) -> Decimal:
+        """Calculate unrealized PnL for a position."""
+        if position == 0 or not entry_prices:
+            return Decimal('0')
+        
+        # Calculate weighted average entry price
+        total_size = Decimal('0')
+        total_value = Decimal('0')
+        for entry_size, entry_price in entry_prices:
+            total_size += abs(entry_size)
+            total_value += abs(entry_size) * entry_price
+        
+        if total_size == 0:
+            return Decimal('0')
+        
+        avg_entry_price = total_value / total_size
+        
+        # Calculate unrealized PnL
+        if position > 0:  # Long position
+            unrealized_pnl = (current_price - avg_entry_price) * position
+        else:  # Short position
+            unrealized_pnl = (avg_entry_price - current_price) * abs(position)
+        
+        return unrealized_pnl
+
+    async def _calculate_aggregated_pnl(self) -> Tuple[Decimal, Decimal, Decimal]:
+        """Calculate aggregated PnL from both exchanges."""
+        try:
+            # Get current market prices
+            grvt_best_bid, grvt_best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+            bingx_best_bid, bingx_best_ask = await self.bingx_client.fetch_bbo_prices(self.bingx_contract_id)
+            
+            # Use mid price for PnL calculation
+            grvt_mid_price = (grvt_best_bid + grvt_best_ask) / Decimal('2')
+            bingx_mid_price = (bingx_best_bid + bingx_best_ask) / Decimal('2')
+            
+            # Calculate unrealized PnL for each exchange
+            grvt_unrealized = await self._calculate_unrealized_pnl(
+                self.grvt_position, self.grvt_entry_prices, grvt_mid_price
+            )
+            bingx_unrealized = await self._calculate_unrealized_pnl(
+                self.bingx_position, self.bingx_entry_prices, bingx_mid_price
+            )
+            
+            # Total PnL = realized + unrealized from both exchanges
+            total_pnl = self.cumulative_realized_pnl + grvt_unrealized + bingx_unrealized
+            
+            return total_pnl, grvt_unrealized, bingx_unrealized
+        except Exception as exc:
+            self.logger.warning(f"Failed to calculate PnL: {exc}")
+            return Decimal('0'), Decimal('0'), Decimal('0')
+
+    async def _display_pnl_periodically(self) -> None:
+        """Periodically display aggregated PnL."""
+        while not self.stop_flag:
+            try:
+                total_pnl, grvt_unrealized, bingx_unrealized = await self._calculate_aggregated_pnl()
+                
+                # Clear previous line and display PnL
+                print(f"\r[PnL] Total: {total_pnl:.4f} | Realized: {self.cumulative_realized_pnl:.4f} | "
+                      f"GRVT Unrealized: {grvt_unrealized:.4f} | BingX Unrealized: {bingx_unrealized:.4f} | "
+                      f"GRVT Pos: {self.grvt_position} | BingX Pos: {self.bingx_position}", end='', flush=True)
+                
+                await asyncio.sleep(self.pnl_display_interval)
+            except Exception as exc:
+                self.logger.warning(f"Error displaying PnL: {exc}")
+                await asyncio.sleep(self.pnl_display_interval)
+
+    # ------------------------------------------------------------------ #
     # Main run loop
     # ------------------------------------------------------------------ #
 
@@ -1279,6 +1549,9 @@ class HedgeBot:
             return
 
         await asyncio.sleep(2)
+
+        # Start PnL display task
+        self.pnl_display_task = asyncio.create_task(self._display_pnl_periodically())
 
         iteration = 0
         while not self.stop_flag and iteration < self.iterations:
@@ -1312,6 +1585,22 @@ class HedgeBot:
                 break
 
         self.logger.info("Trading loop finished")
+        
+        # Stop PnL display task
+        if self.pnl_display_task and not self.pnl_display_task.done():
+            self.pnl_display_task.cancel()
+            try:
+                await self.pnl_display_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Final PnL display
+        print()  # New line after the periodic display
+        total_pnl, grvt_unrealized, bingx_unrealized = await self._calculate_aggregated_pnl()
+        self.logger.info(
+            f"Final PnL Summary | Total: {total_pnl:.4f} | Realized: {self.cumulative_realized_pnl:.4f} | "
+            f"GRVT Unrealized: {grvt_unrealized:.4f} | BingX Unrealized: {bingx_unrealized:.4f}"
+        )
 
     async def cleanup(self) -> None:
         if self.grvt_client:
