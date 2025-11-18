@@ -3,8 +3,9 @@ import os
 import signal
 import sys
 import time
-from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Deque, Dict, List, Optional, Tuple
 import logging
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,6 +21,176 @@ class Config:
         for key, value in config_dict.items():
             setattr(self, key, value)
 
+
+class CrossExchangePnLTracker:
+    """
+    Helper that pairs fills between two venues and reports realized spread PnL in real time.
+    """
+
+    def __init__(self, maker_label: str, hedge_label: str, instrument: str, logger: logging.Logger):
+        self.maker_label = maker_label
+        self.hedge_label = hedge_label
+        self.instrument = instrument
+        self.logger = logger
+        self._maker_queue: Deque[Dict[str, Decimal]] = deque()
+        self._hedge_queue: Deque[Dict[str, Decimal]] = deque()
+        self.cumulative_pnl = Decimal('0')
+        self.total_matched_quantity = Decimal('0')
+        self._epsilon = Decimal('1e-12')
+
+    def record_maker_fill(self, side: str, price: Any, quantity: Any) -> None:
+        self._enqueue_fill(self._maker_queue, self.maker_label, side, price, quantity)
+
+    def record_hedge_fill(self, side: str, price: Any, quantity: Any) -> None:
+        self._enqueue_fill(self._hedge_queue, self.hedge_label, side, price, quantity)
+
+    def _enqueue_fill(
+        self,
+        queue: Deque[Dict[str, Decimal]],
+        venue_label: str,
+        side: Any,
+        price: Any,
+        quantity: Any
+    ) -> None:
+        normalized_side = (str(side or '')).strip().lower()
+        if normalized_side not in {'buy', 'sell'}:
+            self.logger.warning("⚠️ [%s] Ignoring fill with unsupported side '%s'", venue_label, side)
+            return
+
+        price_dec = self._to_decimal(price)
+        qty_dec = self._to_decimal(quantity)
+        if price_dec is None or price_dec <= 0:
+            self.logger.warning("⚠️ [%s] Ignoring fill due to invalid price: %s", venue_label, price)
+            return
+        if qty_dec is None or qty_dec <= 0:
+            self.logger.warning("⚠️ [%s] Ignoring fill due to invalid quantity: %s", venue_label, quantity)
+            return
+
+        queue.append({
+            'side': normalized_side,
+            'price': price_dec,
+            'remaining': qty_dec
+        })
+        self._try_match()
+
+    def _try_match(self) -> None:
+        while self._maker_queue and self._hedge_queue:
+            maker_leg = self._maker_queue[0]
+            hedge_leg = self._hedge_queue[0]
+            match_qty = min(maker_leg['remaining'], hedge_leg['remaining'])
+            if match_qty <= self._epsilon:
+                break
+
+            match = self._build_match(maker_leg, hedge_leg, match_qty)
+            if match is None:
+                # Drop the oldest leg to keep queues from stalling.
+                self.logger.warning("⚠️ Dropping unmatched %s fill to resync PnL tracker.", self.maker_label)
+                self._maker_queue.popleft()
+                continue
+
+            maker_leg['remaining'] -= match_qty
+            hedge_leg['remaining'] -= match_qty
+            if maker_leg['remaining'] <= self._epsilon:
+                self._maker_queue.popleft()
+            if hedge_leg['remaining'] <= self._epsilon:
+                self._hedge_queue.popleft()
+
+            self.cumulative_pnl += match['pnl']
+            self.total_matched_quantity += match_qty
+            self._log_match(match)
+
+    def _build_match(
+        self,
+        maker_leg: Dict[str, Decimal],
+        hedge_leg: Dict[str, Decimal],
+        quantity: Decimal
+    ) -> Optional[Dict[str, Any]]:
+        buy_leg = None
+        sell_leg = None
+        for leg, venue in ((maker_leg, self.maker_label), (hedge_leg, self.hedge_label)):
+            if leg['side'] == 'buy':
+                buy_leg = {'exchange': venue, 'price': leg['price']}
+            elif leg['side'] == 'sell':
+                sell_leg = {'exchange': venue, 'price': leg['price']}
+
+        if buy_leg is None or sell_leg is None:
+            self.logger.warning(
+                "⚠️ Unable to compute spread PnL (maker_side=%s, hedge_side=%s)",
+                maker_leg['side'],
+                hedge_leg['side']
+            )
+            return None
+
+        spread = sell_leg['price'] - buy_leg['price']
+        pnl = spread * quantity
+        return {
+            'buy_exchange': buy_leg['exchange'],
+            'buy_price': buy_leg['price'],
+            'sell_exchange': sell_leg['exchange'],
+            'sell_price': sell_leg['price'],
+            'spread': spread,
+            'qty': quantity,
+            'pnl': pnl
+        }
+
+    def _log_match(self, match: Dict[str, Any]) -> None:
+        pnl = match['pnl']
+        icon = "📈" if pnl > 0 else "📉" if pnl < 0 else "⚖️"
+        message = (
+            f"{icon} Hedge PnL [{self.instrument}] qty={self._fmt(match['qty'], 6)} | "
+            f"{match['sell_exchange']} SELL {self._fmt(match['sell_price'], 2)} vs "
+            f"{match['buy_exchange']} BUY {self._fmt(match['buy_price'], 2)} | "
+            f"spread={self._fmt(match['spread'], 4)} | realized={self._fmt(pnl, 4)} USDT | "
+            f"cumulative={self._fmt(self.cumulative_pnl, 4)} USDT"
+        )
+        self.logger.info(message)
+
+    def summary(self) -> str:
+        maker_pending, hedge_pending = self._pending_totals()
+        return (
+            "PnL Summary "
+            f"[{self.instrument}] cumulative={self._fmt(self.cumulative_pnl, 4)} USDT | "
+            f"matched_qty={self._fmt(self.total_matched_quantity, 6)} | "
+            f"pending {self.maker_label}={self._fmt(maker_pending, 6)} / "
+            f"{self.hedge_label}={self._fmt(hedge_pending, 6)}"
+        )
+
+    def flush_pending(self) -> None:
+        maker_pending, hedge_pending = self._pending_totals()
+        if maker_pending > self._epsilon or hedge_pending > self._epsilon:
+            self.logger.info(
+                "⚠️ Unmatched fills remain | %s=%s | %s=%s",
+                self.maker_label,
+                self._fmt(maker_pending, 6),
+                self.hedge_label,
+                self._fmt(hedge_pending, 6)
+            )
+
+    def _pending_totals(self) -> Tuple[Decimal, Decimal]:
+        maker_total = sum((leg['remaining'] for leg in self._maker_queue), Decimal('0'))
+        hedge_total = sum((leg['remaining'] for leg in self._hedge_queue), Decimal('0'))
+        return maker_total, hedge_total
+
+    @staticmethod
+    def _to_decimal(value: Any) -> Optional[Decimal]:
+        if value is None:
+            return None
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _strip_trailing(number_str: str) -> str:
+        if '.' not in number_str:
+            return number_str
+        number_str = number_str.rstrip('0').rstrip('.')
+        return number_str or '0'
+
+    def _fmt(self, value: Decimal, digits: int) -> str:
+        quant = Decimal('1').scaleb(-digits)
+        quantized = value.quantize(quant, rounding=ROUND_HALF_UP)
+        return self._strip_trailing(f"{quantized:f}")
 
 class HedgeBot:
     """
@@ -259,6 +430,8 @@ class HedgeBot:
 
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
+
+        self.pnl_tracker = CrossExchangePnLTracker("GRVT", "BingX", self.ticker, self.logger)
 
         for message in config_warnings:
             self.logger.warning(message)
@@ -538,6 +711,8 @@ class HedgeBot:
                 order_result.price,
                 order_result.status,
             )
+            if filled_size > 0 and order_result.price is not None:
+                self._record_bingx_fill_for_pnl(hedge_side, order_result.price, filled_size)
 
         if hedge_side == 'buy':
             self.bingx_position += total_executed
@@ -760,6 +935,20 @@ class HedgeBot:
         self.current_stop_loss_price = None
         self.last_roi_reason = None
         self.pending_grvt_price = None
+
+    def _record_grvt_fill_for_pnl(self, fill: Optional[Dict[str, Any]]) -> None:
+        if not self.pnl_tracker or not fill:
+            return
+        self.pnl_tracker.record_maker_fill(
+            fill.get('side'),
+            fill.get('price'),
+            fill.get('size')
+        )
+
+    def _record_bingx_fill_for_pnl(self, side: str, price: Any, quantity: Any) -> None:
+        if not self.pnl_tracker:
+            return
+        self.pnl_tracker.record_hedge_fill(side, price, quantity)
 
     def _register_entry(self, fill: Dict[str, Any], previous_position: Decimal) -> None:
         tolerance = self.position_tolerance
@@ -1214,6 +1403,8 @@ class HedgeBot:
             self._reset_entry_state()
             return False
 
+        self._record_grvt_fill_for_pnl(fill)
+
         if price_override is not None and self.pending_grvt_price and self.pending_grvt_price[0] == trade_side:
             self.pending_grvt_price = None
 
@@ -1312,8 +1503,12 @@ class HedgeBot:
                 break
 
         self.logger.info("Trading loop finished")
+        if self.pnl_tracker:
+            self.logger.info(self.pnl_tracker.summary())
 
     async def cleanup(self) -> None:
+        if self.pnl_tracker:
+            self.pnl_tracker.flush_pending()
         if self.grvt_client:
             try:
                 await self.grvt_client.disconnect()
