@@ -318,7 +318,8 @@ class GrvtClient(BaseExchangeClient):
         direction: str,
         price: Optional[Decimal] = None,
         tp_metadata: Optional[Dict[str, Any]] = None,
-        sl_metadata: Optional[Dict[str, Any]] = None
+        sl_metadata: Optional[Dict[str, Any]] = None,
+        respect_price: bool = False
     ) -> OrderResult:
         """Place an open order with GRVT."""
         attempt = 0
@@ -342,32 +343,23 @@ class GrvtClient(BaseExchangeClient):
                 return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
             # Determine order side and price
-            if direction == 'buy':
-                if price is not None:
-                    order_price = Decimal(price)
-                    if order_price >= best_ask:
-                        order_price = best_ask - self.config.tick_size
-                else:
-                    order_price = best_ask - self.config.tick_size
-            elif direction == 'sell':
-                if price is not None:
-                    order_price = Decimal(price)
-                    if order_price <= best_bid:
-                        order_price = best_bid + self.config.tick_size
-                else:
-                    order_price = best_bid + self.config.tick_size
+            if price is not None:
+                order_price = Decimal(price)
+                if order_price <= 0:
+                    return OrderResult(success=False, error_message='Provided order price is non-positive')
+                order_price = self.round_to_tick(order_price)
+                if not respect_price:
+                    if direction == 'buy' and order_price >= best_ask:
+                        order_price = self.round_to_tick(best_ask - self.config.tick_size)
+                    elif direction == 'sell' and order_price <= best_bid:
+                        order_price = self.round_to_tick(best_bid + self.config.tick_size)
             else:
-                raise Exception(f"[OPEN] Invalid direction: {direction}")
-
-            if order_price <= 0:
-                return OrderResult(success=False, error_message='Calculated order price is non-positive')
-
-            order_price = self.round_to_tick(order_price)
-
-            if direction == 'buy' and order_price >= best_ask:
-                order_price = self.round_to_tick(best_ask - self.config.tick_size)
-            elif direction == 'sell' and order_price <= best_bid:
-                order_price = self.round_to_tick(best_bid + self.config.tick_size)
+                if direction == 'buy':
+                    order_price = self.round_to_tick(best_ask - self.config.tick_size)
+                elif direction == 'sell':
+                    order_price = self.round_to_tick(best_bid + self.config.tick_size)
+                else:
+                    raise Exception(f"[OPEN] Invalid direction: {direction}")
 
             # Place the order using GRVT SDK
             try:

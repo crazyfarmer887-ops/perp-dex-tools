@@ -562,7 +562,8 @@ class HedgeBot:
             direction=side,
             price=price_override,
             tp_metadata=tp_metadata,
-            sl_metadata=sl_metadata
+            sl_metadata=sl_metadata,
+            respect_price=price_override is not None
         )
 
         if not order_result.success or not order_result.order_id:
@@ -1153,7 +1154,7 @@ class HedgeBot:
         self.last_roi_reason = None
         self.pending_grvt_price = None
 
-    def _register_entry(self, fill: Dict[str, Any], previous_position: Decimal) -> None:
+    async def _register_entry(self, fill: Dict[str, Any], previous_position: Decimal) -> None:
         tolerance = self.position_tolerance
         net_position = self.grvt_position
 
@@ -1162,7 +1163,7 @@ class HedgeBot:
                 "GRVT position flattened after %s fill; clearing ROI tracking.",
                 str(fill.get('side', '')).upper()
             )
-            self._reset_entry_state()
+            await self._clear_entry_state("grvt flat")
             return
 
         try:
@@ -1182,7 +1183,7 @@ class HedgeBot:
         if flip_detected:
             if price is None or price <= 0:
                 self.logger.warning("⚠️ Unable to register new %s entry due to invalid fill price.", side.upper())
-                self._reset_entry_state()
+                await self._clear_entry_state("invalid entry price")
                 return
             self.current_entry_price = price
         elif self.current_entry_price is None and price is not None and price > 0:
@@ -1195,10 +1196,7 @@ class HedgeBot:
 
         if self.current_entry_price is not None:
             self._update_roi_targets(side, self.current_entry_price)
-            if self.loop:
-                self.loop.create_task(self._refresh_grvt_exit_orders())
-            else:
-                asyncio.create_task(self._refresh_grvt_exit_orders())
+            await self._refresh_grvt_exit_orders()
         else:
             self.logger.warning("⚠️ ROI targets disabled due to missing entry price for %s position.", side.upper())
 
@@ -1484,7 +1482,8 @@ class HedgeBot:
                 contract_id=self.grvt_contract_id,
                 quantity=quantity,
                 direction=side,
-                price=price
+                price=price,
+                respect_price=True
             )
         except Exception as exc:
             self.logger.warning("[GRVT] Failed to submit %s exit order: %s", label.upper(), exc)
@@ -1963,8 +1962,7 @@ class HedgeBot:
         ):
             self.pending_grvt_price = None
 
-        self._register_entry(fill, previous_position)
-        await self._refresh_grvt_exit_orders()
+        await self._register_entry(fill, previous_position)
         hedge_success = await self._ensure_bingx_hedge(fill)
         if not hedge_success:
             self.logger.error(
