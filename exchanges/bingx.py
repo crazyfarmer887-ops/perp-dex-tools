@@ -119,11 +119,29 @@ class BingxClient(BaseExchangeClient):
     def _quantize_amount(self, amount: Decimal) -> str:
         if not self._market:
             return str(amount)
+
         precision = self._market.get('precision', {}).get('amount')
         if precision is None:
             return str(amount)
-        step = Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
-        return str(amount.quantize(step, rounding=ROUND_HALF_UP))
+
+        try:
+            precision_int = int(precision)
+        except (TypeError, ValueError):
+            return str(amount)
+
+        if precision_int < 0:
+            return str(amount)
+
+        try:
+            step = Decimal('1').scaleb(-precision_int)
+        except InvalidOperation:
+            step = Decimal('1') / (Decimal(10) ** precision_int)
+
+        try:
+            quantized = amount.quantize(step, rounding=ROUND_HALF_UP)
+        except InvalidOperation:
+            return str(amount)
+        return str(quantized)
 
     def _build_tp_sl_payload(
         self,
