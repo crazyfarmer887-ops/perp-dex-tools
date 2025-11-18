@@ -21,6 +21,7 @@ from exchanges.backpack import BackpackClient
 import websockets
 from datetime import datetime
 import pytz
+from helpers.pnl_tracker import HedgedPnlTracker, PnlUpdate
 
 class Config:
     """Simple config class to wrap dictionary for Backpack client."""
@@ -106,6 +107,12 @@ class HedgeBot:
 
         # Prevent propagation to root logger to avoid duplicate messages
         self.logger.propagate = False
+
+        pnl_quote = os.getenv('HEDGE_PNL_QUOTE', 'USDC')
+        self.pnl_tracker = HedgedPnlTracker(
+            exchanges=('Backpack', 'Lighter'),
+            quote_symbol=pnl_quote
+        )
 
         # State management
         self.stop_flag = False
@@ -220,6 +227,25 @@ class HedgeBot:
 
         self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
 
+    def _format_pnl_value(self, value: Decimal) -> str:
+        text = f"{value:.6f}"
+        if '.' in text:
+            text = text.rstrip('0').rstrip('.')
+        return text or "0"
+
+    def _emit_pnl_update(self, source: str, update: Optional[PnlUpdate]) -> None:
+        if not update or update.realized_delta == Decimal('0'):
+            return
+        quote = self.pnl_tracker.quote_symbol
+        delta = self._format_pnl_value(update.realized_delta)
+        exchange_total = self._format_pnl_value(update.exchange_realized)
+        aggregated_total = self._format_pnl_value(update.aggregated_realized)
+        self.logger.info(
+            f"💰 PnL Update ({source}) Δ={delta} {quote} | "
+            f"{update.exchange}: {exchange_total} {quote} | "
+            f"Aggregated: {aggregated_total} {quote}"
+        )
+
     def handle_lighter_order_result(self, order_data):
         """Handle Lighter order result from WebSocket."""
         try:
@@ -246,6 +272,14 @@ class HedgeBot:
                 price=str(order_data['avg_filled_price']),
                 quantity=str(order_data['filled_base_amount'])
             )
+
+            pnl_update = self.pnl_tracker.record_fill(
+                exchange='Lighter',
+                side='sell' if order_data["is_ask"] else 'buy',
+                price=order_data['avg_filled_price'],
+                quantity=order_data['filled_base_amount']
+            )
+            self._emit_pnl_update("Lighter", pnl_update)
 
             # Mark execution as complete
             self.lighter_order_filled = True  # Mark order as filled
@@ -1035,6 +1069,14 @@ class HedgeBot:
                         price=str(price),
                         quantity=str(filled_size)
                     )
+
+                    pnl_update = self.pnl_tracker.record_fill(
+                        exchange='Backpack',
+                        side=side,
+                        price=price,
+                        quantity=filled_size
+                    )
+                    self._emit_pnl_update("Backpack", pnl_update)
 
                     self.handle_backpack_order_update({
                         'order_id': order_id,
