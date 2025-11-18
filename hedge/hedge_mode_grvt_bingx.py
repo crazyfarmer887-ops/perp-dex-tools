@@ -1195,6 +1195,10 @@ class HedgeBot:
 
         if self.current_entry_price is not None:
             self._update_roi_targets(side, self.current_entry_price)
+            if self.loop:
+                self.loop.create_task(self._refresh_grvt_exit_orders())
+            else:
+                asyncio.create_task(self._refresh_grvt_exit_orders())
         else:
             self.logger.warning("⚠️ ROI targets disabled due to missing entry price for %s position.", side.upper())
 
@@ -1431,6 +1435,8 @@ class HedgeBot:
             self.logger.error("[BINGX] ROI %s hedge failed; manual intervention required.", trigger)
             return False
 
+        await self._enforce_balanced_positions(f"ROI {trigger}")
+        await self._refresh_grvt_exit_orders()
         await self._cancel_grvt_exit_orders(f"ROI {trigger}")
         self._reset_entry_state()
         self.logger.info("✅ ROI %s execution complete; positions hedged.", trigger)
