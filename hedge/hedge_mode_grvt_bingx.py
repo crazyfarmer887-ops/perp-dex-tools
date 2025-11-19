@@ -300,6 +300,15 @@ class HedgeBot:
         self.dynamic_tp_roi: Optional[Decimal] = None
         self.dynamic_sl_roi: Optional[Decimal] = None
         self.roi_target_task: Optional[asyncio.Task] = None
+        self.position_poll_interval = max(
+            0.1,
+            _coerce_float(
+                os.getenv('GRVT_BINGX_POSITION_POLL_INTERVAL'),
+                0.5,
+                'GRVT_BINGX_POSITION_POLL_INTERVAL'
+            )
+        )
+        self.position_poll_task: Optional[asyncio.Task] = None
 
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
@@ -356,6 +365,10 @@ class HedgeBot:
             "ROI target delay %ss | leverage=%s",
             self.roi_target_delay,
             self.roi_leverage
+        )
+        self.logger.info(
+            "Position poll interval: %.2fs",
+            self.position_poll_interval
         )
 
     # ------------------------------------------------------------------ #
@@ -533,6 +546,20 @@ class HedgeBot:
             grvt_position,
             bingx_position
         )
+    
+    async def _position_polling_loop(self) -> None:
+        self.logger.info("📡 Starting position polling task (interval %.2fs)", self.position_poll_interval)
+        try:
+            while not self.stop_flag:
+                try:
+                    await self._sync_positions_from_exchanges()
+                except Exception as exc:
+                    self.logger.warning(f"⚠️ Position polling error: {exc}")
+                await asyncio.sleep(self.position_poll_interval)
+        except asyncio.CancelledError:
+            self.logger.info("Position polling task cancelled.")
+        finally:
+            self.logger.info("📡 Position polling task stopped.")
 
 
     def initialize_clients(self) -> None:
@@ -1687,6 +1714,8 @@ class HedgeBot:
             await self.load_contract_metadata()
             await self.setup_grvt_websocket()
             await self.setup_bingx()
+            if self.position_poll_task is None or self.position_poll_task.done():
+                self.position_poll_task = asyncio.create_task(self._position_polling_loop())
         except Exception as exc:
             self.logger.error(f"Initialization failed: {exc}")
             self.stop_flag = True
@@ -1743,6 +1772,13 @@ class HedgeBot:
 
     async def cleanup(self) -> None:
         self._cancel_roi_target_task()
+        if self.position_poll_task:
+            self.position_poll_task.cancel()
+            try:
+                await self.position_poll_task
+            except asyncio.CancelledError:
+                pass
+            self.position_poll_task = None
         if self.grvt_client:
             try:
                 await self.grvt_client.disconnect()
