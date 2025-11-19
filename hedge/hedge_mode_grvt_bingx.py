@@ -3,7 +3,7 @@ import os
 import signal
 import sys
 import time
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_CEILING
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
@@ -44,6 +44,7 @@ class HedgeBot:
         maker_repricing_interval: Optional[float] = None,
         maker_repricing_offset_ticks: Optional[Decimal] = None,
         maker_max_reprices: Optional[int] = None,
+        roi_leverage: Optional[Decimal] = None,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
@@ -285,6 +286,21 @@ class HedgeBot:
             )
             self.grvt_maker_max_reprices = 0
 
+        roi_leverage_source = roi_leverage if roi_leverage is not None else os.getenv('GRVT_BINGX_ROI_LEVERAGE')
+        self.roi_leverage = _coerce_decimal(
+            roi_leverage_source,
+            Decimal('1'),
+            'GRVT_BINGX_ROI_LEVERAGE' if roi_leverage is None else 'roi_leverage'
+        )
+        if self.roi_leverage <= 0:
+            config_warnings.append("ROI leverage must be positive; using 1.")
+            self.roi_leverage = Decimal('1')
+
+        self.roi_target_delay = 60  # seconds
+        self.dynamic_tp_roi: Optional[Decimal] = None
+        self.dynamic_sl_roi: Optional[Decimal] = None
+        self.roi_target_task: Optional[asyncio.Task] = None
+
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
 
@@ -336,6 +352,11 @@ class HedgeBot:
             )
         else:
             self.logger.info("GRVT maker repricing: OFF")
+        self.logger.info(
+            "ROI target delay %ss | leverage=%s",
+            self.roi_target_delay,
+            self.roi_leverage
+        )
 
     # ------------------------------------------------------------------ #
     # Initialization helpers
@@ -381,6 +402,98 @@ class HedgeBot:
         if tick <= 0:
             tick = Decimal('0.01')
         return tick
+
+    def _round_to_one_decimal(self, price: Decimal) -> Decimal:
+        try:
+            return price.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)
+        except (InvalidOperation, ValueError):
+            return price
+
+    def _roi_step_value(self, base_value: Optional[Decimal]) -> Optional[Decimal]:
+        if base_value is None:
+            return None
+        if self.roi_leverage <= 0:
+            return base_value
+        return base_value * self.roi_leverage
+
+    def _ceil_to_step(self, value: Decimal, step: Decimal) -> Decimal:
+        if step <= 0:
+            return value
+        if value <= 0:
+            return step
+        quotient = (value / step).quantize(Decimal('1'), rounding=ROUND_CEILING)
+        return quotient * step
+
+    def _cancel_roi_target_task(self) -> None:
+        if self.roi_target_task and not self.roi_target_task.done():
+            self.roi_target_task.cancel()
+        self.roi_target_task = None
+
+    def _schedule_roi_target_refresh(self) -> None:
+        self._cancel_roi_target_task()
+        if self.current_entry_price is None or self.current_entry_side is None:
+            return
+        async def starter():
+            await self._refresh_roi_targets_after_delay()
+        self.roi_target_task = asyncio.create_task(starter())
+
+    def _apply_dynamic_roi_targets(self) -> None:
+        if self.current_entry_side is None or self.current_entry_price is None:
+            return
+        self._update_roi_targets(self.current_entry_side, self.current_entry_price)
+
+    async def _measure_current_roi(self) -> Optional[Decimal]:
+        if (
+            self.grvt_client is None
+            or self.grvt_contract_id is None
+            or self.current_entry_price is None
+            or self.current_entry_price <= 0
+            or self.current_entry_side is None
+        ):
+            return None
+        try:
+            best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+        except Exception as exc:
+            self.logger.warning(f"⚠️ Failed to fetch GRVT prices for ROI snapshot: {exc}")
+            return None
+
+        entry_price = self.current_entry_price
+        hundred = Decimal('100')
+        if self.current_entry_side == 'buy' and best_bid > 0:
+            return (best_bid - entry_price) / entry_price * hundred
+        if self.current_entry_side == 'sell' and best_ask > 0:
+            return (entry_price - best_ask) / entry_price * hundred
+        return None
+
+    async def _refresh_roi_targets_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(self.roi_target_delay)
+            snapshot = await self._measure_current_roi()
+            tp_step = self._roi_step_value(self.tp_roi)
+            sl_step = self._roi_step_value(self.sl_roi)
+
+            if tp_step is not None:
+                base_value = snapshot if snapshot is not None and snapshot > 0 else tp_step
+                self.dynamic_tp_roi = self._ceil_to_step(base_value, tp_step)
+            else:
+                self.dynamic_tp_roi = None
+
+            if sl_step is not None:
+                adverse = -snapshot if snapshot is not None and snapshot < 0 else sl_step
+                adverse = abs(adverse)
+                self.dynamic_sl_roi = self._ceil_to_step(adverse, sl_step)
+            else:
+                self.dynamic_sl_roi = None
+
+            self._apply_dynamic_roi_targets()
+            self.logger.info(
+                "ROI targets initialized | TP=%s%% | SL=%s%%",
+                self.dynamic_tp_roi,
+                self.dynamic_sl_roi
+            )
+        except asyncio.CancelledError:
+            return
+
 
     def initialize_clients(self) -> None:
         if self.grvt_client is None:
@@ -855,19 +968,23 @@ class HedgeBot:
             self.logger.warning("⚠️ Cannot compute BingX TP/SL due to invalid entry price.")
             return None, None
 
+        if self.dynamic_tp_roi is None and self.dynamic_sl_roi is None:
+            self.logger.info("[BINGX] TP/SL targets pending ROI snapshot; skipping attachment.")
+            return None, None
+
         hundred = Decimal('100')
         take_profit_price: Optional[Decimal] = None
         stop_loss_price: Optional[Decimal] = None
 
-        if self.tp_roi is not None:
-            tp_factor = self.tp_roi / hundred
+        if self.dynamic_tp_roi is not None:
+            tp_factor = self.dynamic_tp_roi / hundred
             if hedge_side == 'sell':
                 take_profit_price = entry_price * (Decimal('1') - tp_factor)
             else:
                 take_profit_price = entry_price * (Decimal('1') + tp_factor)
 
-        if self.sl_roi is not None:
-            sl_factor = self.sl_roi / hundred
+        if self.dynamic_sl_roi is not None:
+            sl_factor = self.dynamic_sl_roi / hundred
             if hedge_side == 'sell':
                 stop_loss_price = entry_price * (Decimal('1') + sl_factor)
             else:
@@ -879,6 +996,11 @@ class HedgeBot:
         if stop_loss_price is not None and stop_loss_price <= 0:
             self.logger.warning("⚠️ Computed BingX stop-loss price is non-positive; ignoring SL.")
             stop_loss_price = None
+
+        if take_profit_price is not None:
+            take_profit_price = self._round_to_one_decimal(take_profit_price)
+        if stop_loss_price is not None:
+            stop_loss_price = self._round_to_one_decimal(stop_loss_price)
 
         return take_profit_price, stop_loss_price
 
@@ -981,6 +1103,9 @@ class HedgeBot:
         self.current_stop_loss_price = None
         self.last_roi_reason = None
         self.pending_grvt_price = None
+        self.dynamic_tp_roi = None
+        self.dynamic_sl_roi = None
+        self._cancel_roi_target_task()
 
     def _register_entry(self, fill: Dict[str, Any], previous_position: Decimal) -> None:
         tolerance = self.position_tolerance
@@ -1021,11 +1146,19 @@ class HedgeBot:
         self.current_entry_size = size
         self.current_entry_timestamp = time.time()
         self.last_roi_reason = None
-
+        self.dynamic_tp_roi = None
+        self.dynamic_sl_roi = None
+        self.current_take_profit_price = None
+        self.current_stop_loss_price = None
         if self.current_entry_price is not None:
-            self._update_roi_targets(side, self.current_entry_price)
+            self.logger.info(
+                "ROI targets scheduled after %s seconds for %s position.",
+                self.roi_target_delay,
+                side.upper()
+            )
         else:
-            self.logger.warning("⚠️ ROI targets disabled due to missing entry price for %s position.", side.upper())
+            self.logger.warning("⚠️ Missing entry price; ROI targets cannot be scheduled for %s position.", side.upper())
+        self._schedule_roi_target_refresh()
 
     def _update_roi_targets(self, side: str, entry_price: Decimal) -> None:
         self.current_take_profit_price = None
@@ -1038,21 +1171,25 @@ class HedgeBot:
         one = Decimal('1')
         messages = []
 
-        if self.tp_roi is not None:
-            tp_factor = self.tp_roi / hundred
+        if self.dynamic_tp_roi is not None:
+            tp_factor = self.dynamic_tp_roi / hundred
             if side == 'buy':
                 self.current_take_profit_price = entry_price * (one + tp_factor)
             else:
                 self.current_take_profit_price = entry_price * (one - tp_factor)
-            messages.append(f"TP @ {self.current_take_profit_price} ({self.tp_roi}% ROI)")
+            if self.current_take_profit_price is not None:
+                self.current_take_profit_price = self._round_to_one_decimal(self.current_take_profit_price)
+            messages.append(f"TP @ {self.current_take_profit_price} ({self.dynamic_tp_roi}% ROI)")
 
-        if self.sl_roi is not None:
-            sl_factor = self.sl_roi / hundred
+        if self.dynamic_sl_roi is not None:
+            sl_factor = self.dynamic_sl_roi / hundred
             if side == 'buy':
                 self.current_stop_loss_price = entry_price * (one - sl_factor)
             else:
                 self.current_stop_loss_price = entry_price * (one + sl_factor)
-            messages.append(f"SL @ {self.current_stop_loss_price} (-{self.sl_roi}% ROI)")
+            if self.current_stop_loss_price is not None:
+                self.current_stop_loss_price = self._round_to_one_decimal(self.current_stop_loss_price)
+            messages.append(f"SL @ {self.current_stop_loss_price} (-{self.dynamic_sl_roi}% ROI)")
 
         if messages:
             self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
@@ -1342,6 +1479,20 @@ class HedgeBot:
             self.logger.warning("⚠️ Cannot evaluate ROI targets because entry price is non-positive.")
             return
 
+        if self.dynamic_tp_roi is None and self.dynamic_sl_roi is None:
+            if self.roi_target_task:
+                remaining = max(
+                    0.0,
+                    self.roi_target_delay - (time.time() - (self.current_entry_timestamp or time.time()))
+                )
+                try:
+                    await asyncio.wait_for(asyncio.shield(self.roi_target_task), timeout=remaining if remaining > 0 else None)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            if self.dynamic_tp_roi is None and self.dynamic_sl_roi is None:
+                self.logger.info("ROI targets not initialized yet; skipping ROI wait for this cycle.")
+                return
+
         hundred = Decimal('100')
         start_time = time.time()
         self.logger.info("⏳ Waiting for ROI targets before executing opposite GRVT cycle...")
@@ -1365,18 +1516,18 @@ class HedgeBot:
 
             if roi is not None:
                 roi_float = float(roi)
-                take_profit_hit = self.tp_roi is not None and roi >= self.tp_roi
-                stop_loss_hit = self.sl_roi is not None and roi <= -self.sl_roi
+                take_profit_hit = self.dynamic_tp_roi is not None and roi >= self.dynamic_tp_roi
+                stop_loss_hit = self.dynamic_sl_roi is not None and roi <= -self.dynamic_sl_roi
 
                 if take_profit_hit:
                     self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
-                    self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%)")
+                    self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.dynamic_tp_roi}%)")
                     self._schedule_next_grvt_order_price('take_profit')
                     return
 
                 if stop_loss_hit:
                     self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
-                    self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%)")
+                    self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.dynamic_sl_roi}%)")
                     self._schedule_next_grvt_order_price('stop_loss')
                     return
 
@@ -1535,6 +1686,7 @@ class HedgeBot:
         self.logger.info("Trading loop finished")
 
     async def cleanup(self) -> None:
+        self._cancel_roi_target_task()
         if self.grvt_client:
             try:
                 await self.grvt_client.disconnect()
