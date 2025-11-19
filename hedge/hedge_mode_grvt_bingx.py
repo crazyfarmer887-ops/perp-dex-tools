@@ -494,6 +494,33 @@ class HedgeBot:
         except asyncio.CancelledError:
             return
 
+    async def _flatten_positions_after_roi(self, trigger: str) -> None:
+        self.logger.info("🔄 Flattening positions after ROI %s trigger...", trigger)
+        tolerance = self.position_tolerance
+        grvt_position, bingx_position = await self._sync_positions_from_exchanges()
+
+        flatten_tasks: List[asyncio.Future] = []
+
+        if abs(grvt_position) > tolerance:
+            flatten_tasks.append(asyncio.create_task(self._place_grvt_limit_close(grvt_position)))
+        if abs(bingx_position) > tolerance:
+            flatten_tasks.append(asyncio.create_task(self._place_bingx_limit_close(bingx_position)))
+
+        if flatten_tasks:
+            await asyncio.gather(*flatten_tasks, return_exceptions=True)
+            await asyncio.sleep(self.position_close_poll_interval)
+            grvt_position, bingx_position = await self._sync_positions_from_exchanges()
+
+        if self._per_exchange_positions_flat(grvt_position, bingx_position):
+            self.logger.info("✅ Positions flat after ROI %s trigger.", trigger)
+        else:
+            self.logger.warning(
+                "⚠️ Positions remain imbalanced after ROI %s trigger | GRVT=%s | BingX=%s",
+                trigger.upper(),
+                grvt_position,
+                bingx_position
+            )
+
 
     def initialize_clients(self) -> None:
         if self.grvt_client is None:
@@ -1523,12 +1550,14 @@ class HedgeBot:
                     self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
                     self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.dynamic_tp_roi}%)")
                     self._schedule_next_grvt_order_price('take_profit')
+                    await self._flatten_positions_after_roi('take_profit')
                     return
 
                 if stop_loss_hit:
                     self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
                     self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.dynamic_sl_roi}%)")
                     self._schedule_next_grvt_order_price('stop_loss')
+                    await self._flatten_positions_after_roi('stop_loss')
                     return
 
             elapsed = time.time() - start_time
