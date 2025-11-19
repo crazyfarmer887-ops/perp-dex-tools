@@ -32,6 +32,7 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    prevent_self_matching: bool = True  # Enable self-matching prevention by default
 
     @property
     def close_order_side(self) -> str:
@@ -245,6 +246,30 @@ class TradingBot:
                 else:
                     close_price = filled_price * (1 - self.config.take_profit/100)
 
+                # Check for self-matching before placing close order
+                if self.config.prevent_self_matching:
+                    would_self_match = await self._check_self_matching(close_price, close_side)
+                    if would_self_match:
+                        # Adjust price to avoid self-matching
+                        best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                        if close_side == 'sell':
+                            # For sell orders, ensure price is above highest buy order
+                            # Use a small buffer above best_bid
+                            adjusted_price = best_bid * (1 + self.config.take_profit/100 + 0.001)  # Add 0.1% buffer
+                            close_price = max(close_price, adjusted_price)
+                            self.logger.log(
+                                f"[SELF-MATCH PREVENTION] Adjusted close sell price from {filled_price * (1 + self.config.take_profit/100)} to {close_price}",
+                                "INFO"
+                            )
+                        else:  # buy
+                            # For buy orders, ensure price is below lowest sell order
+                            adjusted_price = best_ask * (1 - self.config.take_profit/100 - 0.001)  # Subtract 0.1% buffer
+                            close_price = min(close_price, adjusted_price)
+                            self.logger.log(
+                                f"[SELF-MATCH PREVENTION] Adjusted close buy price from {filled_price * (1 - self.config.take_profit/100)} to {close_price}",
+                                "INFO"
+                            )
+
                 close_order_result = await self.exchange_client.place_close_order(
                     self.config.contract_id,
                     self.config.quantity,
@@ -343,6 +368,29 @@ class TradingBot:
                     else:
                         close_price = filled_price * (1 - self.config.take_profit/100)
 
+                    # Check for self-matching before placing close order
+                    if self.config.prevent_self_matching:
+                        would_self_match = await self._check_self_matching(close_price, close_side)
+                        if would_self_match:
+                            # Adjust price to avoid self-matching
+                            best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                            if close_side == 'sell':
+                                # For sell orders, ensure price is above highest buy order
+                                adjusted_price = best_bid * (1 + self.config.take_profit/100 + 0.001)  # Add 0.1% buffer
+                                close_price = max(close_price, adjusted_price)
+                                self.logger.log(
+                                    f"[SELF-MATCH PREVENTION] Adjusted partial fill close sell price from {filled_price * (1 + self.config.take_profit/100)} to {close_price}",
+                                    "INFO"
+                                )
+                            else:  # buy
+                                # For buy orders, ensure price is below lowest sell order
+                                adjusted_price = best_ask * (1 - self.config.take_profit/100 - 0.001)  # Subtract 0.1% buffer
+                                close_price = min(close_price, adjusted_price)
+                                self.logger.log(
+                                    f"[SELF-MATCH PREVENTION] Adjusted partial fill close buy price from {filled_price * (1 - self.config.take_profit/100)} to {close_price}",
+                                    "INFO"
+                                )
+
                     close_order_result = await self.exchange_client.place_close_order(
                         self.config.contract_id,
                         self.order_filled_amount,
@@ -418,6 +466,49 @@ class TradingBot:
                 self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
 
             print("--------------------------------")
+
+    async def _check_self_matching(self, order_price: Decimal, order_side: str) -> bool:
+        """Check if a new order would match against existing orders on the opposite side.
+        
+        Returns True if self-matching would occur, False otherwise.
+        """
+        try:
+            # Get all active orders
+            active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            
+            # Filter orders on the opposite side
+            opposite_side = 'sell' if order_side == 'buy' else 'buy'
+            opposite_orders = [order for order in active_orders if order.side == opposite_side]
+            
+            if not opposite_orders:
+                return False
+            
+            # Check if the new order price would match any opposite order
+            for existing_order in opposite_orders:
+                if order_side == 'buy':
+                    # Buy order matches if our buy price >= existing sell price
+                    if order_price >= existing_order.price:
+                        self.logger.log(
+                            f"[SELF-MATCH PREVENTION] New {order_side} order @ {order_price} "
+                            f"would match existing {opposite_side} order @ {existing_order.price}",
+                            "WARNING"
+                        )
+                        return True
+                else:  # sell
+                    # Sell order matches if our sell price <= existing buy price
+                    if order_price <= existing_order.price:
+                        self.logger.log(
+                            f"[SELF-MATCH PREVENTION] New {order_side} order @ {order_price} "
+                            f"would match existing {opposite_side} order @ {existing_order.price}",
+                            "WARNING"
+                        )
+                        return True
+            
+            return False
+        except Exception as e:
+            self.logger.log(f"Error checking self-matching: {e}", "ERROR")
+            # On error, allow the order to proceed (fail-safe)
+            return False
 
     async def _meet_grid_step_condition(self) -> bool:
         if self.active_close_orders:
@@ -506,6 +597,7 @@ class TradingBot:
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
             self.logger.log(f"Boost Mode: {self.config.boost_mode}", "INFO")
+            self.logger.log(f"Prevent Self-Matching: {self.config.prevent_self_matching}", "INFO")
             self.logger.log("=============================", "INFO")
 
             # Capture the running event loop for thread-safe callbacks
