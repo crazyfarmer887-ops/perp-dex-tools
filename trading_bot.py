@@ -14,6 +14,7 @@ from exchanges import ExchangeFactory
 from helpers import TradingLogger
 from helpers.lark_bot import LarkBot
 from helpers.telegram_bot import TelegramBot
+from helpers.fee_tracker import FeeTracker
 
 
 @dataclass
@@ -61,6 +62,7 @@ class TradingBot:
     def __init__(self, config: TradingConfig):
         self.config = config
         self.logger = TradingLogger(config.exchange, config.ticker, log_to_console=True)
+        self.fee_tracker = FeeTracker(config.exchange, config.ticker)
 
         # Create exchange client
         try:
@@ -91,6 +93,9 @@ class TradingBot:
         self.shutdown_requested = True
 
         try:
+            # Print fee summary before shutdown
+            self.fee_tracker.print_summary()
+            
             # Disconnect from exchange
             await self.exchange_client.disconnect()
             self.logger.log("Graceful shutdown completed", "INFO")
@@ -128,6 +133,18 @@ class TradingBot:
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
                                     f"{message.get('size')} @ {message.get('price')}", "INFO")
                     self.logger.log_transaction(order_id, side, message.get('size'), message.get('price'), status)
+                    
+                    # Track fees - OPEN orders are typically maker, CLOSE orders depend on boost_mode
+                    fee_type = 'taker' if (order_type == "CLOSE" and self.config.boost_mode) else 'maker'
+                    self.fee_tracker.log_fee(
+                        order_id=order_id,
+                        order_type=order_type,
+                        side=side,
+                        quantity=Decimal(message.get('size')),
+                        price=Decimal(message.get('price')),
+                        fee_type=fee_type,
+                        status=status
+                    )
                 elif status == "CANCELED":
                     if order_type == "OPEN":
                         self.order_filled_amount = filled_size
@@ -138,6 +155,17 @@ class TradingBot:
 
                         if self.order_filled_amount > 0:
                             self.logger.log_transaction(order_id, side, self.order_filled_amount, message.get('price'), status)
+                            # Track fees for partially filled orders
+                            fee_type = 'maker'  # OPEN orders are maker
+                            self.fee_tracker.log_fee(
+                                order_id=order_id,
+                                order_type="OPEN",
+                                side=side,
+                                quantity=self.order_filled_amount,
+                                price=Decimal(message.get('price')),
+                                fee_type=fee_type,
+                                status=status
+                            )
                             
                     # PATCH
                     if self.config.exchange == "extended":
@@ -388,8 +416,13 @@ class TradingBot:
                     if isinstance(order, dict)
                 )
 
+                # Get fee summary
+                fee_summary = self.fee_tracker.get_fee_summary()
+                
                 self.logger.log(f"Current Position: {position_amt} | Active closing amount: {active_close_amount} | "
-                                f"Order quantity: {len(self.active_close_orders)}")
+                                f"Order quantity: {len(self.active_close_orders)} | "
+                                f"Total Fees: ${fee_summary['total_fees']:.4f} | "
+                                f"Maker/Taker: ${fee_summary['maker_fees']:.4f}/${fee_summary['taker_fees']:.4f}")
                 self.last_log_time = time.time()
                 # Check for position mismatch
                 if abs(position_amt - active_close_amount) > (2 * self.config.quantity):
