@@ -40,6 +40,10 @@ class HedgeBot:
         bingx_attach_tp_sl: Optional[bool] = None,
         bingx_time_in_force: Optional[str] = None,
         strict_mode: Optional[bool] = None,
+        maker_repricing_enabled: Optional[bool] = None,
+        maker_repricing_interval: Optional[float] = None,
+        maker_repricing_offset_ticks: Optional[Decimal] = None,
+        maker_max_reprices: Optional[int] = None,
     ):
         self.ticker = ticker.upper()
         self.order_quantity = order_quantity
@@ -236,6 +240,51 @@ class HedgeBot:
             )
         )
 
+        env_maker_enabled = _parse_bool(os.getenv('GRVT_MAKER_REPRICING_ENABLED'), 'GRVT_MAKER_REPRICING_ENABLED')
+        if maker_repricing_enabled is not None:
+            self.grvt_maker_repricing_enabled = bool(maker_repricing_enabled)
+        elif env_maker_enabled is not None:
+            self.grvt_maker_repricing_enabled = env_maker_enabled
+        else:
+            self.grvt_maker_repricing_enabled = False
+
+        if maker_repricing_interval is not None:
+            interval_source = maker_repricing_interval
+            interval_label = 'maker_repricing_interval'
+        else:
+            interval_source = os.getenv('GRVT_MAKER_REPRICING_INTERVAL')
+            interval_label = 'GRVT_MAKER_REPRICING_INTERVAL'
+        self.grvt_maker_repricing_interval = max(
+            0.2,
+            _coerce_float(interval_source, 1.0, interval_label)
+        )
+
+        if maker_repricing_offset_ticks is not None:
+            offset_source = maker_repricing_offset_ticks
+            offset_label = 'maker_repricing_offset_ticks'
+        else:
+            offset_source = os.getenv('GRVT_MAKER_OFFSET_TICKS')
+            offset_label = 'GRVT_MAKER_OFFSET_TICKS'
+        self.grvt_maker_offset_ticks = _coerce_decimal(offset_source, Decimal('1'), offset_label)
+        if self.grvt_maker_offset_ticks <= 0:
+            config_warnings.append(
+                f"{offset_label}='{offset_source}' is invalid; using 1 tick."
+            )
+            self.grvt_maker_offset_ticks = Decimal('1')
+
+        if maker_max_reprices is not None:
+            max_reprices_source = maker_max_reprices
+            max_reprices_label = 'maker_max_reprices'
+        else:
+            max_reprices_source = os.getenv('GRVT_MAKER_MAX_REPRICES')
+            max_reprices_label = 'GRVT_MAKER_MAX_REPRICES'
+        self.grvt_maker_max_reprices = _coerce_int(max_reprices_source, 20, max_reprices_label)
+        if self.grvt_maker_max_reprices < 0:
+            config_warnings.append(
+                f"{max_reprices_label}='{max_reprices_source}' is invalid; using 0 (no limit)."
+            )
+            self.grvt_maker_max_reprices = 0
+
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
 
@@ -277,6 +326,16 @@ class HedgeBot:
             self.position_close_retry_delay,
             f"{self.position_close_timeout:.1f}s" if self.position_close_timeout > 0 else "DISABLED"
         )
+        if self.grvt_maker_repricing_enabled:
+            limit_note = "∞" if self.grvt_maker_max_reprices == 0 else str(self.grvt_maker_max_reprices)
+            self.logger.info(
+                "GRVT maker repricing: ON | interval=%.2fs | offset_ticks=%s | max_reprices=%s",
+                self.grvt_maker_repricing_interval,
+                self.grvt_maker_offset_ticks,
+                limit_note
+            )
+        else:
+            self.logger.info("GRVT maker repricing: OFF")
 
     # ------------------------------------------------------------------ #
     # Initialization helpers
@@ -309,6 +368,18 @@ class HedgeBot:
             'direction': 'buy',
             'close_order_side': 'sell'
         })
+
+    def _grvt_tick(self) -> Decimal:
+        if self.grvt_tick_size and self.grvt_tick_size > 0:
+            return self.grvt_tick_size
+        tick = getattr(self.grvt_client.config, 'tick_size', Decimal('0.01')) if self.grvt_client else Decimal('0.01')
+        try:
+            tick = Decimal(str(tick))
+        except (InvalidOperation, ValueError, TypeError):
+            tick = Decimal('0.01')
+        if tick <= 0:
+            tick = Decimal('0.01')
+        return tick
 
     def initialize_clients(self) -> None:
         if self.grvt_client is None:
@@ -370,6 +441,154 @@ class HedgeBot:
     async def setup_bingx(self) -> None:
         assert self.bingx_client is not None
         await self.bingx_client.connect()
+
+    def _maker_repricing_active(self, price_override: Optional[Decimal]) -> bool:
+        return self.grvt_maker_repricing_enabled and price_override is None and not self.stop_flag
+
+    async def _compute_grvt_maker_price(self, side: str) -> Optional[Decimal]:
+        if self.grvt_client is None or self.grvt_contract_id is None:
+            return None
+        try:
+            best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
+        except Exception as exc:
+            self.logger.warning(f"[GRVT] Failed to fetch book for repricing: {exc}")
+            return None
+
+        tick = self._grvt_tick()
+        offset_ticks = self.grvt_maker_offset_ticks if self.grvt_maker_offset_ticks > 0 else Decimal('1')
+        offset = tick * offset_ticks
+
+        if side == 'buy':
+            target = best_ask - offset
+            if target >= best_ask:
+                target = best_ask - tick
+        else:
+            target = best_bid + offset
+            if target <= best_bid:
+                target = best_bid + tick
+
+        if target <= 0:
+            return None
+
+        try:
+            return self.grvt_client.round_to_tick(target)
+        except Exception:
+            return target
+
+    async def _await_grvt_fill_with_repricing(
+        self,
+        side: str,
+        quantity: Decimal,
+        current_order_id: str,
+        current_price: Optional[Decimal],
+        price_override: Optional[Decimal]
+    ) -> Optional[Dict[str, Any]]:
+        repricing_enabled = self._maker_repricing_active(price_override)
+        reprices_done = 0
+        start_time = time.time()
+
+        while not self.stop_flag:
+            if self.grvt_fill_event.is_set():
+                return self.last_grvt_fill
+
+            elapsed = time.time() - start_time
+            if elapsed >= self.fill_timeout:
+                break
+
+            wait_timeout = self.fill_timeout - elapsed
+            if repricing_enabled:
+                wait_timeout = min(wait_timeout, self.grvt_maker_repricing_interval)
+
+            try:
+                await asyncio.wait_for(self.grvt_fill_event.wait(), timeout=wait_timeout)
+                if self.grvt_fill_event.is_set():
+                    return self.last_grvt_fill
+            except asyncio.TimeoutError:
+                if not repricing_enabled:
+                    continue
+                if self.grvt_maker_max_reprices > 0 and reprices_done >= self.grvt_maker_max_reprices:
+                    self.logger.info(
+                        "[GRVT] Maker repricing limit reached (%s); holding order price.",
+                        self.grvt_maker_max_reprices
+                    )
+                    repricing_enabled = False
+                    continue
+
+                new_price = await self._compute_grvt_maker_price(side)
+                if new_price is None:
+                    continue
+
+                tick = self._grvt_tick()
+                if current_price is not None and abs(new_price - current_price) < tick:
+                    continue
+
+                cancel_result = await self.grvt_client.cancel_order(current_order_id)
+                if not cancel_result.success:
+                    if self.grvt_fill_event.is_set():
+                        return self.last_grvt_fill
+                    self.logger.warning(
+                        "[GRVT] Failed to cancel %s order %s during repricing: %s",
+                        side.upper(),
+                        current_order_id,
+                        cancel_result.error_message
+                    )
+                    continue
+
+                reprices_done += 1
+                self.logger.info(
+                    "[GRVT] Repricing %s order | %s -> %s (attempt %s)",
+                    side.upper(),
+                    current_price,
+                    new_price,
+                    reprices_done
+                )
+                self.grvt_fill_event.clear()
+                self.last_grvt_fill = None
+
+                new_order = await self.grvt_client.place_open_order(
+                    contract_id=self.grvt_contract_id,
+                    quantity=quantity,
+                    direction=side,
+                    price=new_price
+                )
+                if not new_order.success or not new_order.order_id:
+                    self.logger.error(
+                        "[GRVT] Repriced %s order rejected: %s",
+                        side.upper(),
+                        getattr(new_order, 'error_message', 'unknown error')
+                    )
+                    return None
+
+                current_order_id = new_order.order_id
+                current_price = new_order.price
+                if new_order.status == 'FILLED':
+                    fill_snapshot = {
+                        'order_id': new_order.order_id,
+                        'side': side,
+                        'size': new_order.size,
+                        'price': new_order.price
+                    }
+                    self.last_grvt_fill = fill_snapshot
+                    self.grvt_fill_event.set()
+                    return fill_snapshot
+
+        self.logger.warning(
+            "[GRVT] %s order %s timed out after %.1fs; cancelling outstanding order.",
+            side.upper(),
+            current_order_id,
+            time.time() - start_time
+        )
+        try:
+            cancel_result = await self.grvt_client.cancel_order(current_order_id)
+            if not cancel_result.success:
+                self.logger.error(
+                    "[GRVT] Failed to cancel timed-out order %s: %s",
+                    current_order_id,
+                    cancel_result.error_message
+                )
+        except Exception as exc:
+            self.logger.error("[GRVT] Exception cancelling timed-out order %s: %s", current_order_id, exc)
+        return None
 
     async def place_grvt_order(
         self,
@@ -434,16 +653,17 @@ class HedgeBot:
             self.grvt_fill_event.set()
             return self.last_grvt_fill
 
-        try:
-            await asyncio.wait_for(self.grvt_fill_event.wait(), timeout=self.fill_timeout)
-        except asyncio.TimeoutError:
-            self.logger.warning(f"[GRVT] {side} order {order_result.order_id} timed out, cancelling")
-            cancel_result = await self.grvt_client.cancel_order(order_result.order_id)
-            if not cancel_result.success:
-                self.logger.error(f"[GRVT] Failed to cancel order {order_result.order_id}: {cancel_result.error_message}")
+        if not order_result.order_id:
+            self.logger.error(f"[GRVT] Missing order_id for {side} order response; aborting.")
             return None
 
-        return self.last_grvt_fill
+        return await self._await_grvt_fill_with_repricing(
+            side=side,
+            quantity=order_quantity,
+            current_order_id=order_result.order_id,
+            current_price=order_result.price,
+            price_override=price_override
+        )
 
     async def place_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
         assert self.bingx_client is not None
