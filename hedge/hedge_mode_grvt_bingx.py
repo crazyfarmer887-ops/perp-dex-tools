@@ -364,7 +364,8 @@ class HedgeBot:
             'ticker': self.ticker,
             'contract_id': '',
             'quantity': self.order_quantity,
-            'tick_size': Decimal('0.01'),
+            'tick_size': Decimal('0.1'),
+            'force_tick_size': Decimal('0.1'),
             'direction': 'buy',
             'close_order_side': 'sell'
         })

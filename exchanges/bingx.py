@@ -54,6 +54,28 @@ class BingxClient(BaseExchangeClient):
         self._tracked_orders: Dict[str, Dict[str, Any]] = {}
         self._poll_interval = float(os.getenv('BINGX_ORDER_POLL_INTERVAL', '1.0'))
         self._market: Optional[Dict[str, Any]] = None
+        self.force_tick_size: Optional[Decimal] = None
+
+        force_tick_source = getattr(self.config, 'force_tick_size', None)
+        env_force_tick = os.getenv('BINGX_FORCE_TICK_SIZE')
+        if env_force_tick is not None:
+            force_tick_source = env_force_tick
+
+        if force_tick_source is not None:
+            try:
+                forced = Decimal(str(force_tick_source))
+                if forced > 0:
+                    self.force_tick_size = forced
+                else:
+                    self.logger.log(
+                        f"Ignoring non-positive forced BingX tick size: {force_tick_source}",
+                        "WARNING"
+                    )
+            except (InvalidOperation, ValueError, TypeError):
+                self.logger.log(
+                    f"Invalid forced BingX tick size '{force_tick_source}'; ignoring override.",
+                    "WARNING"
+                )
 
     # --------------------------------------------------------------------- #
     # Base method implementations
@@ -104,6 +126,8 @@ class BingxClient(BaseExchangeClient):
     # --------------------------------------------------------------------- #
 
     def _get_tick_size(self) -> Decimal:
+        if self.force_tick_size and self.force_tick_size > 0:
+            return self.force_tick_size
         if self._market:
             tick = self._market.get('limits', {}).get('price', {}).get('min')
             if tick:
@@ -565,6 +589,9 @@ class BingxClient(BaseExchangeClient):
                     raise ValueError(
                         f"Order quantity is less than min quantity: {self.config.quantity} < {min_quantity_dec}"
                     )
+
+            if self.force_tick_size and self.force_tick_size > 0:
+                self.config.tick_size = self.force_tick_size
 
             return self.config.contract_id, self.config.tick_size
 
