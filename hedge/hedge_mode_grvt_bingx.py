@@ -494,8 +494,8 @@ class HedgeBot:
         except asyncio.CancelledError:
             return
 
-    async def _flatten_positions_after_roi(self, trigger: str) -> None:
-        self.logger.info("🔄 Flattening positions after ROI %s trigger...", trigger)
+    async def _flatten_positions(self, reason: str) -> None:
+        self.logger.info("🔄 Flattening positions due to %s...", reason)
         tolerance = self.position_tolerance
         poll_interval = Decimal('0.1')
         max_wait = self.position_close_timeout if self.position_close_timeout > 0 else max(5.0, float(self.fill_timeout))
@@ -507,7 +507,7 @@ class HedgeBot:
             grvt_position, bingx_position = await self._sync_positions_from_exchanges()
 
             if self._per_exchange_positions_flat(grvt_position, bingx_position):
-                self.logger.info("✅ Positions flat after ROI %s trigger.", trigger)
+                self.logger.info("✅ Positions flat (%s).", reason)
                 return
 
             if abs(grvt_position) > tolerance:
@@ -528,8 +528,8 @@ class HedgeBot:
 
         grvt_position, bingx_position = await self._sync_positions_from_exchanges()
         self.logger.warning(
-            "⚠️ Positions remain imbalanced after ROI %s trigger | GRVT=%s | BingX=%s",
-            trigger.upper(),
+            "⚠️ Positions remain imbalanced after %s | GRVT=%s | BingX=%s",
+            reason.upper(),
             grvt_position,
             bingx_position
         )
@@ -1563,14 +1563,14 @@ class HedgeBot:
                     self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
                     self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.dynamic_tp_roi}%)")
                     self._schedule_next_grvt_order_price('take_profit')
-                    await self._flatten_positions_after_roi('take_profit')
+                    await self._flatten_positions('take_profit')
                     return
 
                 if stop_loss_hit:
                     self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
                     self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.dynamic_sl_roi}%)")
                     self._schedule_next_grvt_order_price('stop_loss')
-                    await self._flatten_positions_after_roi('stop_loss')
+                    await self._flatten_positions('stop_loss')
                     return
 
             elapsed = time.time() - start_time
@@ -1716,14 +1716,28 @@ class HedgeBot:
                 break
 
             if not self._positions_are_flat():
-                self.logger.error(
-                    "Residual positions detected after iteration %s | GRVT=%s | BingX=%s. Halting to prevent compounding.",
+                self.logger.warning(
+                    "Positions imbalanced after iteration %s | GRVT=%s | BingX=%s. Attempting auto-flatten.",
                     iteration,
                     self.grvt_position,
                     self.bingx_position
                 )
-                self.stop_flag = True
-                break
+                await self._flatten_positions(f"iteration_{iteration}")
+                await asyncio.sleep(self.position_close_poll_interval)
+                await self._sync_positions_from_exchanges()
+
+                if not self._positions_are_flat():
+                    self.logger.error(
+                        "Residual positions detected after iteration %s | GRVT=%s | BingX=%s. Halting to prevent compounding.",
+                        iteration,
+                        self.grvt_position,
+                        self.bingx_position
+                    )
+                    self.stop_flag = True
+                    break
+                else:
+                    self.logger.info("Positions realigned after iteration %s; continuing.", iteration)
+                    continue
 
         self.logger.info("Trading loop finished")
 
