@@ -1649,6 +1649,7 @@ class HedgeBot:
         if self.pending_grvt_price and self.pending_grvt_price[0] == side:
             price_override = self.pending_grvt_price[1]
 
+        await self._sync_positions_from_exchanges()
         trade_delta = self._compute_trade_delta(side)
         if trade_delta == 0:
             self.logger.info(
@@ -1687,6 +1688,7 @@ class HedgeBot:
 
         fill = await self.place_grvt_order(trade_side, quantity=trade_quantity, price_override=price_override)
         if not fill or self.stop_flag:
+            await self._sync_positions_from_exchanges()
             self._reset_entry_state()
             return False
 
