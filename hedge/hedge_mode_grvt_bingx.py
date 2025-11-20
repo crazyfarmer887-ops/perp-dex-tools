@@ -1389,6 +1389,41 @@ class HedgeBot:
         )
         return True
 
+    async def _place_bingx_market_close(self, position: Decimal, reason: str = "") -> bool:
+        assert self.bingx_client is not None
+        assert self.bingx_contract_id is not None
+
+        quantity = abs(position)
+        if quantity <= 0:
+            return True
+
+        side = 'sell' if position > 0 else 'buy'
+        self.logger.info("[BINGX] Placing MARKET %s order to close %s (reason=%s)", side.upper(), quantity, reason or "n/a")
+        try:
+            result = await self.bingx_client.place_market_order(
+                contract_id=self.bingx_contract_id,
+                quantity=quantity,
+                side=side
+            )
+        except Exception as exc:
+            self.logger.error("[BINGX] Failed to submit market close order: %s", exc)
+            return False
+
+        if not result or not result.success:
+            error = getattr(result, 'error_message', 'Unknown error') if result else 'No response'
+            self.logger.error("[BINGX] Market close order rejected: %s", error)
+            return False
+
+        self.logger.info(
+            "[BINGX] Market close filled | id=%s | side=%s | qty=%s | price=%s | status=%s",
+            result.order_id,
+            side.upper(),
+            result.size or quantity,
+            result.price,
+            result.status
+        )
+        return True
+
     async def _place_bingx_limit_close(self, position: Decimal) -> bool:
         assert self.bingx_client is not None
         assert self.bingx_contract_id is not None
@@ -1410,12 +1445,12 @@ class HedgeBot:
             )
         except Exception as exc:
             self.logger.error("[BINGX] Failed to submit limit close order: %s", exc)
-            return False
+            return await self._place_bingx_market_close(position, reason="limit_exception")
 
         if not result or not result.success:
             error = getattr(result, 'error_message', 'Unknown error') if result else 'No response'
             self.logger.error("[BINGX] Limit close order rejected: %s", error)
-            return False
+            return await self._place_bingx_market_close(position, reason="limit_rejected")
 
         self.logger.info(
             "[BINGX] Close order accepted | id=%s | side=%s | qty=%s | price=%s | status=%s",
