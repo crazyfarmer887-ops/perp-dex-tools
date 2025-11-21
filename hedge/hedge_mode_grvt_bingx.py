@@ -482,23 +482,7 @@ class HedgeBot:
         try:
             await asyncio.sleep(self.roi_target_delay)
             snapshot = await self._measure_current_roi()
-            tp_step = self._roi_step_value(self.tp_roi)
-            sl_step = self._roi_step_value(self.sl_roi)
-
-            if tp_step is not None:
-                base_value = snapshot if snapshot is not None and snapshot > 0 else tp_step
-                self.dynamic_tp_roi = self._ceil_to_step(base_value, tp_step)
-            else:
-                self.dynamic_tp_roi = None
-
-            if sl_step is not None:
-                adverse = -snapshot if snapshot is not None and snapshot < 0 else sl_step
-                adverse = abs(adverse)
-                self.dynamic_sl_roi = self._ceil_to_step(adverse, sl_step)
-            else:
-                self.dynamic_sl_roi = None
-
-            self._apply_dynamic_roi_targets()
+            self._set_dynamic_targets(snapshot)
             self.logger.info(
                 "ROI targets initialized | TP=%s%% | SL=%s%%",
                 self.dynamic_tp_roi,
@@ -506,6 +490,34 @@ class HedgeBot:
             )
         except asyncio.CancelledError:
             return
+
+    async def _set_dynamic_targets(self, snapshot: Optional[Decimal]) -> None:
+        tp_step = self._roi_step_value(self.tp_roi)
+        sl_step = self._roi_step_value(self.sl_roi)
+        changed = False
+
+        if tp_step is not None:
+            base_value = snapshot if snapshot is not None and snapshot > 0 else tp_step
+            new_tp = self._ceil_to_step(base_value, tp_step)
+        else:
+            new_tp = None
+
+        if sl_step is not None:
+            adverse = -snapshot if snapshot is not None and snapshot < 0 else sl_step
+            adverse = abs(adverse)
+            new_sl = self._ceil_to_step(adverse, sl_step)
+        else:
+            new_sl = None
+
+        if new_tp != self.dynamic_tp_roi:
+            self.dynamic_tp_roi = new_tp
+            changed = True
+        if new_sl != self.dynamic_sl_roi:
+            self.dynamic_sl_roi = new_sl
+            changed = True
+
+        if changed and self.current_entry_price and self.current_entry_side:
+            self._update_roi_targets(self.current_entry_side, self.current_entry_price)
 
     async def _flatten_positions(self, reason: str) -> None:
         self.logger.info("🔄 Flattening positions due to %s...", reason)
@@ -1615,7 +1627,10 @@ class HedgeBot:
                     self.roi_target_delay - (time.time() - (self.current_entry_timestamp or time.time()))
                 )
                 try:
-                    await asyncio.wait_for(asyncio.shield(self.roi_target_task), timeout=remaining if remaining > 0 else None)
+                    await asyncio.wait_for(
+                        asyncio.shield(self.roi_target_task),
+                        timeout=remaining if remaining > 0 else None
+                    )
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
             if self.dynamic_tp_roi is None and self.dynamic_sl_roi is None:
@@ -1644,6 +1659,7 @@ class HedgeBot:
                 roi = (entry_price - reference_price) / entry_price * hundred
 
             if roi is not None:
+                await self._set_dynamic_targets(roi)
                 roi_float = float(roi)
                 take_profit_hit = self.dynamic_tp_roi is not None and roi >= self.dynamic_tp_roi
                 stop_loss_hit = self.dynamic_sl_roi is not None and roi <= -self.dynamic_sl_roi
