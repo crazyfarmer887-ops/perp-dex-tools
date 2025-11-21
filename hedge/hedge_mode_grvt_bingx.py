@@ -1012,11 +1012,13 @@ class HedgeBot:
 
             if self.max_hedge_retries > 0 and attempts >= self.max_hedge_retries:
                 self.logger.error(
-                    "Exceeded max BingX hedge retries (%s); stopping to avoid unhedged exposure.",
+                    "Exceeded max BingX hedge retries (%s); attempting forced flatten and continuing.",
                     self.max_hedge_retries
                 )
-                self.stop_flag = True
-                return False
+                flatten_ok = await self._require_positions_flat("bingx_hedge_failure")
+                if not flatten_ok:
+                    self.logger.warning("Unable to flatten positions after BingX hedge failure; continuing cautiously.")
+                return True
 
             await asyncio.sleep(self.hedge_retry_delay)
 
