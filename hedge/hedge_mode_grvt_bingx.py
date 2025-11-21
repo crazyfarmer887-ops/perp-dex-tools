@@ -546,6 +546,33 @@ class HedgeBot:
             grvt_position,
             bingx_position
         )
+
+    async def _require_positions_flat(self, context: str) -> bool:
+        await self._sync_positions_from_exchanges()
+        if self._per_exchange_positions_flat(self.grvt_position, self.bingx_position):
+            return True
+
+        self.logger.warning(
+            "Positions not flat before %s | GRVT=%s | BingX=%s. Attempting flatten.",
+            context,
+            self.grvt_position,
+            self.bingx_position
+        )
+        await self._flatten_positions(context)
+        await asyncio.sleep(self.position_close_poll_interval)
+        await self._sync_positions_from_exchanges()
+
+        if self._per_exchange_positions_flat(self.grvt_position, self.bingx_position):
+            self.logger.info("Positions flat after %s.", context)
+            return True
+
+        self.logger.error(
+            "Unable to flatten positions after %s | GRVT=%s | BingX=%s",
+            context,
+            self.grvt_position,
+            self.bingx_position
+        )
+        return False
     
     async def _position_polling_loop(self) -> None:
         self.logger.info("📡 Starting position polling task (interval %.2fs)", self.position_poll_interval)
@@ -1648,6 +1675,9 @@ class HedgeBot:
         price_override = None
         if self.pending_grvt_price and self.pending_grvt_price[0] == side:
             price_override = self.pending_grvt_price[1]
+
+        if not await self._require_positions_flat(f"pre_cycle_{side.upper()}"):
+            return False
 
         await self._sync_positions_from_exchanges()
         trade_delta = self._compute_trade_delta(side)
