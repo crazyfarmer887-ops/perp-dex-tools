@@ -572,11 +572,17 @@ class HedgeBot:
 
             if self.max_hedge_retries > 0 and attempts >= self.max_hedge_retries:
                 self.logger.error(
-                    "Exceeded max BingX hedge retries (%s); stopping to avoid unhedged exposure.",
+                    "Exceeded max BingX hedge retries (%s); attempting forced flatten.",
                     self.max_hedge_retries
                 )
-                self.stop_flag = True
-                return False
+                flatten_ok = await self._require_positions_flat("bingx_hedge_failure")
+                if not flatten_ok:
+                    self.logger.critical("CRITICAL: Unable to flatten positions after BingX hedge failure. Stopping bot.")
+                    self.stop_flag = True
+                    return False
+                else:
+                    self.logger.warning("Positions flattened successfully due to hedge failure; stopping cycle.")
+                    return False
 
             await asyncio.sleep(self.hedge_retry_delay)
 
@@ -1001,6 +1007,65 @@ class HedgeBot:
             result.status
         )
         return True
+
+    async def _flatten_positions(self, reason: str) -> None:
+        self.logger.info("🔄 Flattening positions due to %s...", reason)
+        tolerance = self.position_tolerance
+        poll_interval = Decimal('0.1')
+        max_wait = self.position_close_timeout if self.position_close_timeout > 0 else max(5.0, float(self.fill_timeout))
+        start_time = time.time()
+        last_grvt_submitted: Optional[Decimal] = None
+        last_bingx_submitted: Optional[Decimal] = None
+
+        while not self.stop_flag and (time.time() - start_time) < max_wait:
+            grvt_position, bingx_position = await self._sync_positions_from_exchanges()
+
+            if self._per_exchange_positions_flat(grvt_position, bingx_position):
+                self.logger.info("✅ Positions flat (%s).", reason)
+                return
+
+            if abs(grvt_position) > tolerance:
+                if last_grvt_submitted is None or abs(grvt_position - last_grvt_submitted) > tolerance:
+                    await self._place_grvt_limit_close(grvt_position)
+                    last_grvt_submitted = grvt_position
+            else:
+                last_grvt_submitted = None
+
+            if abs(bingx_position) > tolerance:
+                if last_bingx_submitted is None or abs(bingx_position - last_bingx_submitted) > tolerance:
+                    await self._place_bingx_limit_close(bingx_position)
+                    last_bingx_submitted = bingx_position
+            else:
+                last_bingx_submitted = None
+
+            await asyncio.sleep(float(poll_interval))
+
+    async def _require_positions_flat(self, context: str) -> bool:
+        await self._sync_positions_from_exchanges()
+        if self._per_exchange_positions_flat(self.grvt_position, self.bingx_position):
+            return True
+
+        self.logger.warning(
+            "Positions not flat before %s | GRVT=%s | BingX=%s. Attempting flatten.",
+            context,
+            self.grvt_position,
+            self.bingx_position
+        )
+        await self._flatten_positions(context)
+        await asyncio.sleep(self.position_close_poll_interval)
+        await self._sync_positions_from_exchanges()
+
+        if self._per_exchange_positions_flat(self.grvt_position, self.bingx_position):
+            self.logger.info("Positions flat after %s.", context)
+            return True
+
+        self.logger.error(
+            "Unable to flatten positions after %s | GRVT=%s | BingX=%s",
+            context,
+            self.grvt_position,
+            self.bingx_position
+        )
+        return False
 
     async def close_positions_with_limit_orders(self) -> None:
         """
