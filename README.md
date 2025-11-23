@@ -14,6 +14,8 @@
 
 一个支持多个交易所（目前包括 EdgeX, Backpack, Paradex, Aster, Lighter, grvt, Extended, BingX）的模块化交易机器人。该机器人实现了自动下单并在盈利时自动平仓的策略，主要目的是取得高交易量。
 
+详细的 API 文档请参考 [docs/API_REFERENCE.md](docs/API_REFERENCE.md)。
+
 ## 邀请链接 (获得返佣以及福利)
 
 #### EdgeX: [https://pro.edgex.exchange/referral/QUANT](https://pro.edgex.exchange/referral/QUANT)

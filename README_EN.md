@@ -10,6 +10,8 @@
 
 A modular trading bot that supports multiple exchanges including EdgeX, Backpack, Paradex, Aster, Lighter, GRVT, Extended, and BingX. The bot implements an automated strategy that places orders and automatically closes them at a profit.
 
+For detailed API documentation, please refer to [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
+
 ## Referral Links (Enjoy fee rebates and benefits)
 
 #### EdgeX: [https://pro.edgex.exchange/referral/QUANT](https://pro.edgex.exchange/referral/QUANT)
