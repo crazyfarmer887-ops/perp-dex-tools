@@ -8,6 +8,8 @@
 
 ## Multi-Exchange Trading Bot
 
+For detailed API documentation and code reference, please see [API_REFERENCE.md](docs/API_REFERENCE.md).
+
 A modular trading bot that supports multiple exchanges including EdgeX, Backpack, Paradex, Aster, Lighter, GRVT, Extended, and BingX. The bot implements an automated strategy that places orders and automatically closes them at a profit.
 
 ## Referral Links (Enjoy fee rebates and benefits)
