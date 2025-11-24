@@ -64,6 +64,7 @@ class BingxHedgePositionMode:
         roi_percent: Decimal,
         leverage: Decimal,
         quote_asset: str = "USDT",
+        allow_non_reduce_only: bool = False,
     ):
         self.ticker = ticker.upper()
         self.quantity = quantity
@@ -72,6 +73,7 @@ class BingxHedgePositionMode:
         self.quote_asset = quote_asset.upper()
         if not self.quote_asset:
             raise ValueError("quote_asset must be provided (e.g., USDT or VST).")
+        self.allow_non_reduce_only = allow_non_reduce_only
 
         self.logger = logging.getLogger("bingx_hedge_position")
         self.logger.setLevel(logging.INFO)
@@ -210,6 +212,32 @@ class BingxHedgePositionMode:
 
         return base_price, lower, upper
 
+    def _is_reduce_only_rejection(self, error_message: Optional[str]) -> bool:
+        if not error_message:
+            return False
+        lowered = error_message.lower()
+        return "reduce only order" in lowered or '"code":101290' in lowered or "101290" in lowered
+
+    async def _submit_tp_sl_order(
+        self,
+        side: str,
+        price: Decimal,
+        size: Decimal,
+        label: str,
+        reduce_only: bool,
+    ):
+        assert self.bingx_client is not None and self.contract_id is not None
+
+        return await self.bingx_client.place_limit_order(
+            contract_id=self.contract_id,
+            quantity=size,
+            side=side,
+            price=price,
+            reduce_only=reduce_only,
+            post_only=False,
+            time_in_force="GTC",
+        )
+
     async def _place_tp_sl_orders(self, long_order: OrderSnapshot, short_order: OrderSnapshot) -> None:
         assert self.bingx_client is not None and self.contract_id is not None
 
@@ -227,18 +255,33 @@ class BingxHedgePositionMode:
                 self.logger.warning("Skipping %s because size is non-positive (%s).", label, size)
                 continue
 
-            result = await self.bingx_client.place_limit_order(
-                contract_id=self.contract_id,
-                quantity=size,
-                side=side,
-                price=price,
-                reduce_only=True,
-                post_only=False,
-                time_in_force="GTC",
-            )
+            result = await self._submit_tp_sl_order(side, price, size, label, reduce_only=True)
+            used_reduce_only = True
+
+            if not result.success and self._is_reduce_only_rejection(result.error_message):
+                if self.allow_non_reduce_only:
+                    self.logger.warning(
+                        "%s rejected due to reduce-only constraint; retrying without reduceOnly flag.",
+                        label,
+                    )
+                    result = await self._submit_tp_sl_order(side, price, size, label, reduce_only=False)
+                    used_reduce_only = False
+                else:
+                    raise RuntimeError(
+                        f"Reduce-only order for {label} was rejected. Verify that your BingX account is in Hedge Mode "
+                        f"or enable --allow-non-reduce-only to retry without reduceOnly."
+                    )
 
             if result.success:
-                self.logger.info("Placed %s | %s %s @ %s | order_id=%s", label, side.upper(), size, price, result.order_id)
+                self.logger.info(
+                    "Placed %s | %s %s @ %s | reduce_only=%s | order_id=%s",
+                    label,
+                    side.upper(),
+                    size,
+                    price,
+                    "Y" if used_reduce_only else "N",
+                    result.order_id,
+                )
             else:
                 raise RuntimeError(f"Failed to place {label} order: {result.error_message}")
 
@@ -267,6 +310,11 @@ def parse_arguments() -> argparse.Namespace:
         default="USDT",
         help="Quote asset for the BingX contract (e.g., USDT, VST). Default: USDT.",
     )
+    parser.add_argument(
+        "--allow-non-reduce-only",
+        action="store_true",
+        help="If set, retry TP/SL orders without reduceOnly when BingX rejects them (useful for one-way accounts).",
+    )
     parser.add_argument("--env-file", type=str, default=".env", help="Path to env file with API credentials.")
     return parser.parse_args()
 
@@ -288,6 +336,7 @@ async def _run_from_cli() -> None:
         roi_percent=roi_percent,
         leverage=leverage,
         quote_asset=args.quote_asset,
+        allow_non_reduce_only=args.allow_non_reduce_only,
     )
     await bot.execute()
 
