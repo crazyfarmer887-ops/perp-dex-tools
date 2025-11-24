@@ -1298,6 +1298,9 @@ class HedgeBot:
         return True
 
     async def _run_cycle_phase(self, side: str) -> bool:
+        # Ensure we have fresh position data before starting a cycle
+        await self._sync_positions_from_exchanges()
+        
         attempt = 0
         while not self.stop_flag:
             attempt += 1

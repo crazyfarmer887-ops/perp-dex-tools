@@ -307,7 +307,9 @@ class GrvtClient(BaseExchangeClient):
     ) -> OrderResult:
         """Place an open order with GRVT."""
         attempt = 0
-        while True:
+        max_retries = 20  # Prevent infinite loops
+        
+        while attempt < max_retries:
             attempt += 1
             if attempt % 5 == 0:
                 self.logger.log(f"[OPEN] Attempt {attempt} to place order", "INFO")
@@ -379,6 +381,8 @@ class GrvtClient(BaseExchangeClient):
                 raise Exception("[OPEN] Order not processed after 10 seconds")
             else:
                 raise Exception(f"[OPEN] Unexpected order status: {order_status}")
+        
+        return OrderResult(success=False, error_message=f"Failed to place open order after {max_retries} attempts")
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
         """Place a close order with GRVT."""
