@@ -72,6 +72,9 @@ class HedgeBot:
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
+        
+        # Track active hedge tasks to allow pre-emptive execution from websocket
+        self.active_hedge_tasks: Dict[str, asyncio.Task] = {}
 
         config_warnings: List[str] = []
 
@@ -360,6 +363,16 @@ class HedgeBot:
             self.logger.info(
                 f"[GRVT] FILLED {side.upper()} {filled_size} @ {price} | Position={self.grvt_position}"
             )
+
+            # Immediately trigger BingX market hedge if configured
+            if self.bingx_hedge_order_type == 'market' and self.loop and self.last_grvt_fill:
+                order_id_val = self.last_grvt_fill.get('order_id')
+                if order_id_val and order_id_val not in self.active_hedge_tasks:
+                    # Capture the fill data for the task
+                    fill_data = self.last_grvt_fill.copy()
+                    task = self.loop.create_task(self._execute_bingx_hedge_internal(fill_data))
+                    self.active_hedge_tasks[order_id_val] = task
+
             self.grvt_fill_event.set()
 
     async def setup_grvt_websocket(self) -> None:
@@ -446,6 +459,40 @@ class HedgeBot:
         return self.last_grvt_fill
 
     async def place_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
+        """
+        Public entry point to place BingX hedge.
+        It uses active_hedge_tasks to prevent duplicate execution if immediate execution was triggered via websocket.
+        """
+        order_id = fill.get('order_id')
+        if not order_id:
+            # Fallback if no order_id (should not happen)
+            return await self._execute_bingx_hedge_internal(fill)
+
+        # Check if a task is already running/completed for this order_id
+        task = self.active_hedge_tasks.get(order_id)
+        if not task:
+            # No task started yet, start one now
+            task = self.loop.create_task(self._execute_bingx_hedge_internal(fill))
+            self.active_hedge_tasks[order_id] = task
+        
+        try:
+            # Wait for the task to complete
+            result = await task
+            
+            # Clean up task if successful
+            if result:
+                self.active_hedge_tasks.pop(order_id, None)
+            else:
+                # If failed, remove it so next retry triggers a new attempt
+                self.active_hedge_tasks.pop(order_id, None)
+            
+            return result
+        except Exception as e:
+            self.logger.error(f"[BINGX] Error awaiting hedge task for {order_id}: {e}")
+            self.active_hedge_tasks.pop(order_id, None)
+            return False
+
+    async def _execute_bingx_hedge_internal(self, fill: Dict[str, Any]) -> bool:
         assert self.bingx_client is not None
         assert self.bingx_contract_id is not None
 
