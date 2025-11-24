@@ -57,11 +57,21 @@ def _parse_decimal(value: str, label: str) -> Decimal:
 class BingxHedgePositionMode:
     """Core workflow for hedged BingX positioning with symmetric TP/SL targets."""
 
-    def __init__(self, ticker: str, quantity: Decimal, roi_percent: Decimal, leverage: Decimal):
+    def __init__(
+        self,
+        ticker: str,
+        quantity: Decimal,
+        roi_percent: Decimal,
+        leverage: Decimal,
+        quote_asset: str = "USDT",
+    ):
         self.ticker = ticker.upper()
         self.quantity = quantity
         self.roi_percent = roi_percent
         self.leverage = leverage
+        self.quote_asset = quote_asset.upper()
+        if not self.quote_asset:
+            raise ValueError("quote_asset must be provided (e.g., USDT or VST).")
 
         self.logger = logging.getLogger("bingx_hedge_position")
         self.logger.setLevel(logging.INFO)
@@ -83,12 +93,18 @@ class BingxHedgePositionMode:
                 "tick_size": Decimal("0.01"),
                 "direction": "buy",
                 "close_order_side": "sell",
+                "quote_asset": self.quote_asset,
             }
         )
 
     async def execute(self) -> None:
         """Entry point used by the CLI wrapper."""
-        self.logger.info("Initializing BingX hedge position mode (ticker=%s, qty=%s)", self.ticker, self.quantity)
+        self.logger.info(
+            "Initializing BingX hedge position mode (ticker=%s, quote=%s, qty=%s)",
+            self.ticker,
+            self.quote_asset,
+            self.quantity,
+        )
 
         self.bingx_client = BingxClient(self._build_config())
 
@@ -108,7 +124,12 @@ class BingxHedgePositionMode:
         self.tick_size = tick_size
         self.bingx_client.config.contract_id = contract_id
         self.bingx_client.config.tick_size = tick_size
-        self.logger.info("Connected to BingX | contract=%s | tick_size=%s", contract_id, tick_size)
+        self.logger.info(
+            "Connected to BingX | contract=%s | quote=%s | tick_size=%s",
+            contract_id,
+            self.quote_asset,
+            tick_size,
+        )
 
     async def _disconnect(self) -> None:
         if self.bingx_client:
@@ -240,6 +261,12 @@ def parse_arguments() -> argparse.Namespace:
         required=True,
         help="Effective leverage to convert ROI to actual price move (e.g., 4 for 4x).",
     )
+    parser.add_argument(
+        "--quote-asset",
+        type=str,
+        default="USDT",
+        help="Quote asset for the BingX contract (e.g., USDT, VST). Default: USDT.",
+    )
     parser.add_argument("--env-file", type=str, default=".env", help="Path to env file with API credentials.")
     return parser.parse_args()
 
@@ -260,6 +287,7 @@ async def _run_from_cli() -> None:
         quantity=quantity,
         roi_percent=roi_percent,
         leverage=leverage,
+        quote_asset=args.quote_asset,
     )
     await bot.execute()
 

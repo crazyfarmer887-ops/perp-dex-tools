@@ -29,6 +29,9 @@ class BingxClient(BaseExchangeClient):
         self.api_key = os.getenv('BINGX_API_KEY')
         self.api_secret = os.getenv('BINGX_API_SECRET')
         self.environment = os.getenv('BINGX_ENVIRONMENT', 'prod').lower()
+        quote_source = getattr(self.config, 'quote_asset', None) or os.getenv('BINGX_QUOTE_ASSET') or 'USDT'
+        self.quote_asset = str(quote_source).upper()
+        self.config.quote_asset = self.quote_asset
 
         # Initialize logger
         self.logger = TradingLogger(exchange="bingx", ticker=self.config.ticker, log_to_console=False)
@@ -560,11 +563,23 @@ class BingxClient(BaseExchangeClient):
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         await self.exchange.load_markets()
         ticker = self.config.ticker.upper()
+        desired_quote = (getattr(self.config, 'quote_asset', self.quote_asset) or 'USDT').upper()
 
         for symbol, market in self.exchange.markets.items():
             if not market.get('swap'):
                 continue
-            if market.get('base') != ticker or market.get('quote') != 'USDT':
+            market_base = str(market.get('base', '')).upper()
+            market_quote = (
+                str(
+                    market.get('quote')
+                    or market.get('settle')
+                    or market.get('info', {}).get('quoteAsset')
+                    or market.get('info', {}).get('marginCoin')
+                    or ''
+                ).upper()
+            )
+
+            if market_base != ticker or market_quote != desired_quote:
                 continue
 
             self._market = market
