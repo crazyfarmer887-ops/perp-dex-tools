@@ -477,7 +477,7 @@ class LighterClient(BaseExchangeClient):
                 contract_orders.append(OrderInfo(
                     order_id=str(order.order_index),
                     side=side,
-                    size=Decimal(order.remaining_base_amount),  # FIXME: This is wrong. Should be size
+                    size=size,
                     price=price,
                     status=order.status.upper(),
                     filled_size=Decimal(order.filled_base_amount),

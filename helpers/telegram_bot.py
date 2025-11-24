@@ -1,9 +1,8 @@
 import os
-import ssl
-import requests
+import aiohttp
 from typing import Dict, Any, Optional
-
 import certifi
+import ssl
 
 BASE_URL = "https://api.telegram.org/bot"
 
@@ -13,42 +12,46 @@ class TelegramBot:
         self.chat_id = chat_id
         self.base_url = base_url if base_url else BASE_URL
         self.api_url = f"{self.base_url.rstrip('/')}{self.token}"
+        self.session = None
 
-        # Create session with SSL context
-        self.session = requests.Session()
-        self.session.verify = certifi.where()
-        self.session.timeout = 10
-
-    def __enter__(self):
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=ssl.create_default_context(cafile=certifi.where()))
+        )
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
     
-    def close(self):
+    async def close(self):
         """close requests session"""
         if self.session:
-            self.session.close()
+            await self.session.close()
 
-    def send_text(self, content: str, parse_mode: str = "HTML") -> Dict[str, Any]:
+    async def send_text(self, content: str, parse_mode: str = "HTML") -> Dict[str, Any]:
         """Send a text message to Telegram"""
         payload = {
             "chat_id": self.chat_id,
             "text": content,
             "parse_mode": parse_mode
         }
-        return self._send_message("sendMessage", payload)
+        return await self._send_message("sendMessage", payload)
 
-    def _send_message(self, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _send_message(self, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Internal method to send messages to Telegram API"""
         url = f"{self.api_url}/{method}"
         
+        if self.session is None:
+             self.session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=ssl.create_default_context(cafile=certifi.where()))
+            )
+
         try:
-            response = self.session.post(url, json=payload)
-            response_data = response.json()
-            if not response_data.get("ok", False):
-                print(f"Telegram send message failed: {response_data}")
-            return response_data
+            async with self.session.post(url, json=payload) as response:
+                response_data = await response.json()
+                if not response_data.get("ok", False):
+                    print(f"Telegram send message failed: {response_data}")
+                return response_data
         except Exception as e:
             print(f"Telegram send message failed: {e}")
             return {"ok": False, "error": str(e)}

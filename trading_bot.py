@@ -484,8 +484,8 @@ class TradingBot:
         telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
         telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if telegram_token and telegram_chat_id:
-            with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
-                tg_bot.send_text(message)
+            async with TelegramBot(telegram_token, telegram_chat_id) as tg_bot:
+                await tg_bot.send_text(message)
 
     async def run(self):
         """Main trading loop."""

@@ -550,7 +550,7 @@ class ParadexClient(BaseExchangeClient):
             contract_orders.append(OrderInfo(
                 order_id=order.get('id', ''),
                 side=order.get('side', '').lower(),
-                size=Decimal(order.get('remaining_size', 0)),  # FIXME: This is wrong. Should be size
+                size=Decimal(order.get('size', 0)),
                 price=Decimal(order.get('price', 0)),
                 status=order.get('status', ''),
                 filled_size=Decimal(order.get('size', 0)) - Decimal(order.get('remaining_size', 0)),
