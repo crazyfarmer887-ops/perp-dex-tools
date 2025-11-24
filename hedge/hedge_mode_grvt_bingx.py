@@ -371,6 +371,96 @@ class HedgeBot:
         assert self.bingx_client is not None
         await self.bingx_client.connect()
 
+    async def place_grvt_tp_sl_orders(self, entry_side: str, entry_price: Decimal, position_size: Decimal) -> None:
+        """Place GRVT TP and SL limit orders after a position is filled."""
+        if self.grvt_client is None or self.grvt_contract_id is None:
+            return
+        
+        if entry_price is None or entry_price <= 0:
+            self.logger.warning("⚠️ Cannot place GRVT TP/SL orders due to invalid entry price.")
+            return
+        
+        # Determine the close side (opposite of entry side)
+        close_side = 'sell' if entry_side == 'buy' else 'buy'
+        
+        # Calculate TP and SL prices
+        hundred = Decimal('100')
+        one = Decimal('1')
+        
+        # Place TP order if configured
+        if self.tp_roi is not None:
+            tp_factor = self.tp_roi / hundred
+            if entry_side == 'buy':
+                tp_price = entry_price * (one + tp_factor)
+            else:
+                tp_price = entry_price * (one - tp_factor)
+            
+            # Round to tick size
+            if self.grvt_client:
+                try:
+                    tp_price = self.grvt_client.round_to_tick(tp_price)
+                except Exception as exc:
+                    self.logger.warning(f"⚠️ Failed to round TP price: {exc}")
+            
+            self.logger.info(f"[GRVT] Placing TP limit order: {close_side.upper()} {position_size} @ {tp_price}")
+            
+            try:
+                # Configure the client for the close order
+                self.grvt_client.config.direction = close_side
+                self.grvt_client.config.close_order_side = entry_side
+                self.grvt_client.config.quantity = position_size
+                
+                tp_result = await self.grvt_client.place_open_order(
+                    contract_id=self.grvt_contract_id,
+                    quantity=position_size,
+                    direction=close_side,
+                    price=tp_price
+                )
+                
+                if tp_result.success:
+                    self.logger.info(f"[GRVT] TP order placed successfully: {tp_result.order_id}")
+                else:
+                    self.logger.warning(f"[GRVT] Failed to place TP order: {tp_result.error_message}")
+            except Exception as exc:
+                self.logger.error(f"[GRVT] Error placing TP order: {exc}")
+        
+        # Place SL order if configured
+        if self.sl_roi is not None:
+            sl_factor = self.sl_roi / hundred
+            if entry_side == 'buy':
+                sl_price = entry_price * (one - sl_factor)
+            else:
+                sl_price = entry_price * (one + sl_factor)
+            
+            # Round to tick size
+            if self.grvt_client:
+                try:
+                    sl_price = self.grvt_client.round_to_tick(sl_price)
+                except Exception as exc:
+                    self.logger.warning(f"⚠️ Failed to round SL price: {exc}")
+            
+            self.logger.info(f"[GRVT] Placing SL limit order: {close_side.upper()} {position_size} @ {sl_price}")
+            
+            try:
+                # Configure the client for the close order
+                self.grvt_client.config.direction = close_side
+                self.grvt_client.config.close_order_side = entry_side
+                self.grvt_client.config.quantity = position_size
+                
+                sl_result = await self.grvt_client.place_open_order(
+                    contract_id=self.grvt_contract_id,
+                    quantity=position_size,
+                    direction=close_side,
+                    price=sl_price
+                )
+                
+                if sl_result.success:
+                    self.logger.info(f"[GRVT] SL order placed successfully: {sl_result.order_id}")
+                else:
+                    self.logger.warning(f"[GRVT] Failed to place SL order: {sl_result.error_message}")
+            except Exception as exc:
+                self.logger.error(f"[GRVT] Error placing SL order: {exc}")
+
     async def place_grvt_order(
         self,
         side: str,
@@ -432,6 +522,11 @@ class HedgeBot:
                 'price': order_result.price
             }
             self.grvt_fill_event.set()
+            
+            # Place TP/SL orders after fill
+            if order_result.price and order_result.size:
+                await self.place_grvt_tp_sl_orders(side, order_result.price, order_result.size)
+            
             return self.last_grvt_fill
 
         try:
@@ -443,6 +538,14 @@ class HedgeBot:
                 self.logger.error(f"[GRVT] Failed to cancel order {order_result.order_id}: {cancel_result.error_message}")
             return None
 
+        # Place TP/SL orders after fill via websocket
+        if self.last_grvt_fill and self.last_grvt_fill.get('price') and self.last_grvt_fill.get('size'):
+            await self.place_grvt_tp_sl_orders(
+                self.last_grvt_fill['side'], 
+                self.last_grvt_fill['price'], 
+                self.last_grvt_fill['size']
+            )
+        
         return self.last_grvt_fill
 
     async def place_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
@@ -472,7 +575,18 @@ class HedgeBot:
         total_executed = Decimal('0')
         executed_orders: List[Tuple[str, Any]] = []
 
-        if self.bingx_hedge_order_type == 'limit':
+        # When BINGX_HEDGE_ORDER_TYPE is 'market', execute immediately with market order
+        # When 'limit', try limit first then fall back to market
+        if self.bingx_hedge_order_type == 'market':
+            self.logger.info("[BINGX] Using market order for immediate hedge execution (hedge_order_type='market')")
+            market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
+            if market_result is not None:
+                executed_orders.append(('market', market_result))
+                filled_market = self._extract_filled_size(market_result)
+                if filled_market is None or filled_market <= 0:
+                    filled_market = size
+                total_executed += filled_market
+        elif self.bingx_hedge_order_type == 'limit':
             limit_result = await self._place_bingx_limit_hedge(size, hedge_side, entry_price)
             if limit_result is not None:
                 executed_orders.append(('limit', limit_result))
@@ -503,24 +617,14 @@ class HedgeBot:
                             total_executed += filled_market_remaining
             else:
                 self.logger.info("[BINGX] Limit hedge unavailable; falling back to market order.")
-
-        if self.bingx_hedge_order_type != 'limit' and total_executed == 0:
-            market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
-            if market_result is not None:
-                executed_orders.append(('market', market_result))
-                filled_market = self._extract_filled_size(market_result)
-                if filled_market is None or filled_market <= 0:
-                    filled_market = size
-                total_executed += filled_market
-        elif total_executed == 0:
-            # Limit mode but nothing executed yet (e.g., limit failed completely)
-            market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
-            if market_result is not None:
-                executed_orders.append(('market', market_result))
-                filled_market = self._extract_filled_size(market_result)
-                if filled_market is None or filled_market <= 0:
-                    filled_market = size
-                total_executed += filled_market
+                # Fallback to market if limit fails
+                market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
+                if market_result is not None:
+                    executed_orders.append(('market', market_result))
+                    filled_market = self._extract_filled_size(market_result)
+                    if filled_market is None or filled_market <= 0:
+                        filled_market = size
+                    total_executed += filled_market
 
         if total_executed <= 0:
             self.logger.error("[BINGX] Failed to execute hedge order for %s %s.", hedge_side, size)
@@ -1168,67 +1272,45 @@ class HedgeBot:
             await asyncio.sleep(self.position_close_poll_interval)
 
     async def wait_for_roi(self) -> None:
+        """
+        Wait for ROI targets to be hit. Since we now place TP/SL limit orders on GRVT,
+        this method just waits for position to be closed before continuing.
+        """
         if self.stop_flag:
             return
         if self.tp_roi is None and self.sl_roi is None:
             return
-        if self.current_entry_price is None or self.current_entry_side is None:
-            return
         if abs(self.grvt_position) <= self.position_tolerance:
-            self.logger.info("No active GRVT position to monitor for ROI; skipping.")
+            self.logger.info("No active GRVT position to monitor; skipping ROI wait.")
             return
-        if self.grvt_client is None or self.grvt_contract_id is None:
-            self.logger.warning("⚠️ Cannot wait for ROI without GRVT client or contract id.")
-            return
-
-        entry_price = self.current_entry_price
-        if entry_price <= 0:
-            self.logger.warning("⚠️ Cannot evaluate ROI targets because entry price is non-positive.")
-            return
-
-        hundred = Decimal('100')
+        
+        # Since we place TP/SL orders on GRVT, we just wait for position to be closed
+        # or timeout before continuing to next cycle
         start_time = time.time()
-        self.logger.info("⏳ Waiting for ROI targets before executing opposite GRVT cycle...")
-
+        self.logger.info("⏳ Waiting for GRVT TP/SL orders to fill or timeout...")
+        
         while not self.stop_flag:
-            try:
-                best_bid, best_ask = await self.grvt_client.fetch_bbo_prices(self.grvt_contract_id)
-            except Exception as exc:
-                self.logger.warning(f"⚠️ Failed to fetch GRVT prices while waiting for ROI: {exc}")
-                await asyncio.sleep(self.roi_poll_interval)
-                continue
-
-            reference_price = None
-            roi = None
-            if self.current_entry_side == 'buy' and best_bid and best_bid > 0:
-                reference_price = best_bid
-                roi = (reference_price - entry_price) / entry_price * hundred
-            elif self.current_entry_side == 'sell' and best_ask and best_ask > 0:
-                reference_price = best_ask
-                roi = (entry_price - reference_price) / entry_price * hundred
-
-            if roi is not None:
-                roi_float = float(roi)
-                take_profit_hit = self.tp_roi is not None and roi >= self.tp_roi
-                stop_loss_hit = self.sl_roi is not None and roi <= -self.sl_roi
-
-                if take_profit_hit:
-                    self.last_roi_reason = f"take_profit ({roi_float:.4f}%)"
-                    self.logger.info(f"🎯 ROI take profit reached: {roi_float:.4f}% (target {self.tp_roi}%)")
-                    self._schedule_next_grvt_order_price('take_profit')
-                    return
-
-                if stop_loss_hit:
-                    self.last_roi_reason = f"stop_loss ({roi_float:.4f}%)"
-                    self.logger.info(f"🛑 ROI stop loss reached: {roi_float:.4f}% (threshold -{self.sl_roi}%)")
-                    self._schedule_next_grvt_order_price('stop_loss')
-                    return
-
+            # Check if position is closed
+            current_position = await self.grvt_client.get_signed_position() if self.grvt_client else self.grvt_position
+            
+            if abs(current_position) <= self.position_tolerance:
+                self.logger.info("✅ GRVT position closed (TP/SL filled or manually closed)")
+                self.grvt_position = current_position
+                return
+            
             elapsed = time.time() - start_time
             if elapsed >= self.max_roi_wait:
                 self.last_roi_reason = f"timeout ({elapsed:.1f}s)"
                 self.logger.info(f"⏱️ ROI wait timed out after {elapsed:.1f}s; proceeding to next cycle.")
-                self.pending_grvt_price = None
+                # Cancel any outstanding TP/SL orders before continuing
+                try:
+                    active_orders = await self.grvt_client.get_active_orders(self.grvt_contract_id)
+                    for order in active_orders:
+                        if order.side == self.config.close_order_side:
+                            self.logger.info(f"Cancelling outstanding TP/SL order {order.order_id}")
+                            await self.grvt_client.cancel_order(order.order_id)
+                except Exception as exc:
+                    self.logger.warning(f"Error cancelling TP/SL orders: {exc}")
                 return
 
             await asyncio.sleep(self.roi_poll_interval)

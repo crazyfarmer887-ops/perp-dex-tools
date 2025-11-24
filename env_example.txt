@@ -68,6 +68,12 @@ LOG_FILE=trading_log.csv
 
 TIMEZONE=Asia/Shanghai
 
+# Hedge Mode Configuration
+# For BingX hedge order type: 'market' or 'limit'
+# When 'market': BingX will execute market orders immediately after GRVT fill
+# When 'limit': BingX will use limit orders for hedging
+BINGX_HEDGE_ORDER_TYPE=market
+
 # EdgeX API Endpoints
 EDGEX_BASE_URL=https://pro.edgex.exchange
 EDGEX_WS_URL=wss://quote.edgex.exchange
