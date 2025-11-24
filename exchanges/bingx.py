@@ -113,7 +113,13 @@ class BingxClient(BaseExchangeClient):
                 return _to_decimal(tick)
             precision = self._market.get('precision', {}).get('price')
             if precision is not None:
-                return Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
+                try:
+                    prec_val = Decimal(str(precision))
+                    if prec_val < 1 and prec_val > 0:
+                        return prec_val
+                    return Decimal('1') / (Decimal(10) ** prec_val)
+                except Exception:
+                    pass
         return getattr(self.config, 'tick_size', Decimal('0.01'))
 
     def _quantize_amount(self, amount: Decimal) -> str:
@@ -122,8 +128,20 @@ class BingxClient(BaseExchangeClient):
         precision = self._market.get('precision', {}).get('amount')
         if precision is None:
             return str(amount)
-        step = Decimal('1') / (Decimal(10) ** Decimal(str(precision)))
-        return str(amount.quantize(step, rounding=ROUND_HALF_UP))
+        
+        try:
+            # If precision is integer-like (e.g. 1, 2, 3), it's number of decimals
+            # If precision is small float (e.g. 0.01), it's the step size
+            prec_val = Decimal(str(precision))
+            if prec_val < 1 and prec_val > 0:
+                step = prec_val
+            else:
+                step = Decimal('1') / (Decimal(10) ** prec_val)
+                
+            return str(amount.quantize(step, rounding=ROUND_HALF_UP))
+        except Exception as exc:
+            self.logger.log(f"Quantize amount error (amt={amount}, prec={precision}): {exc}", "WARNING")
+            return str(amount)
 
     def _build_tp_sl_payload(
         self,

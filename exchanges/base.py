@@ -67,11 +67,17 @@ class BaseExchangeClient(ABC):
         self._validate_config()
 
     def round_to_tick(self, price) -> Decimal:
-        price = Decimal(price)
-
-        tick = self.config.tick_size
-        # quantize forces price to be a multiple of tick
-        return price.quantize(tick, rounding=ROUND_HALF_UP)
+        try:
+            price = Decimal(price)
+            tick = self.config.tick_size
+            if tick <= 0:
+                return price
+            # quantize forces price to be a multiple of tick
+            return price.quantize(tick, rounding=ROUND_HALF_UP)
+        except Exception as e:
+            # If basic logging is available via print or similar (since we don't have self.logger easily here without mixin)
+            # We will raise with more info
+            raise ValueError(f"round_to_tick failed for price={price}, tick={self.config.tick_size}: {e}")
 
     @abstractmethod
     def _validate_config(self) -> None:
