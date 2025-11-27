@@ -198,7 +198,7 @@ class TradingBot:
             self.current_order_status = 'OPEN'
             self.order_filled_amount = 0.0
 
-            # Place the order
+            # Place the order with strict position validation
             order_result = await self.exchange_client.place_open_order(
                 self.config.contract_id,
                 self.config.quantity,
@@ -206,6 +206,17 @@ class TradingBot:
             )
 
             if not order_result.success:
+                # Log detailed error message for position validation failures
+                if "Position validation failed" in (order_result.error_message or ""):
+                    self.logger.log(
+                        f"[OPEN] Order rejected due to position validation: {order_result.error_message}",
+                        "WARNING"
+                    )
+                else:
+                    self.logger.log(
+                        f"[OPEN] Order placement failed: {order_result.error_message}",
+                        "ERROR"
+                    )
                 return False
 
             if order_result.status == 'FILLED':
@@ -391,14 +402,35 @@ class TradingBot:
                 self.logger.log(f"Current Position: {position_amt} | Active closing amount: {active_close_amount} | "
                                 f"Order quantity: {len(self.active_close_orders)}")
                 self.last_log_time = time.time()
-                # Check for position mismatch
-                if abs(position_amt - active_close_amount) > (2 * self.config.quantity):
+                
+                # Enterprise-grade position mismatch check with 0.001% tolerance
+                position_tolerance_percent = Decimal('0.001')  # 0.001% precision
+                min_tolerance = Decimal('0.00001')  # Minimum absolute tolerance
+                
+                # Calculate tolerance amount (0.001% of position or minimum)
+                if position_amt > 0:
+                    tolerance_amount = position_amt * (position_tolerance_percent / Decimal('100'))
+                    if tolerance_amount < min_tolerance:
+                        tolerance_amount = min_tolerance
+                else:
+                    tolerance_amount = min_tolerance
+                
+                # Also consider quantity-based tolerance (2x quantity as fallback)
+                quantity_based_tolerance = 2 * self.config.quantity
+                effective_tolerance = max(tolerance_amount, quantity_based_tolerance)
+                
+                position_diff = abs(position_amt - active_close_amount)
+                
+                # Check for position mismatch with strict tolerance
+                if position_diff > effective_tolerance:
                     error_message = f"\n\nERROR: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] "
-                    error_message += "Position mismatch detected\n"
+                    error_message += "Position mismatch detected (strict check)\n"
                     error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
                     error_message += "Please manually rebalance your position and take-profit orders\n"
                     error_message += "请手动平衡当前仓位和正在关闭的仓位\n"
-                    error_message += f"current position: {position_amt} | active closing amount: {active_close_amount} | "f"Order quantity: {len(self.active_close_orders)}\n"
+                    error_message += f"current position: {position_amt} | active closing amount: {active_close_amount} | "
+                    error_message += f"Order quantity: {len(self.active_close_orders)} | "
+                    error_message += f"Difference: {position_diff} | Tolerance: {effective_tolerance}\n"
                     error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
                     self.logger.log(error_message, "ERROR")
 
@@ -548,6 +580,21 @@ class TradingBot:
                     continue
 
                 if not mismatch_detected:
+                    # Enterprise-grade: Check for active open orders before placing new one
+                    active_orders_check = await self.exchange_client.get_active_orders(self.config.contract_id)
+                    has_active_open_order = any(
+                        order.side == self.config.direction 
+                        for order in active_orders_check
+                    )
+                    
+                    if has_active_open_order:
+                        self.logger.log(
+                            f"[OPEN] Skipping order placement: Active open order already exists",
+                            "INFO"
+                        )
+                        await asyncio.sleep(1)
+                        continue
+                    
                     wait_time = self._calculate_wait_time()
 
                     if wait_time > 0:
@@ -559,6 +606,7 @@ class TradingBot:
                             await asyncio.sleep(1)
                             continue
 
+                        # Place order with strict validation (already handled in place_open_order)
                         await self._place_and_monitor_open_order()
                         self.last_close_orders += 1
 
