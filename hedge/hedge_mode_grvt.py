@@ -124,6 +124,10 @@ class HedgeBot:
         # State management
         self.stop_flag = False
         self.order_counter = 0
+        self.position_tolerance = Decimal(os.getenv('GRVT_POSITION_TOLERANCE', '0.0001'))
+        self.position_sync_retries = int(os.getenv('GRVT_POSITION_SYNC_RETRIES', '3'))
+        self.position_sync_delay = float(os.getenv('GRVT_POSITION_SYNC_DELAY', '0.5'))
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
 
         # GRVT state
         self.grvt_client = None
@@ -653,20 +657,28 @@ class HedgeBot:
         else:
             raise Exception(f"Failed to place order: {order_result.error_message}")
 
-    async def place_grvt_post_only_order(self, side: str, quantity: Decimal):
-        """Place a post-only order on GRVT."""
+    async def place_grvt_post_only_order(self, side: str, quantity: Decimal) -> bool:
+        """Place a post-only order on GRVT. Returns True if an order was submitted."""
         if not self.grvt_client:
             raise Exception("GRVT client not initialized")
 
         self.grvt_order_status = None
-        self.logger.info(f"[OPEN] [GRVT] [{side}] Placing GRVT POST-ONLY order")
-        order_id, order_price = await self.place_bbo_order(side, quantity)
+        trade_quantity = await self._determine_grvt_trade_quantity(side, quantity)
+        if trade_quantity <= Decimal('0'):
+            self.logger.info(f"[GRVT] [{side}] Position guard skipped order (current={self.grvt_position}).")
+            self.order_execution_complete = True
+            self.waiting_for_lighter_fill = False
+            return False
+
+        self.logger.info(f"[OPEN] [GRVT] [{side}] Placing GRVT POST-ONLY order size={trade_quantity}")
+        order_id, order_price = await self.place_bbo_order(side, trade_quantity)
 
         start_time = time.time()
+        filled = False
         while not self.stop_flag:
             if self.grvt_order_status == 'CANCELED':
                 self.grvt_order_status = 'NEW'
-                order_id, order_price = await self.place_bbo_order(side, quantity)
+                order_id, order_price = await self.place_bbo_order(side, trade_quantity)
                 start_time = time.time()
                 await asyncio.sleep(0.5)
             elif self.grvt_order_status in ['NEW', 'OPEN', 'PENDING', 'CANCELING', 'PARTIALLY_FILLED']:
@@ -693,6 +705,8 @@ class HedgeBot:
                         self.logger.info(f"Order {order_id} is at best bid/ask, waiting for fill")
                         start_time = time.time()
             elif self.grvt_order_status == 'FILLED':
+                await self.sync_grvt_position(f"post-{side}")
+                filled = True
                 break
             else:
                 if self.grvt_order_status is not None:
@@ -700,6 +714,8 @@ class HedgeBot:
                     break
                 else:
                     await asyncio.sleep(0.5)
+
+        return filled
 
 
     def handle_grvt_order_update(self, order_data):
@@ -783,6 +799,157 @@ class HedgeBot:
 
         if messages:
             self.logger.info(f"🎯 ROI targets set ({side.upper()}): {', '.join(messages)}")
+
+    def _within_tolerance(self, value: Decimal, target: Decimal = Decimal('0')) -> bool:
+        """Check if a value is within the configured tolerance of a target."""
+        try:
+            return abs(Decimal(value) - Decimal(target)) <= self.position_tolerance
+        except Exception:
+            return False
+
+    async def sync_grvt_position(self, context: str = "") -> Decimal:
+        """
+        Refresh GRVT position from the exchange to ensure local state is aligned.
+        Returns the latest signed position.
+        """
+        if not self.grvt_client or not self.grvt_contract_id:
+            return self.grvt_position
+
+        attempt = 0
+        last_error: Optional[Exception] = None
+        while attempt < self.position_sync_retries and not self.stop_flag:
+            attempt += 1
+            try:
+                signed_position = await self.grvt_client.get_signed_position()
+                if signed_position != self.grvt_position:
+                    context_msg = f" ({context})" if context else ""
+                    self.logger.info(
+                        f"🔁 GRVT position sync{context_msg}: {self.grvt_position} -> {signed_position}"
+                    )
+                    self.grvt_position = signed_position
+                return self.grvt_position
+            except Exception as exc:
+                last_error = exc
+                self.logger.warning(
+                    f"⚠️ Failed to sync GRVT position (attempt {attempt}/{self.position_sync_retries}): {exc}"
+                )
+                await asyncio.sleep(self.position_sync_delay)
+
+        if last_error:
+            self.logger.error(f"❌ Unable to sync GRVT position after retries: {last_error}")
+        return self.grvt_position
+
+    async def _determine_grvt_trade_quantity(self, side: str, requested_quantity: Decimal) -> Decimal:
+        """Compute the actual trade size after validating current GRVT exposure."""
+        quantity = Decimal(requested_quantity)
+        if quantity <= Decimal('0'):
+            return Decimal('0')
+
+        await self.sync_grvt_position(f"guard-{side}")
+        current_position = self.grvt_position
+        tolerance = self.position_tolerance
+        normalized_side = side.lower()
+
+        if normalized_side == 'buy':
+            if current_position > tolerance:
+                self.logger.warning(
+                    f"⚠️ Existing GRVT long position {current_position} detected before BUY; skipping new order."
+                )
+                return Decimal('0')
+            if current_position < -tolerance:
+                adjusted = quantity + abs(current_position)
+                self.logger.warning(
+                    f"⚠️ Detected unexpected GRVT short {current_position}; increasing BUY size to {adjusted}."
+                )
+                return adjusted
+            if current_position > Decimal('0'):
+                adjusted = quantity - current_position
+                if adjusted <= tolerance:
+                    self.logger.info(
+                        f"BUY request {quantity} reduced to zero by existing position {current_position}."
+                    )
+                    return Decimal('0')
+                self.logger.info(
+                    f"Adjusting BUY size from {quantity} to {adjusted} due to active position {current_position}."
+                )
+                return adjusted
+            return quantity
+
+        # SELL logic
+        if current_position < -tolerance:
+            self.logger.warning(
+                f"⚠️ GRVT position already short {current_position}; skipping SELL to avoid over-hedging."
+            )
+            return Decimal('0')
+        if current_position <= tolerance:
+            self.logger.info("No GRVT long position to close; SELL request skipped.")
+            return Decimal('0')
+
+        adjusted_sell = min(current_position, quantity)
+        if adjusted_sell < quantity:
+            self.logger.info(
+                f"Reducing SELL size from {quantity} to {adjusted_sell} to match current position {current_position}."
+            )
+        if adjusted_sell <= tolerance:
+            return Decimal('0')
+        return adjusted_sell
+
+    async def _force_flatten_positions(self, context: str) -> bool:
+        """Ensure GRVT exposure is flat before continuing."""
+        await self.sync_grvt_position(context)
+        if self._within_tolerance(self.grvt_position):
+            return True
+
+        side = 'sell' if self.grvt_position > 0 else 'buy'
+        quantity = abs(self.grvt_position)
+        self.logger.warning(
+            f"⚠️ {context}: Forcing GRVT {side.upper()} {quantity} to flatten residual position."
+        )
+        outcome = await self._execute_grvt_cycle(side, quantity, f"FORCE_CLOSE/{context}")
+        if outcome is None:
+            return False
+        await self.sync_grvt_position(f"{context}-post")
+        return self._within_tolerance(self.grvt_position)
+
+    async def _execute_grvt_cycle(self, side: str, quantity: Decimal, label: str) -> Optional[bool]:
+        """
+        Execute a GRVT order followed by the Lighter hedge flow.
+        Returns:
+            None  -> fatal error during placement
+            False -> no order submitted (position guard)
+            True  -> order submitted (success path)
+        """
+        await self.sync_grvt_position(f"{label}-start")
+        self.logger.info(f"[{label}] Initiating GRVT {side.upper()} for {quantity}")
+        self.order_execution_complete = False
+        self.waiting_for_lighter_fill = False
+
+        try:
+            submitted = await self.place_grvt_post_only_order(side, quantity)
+        except Exception as exc:
+            self.logger.error(f"⚠️ Error placing GRVT order for {label}: {exc}")
+            self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+            return None
+
+        if not submitted:
+            return False
+
+        start_time = time.time()
+        while not self.order_execution_complete and not self.stop_flag:
+            if self.waiting_for_lighter_fill:
+                await self.place_lighter_market_order(
+                    self.current_lighter_side,
+                    self.current_lighter_quantity,
+                    self.current_lighter_price
+                )
+                break
+
+            await asyncio.sleep(0.01)
+            if time.time() - start_time > 180:
+                self.logger.error(f"❌ Timeout waiting for {label} trade completion")
+                break
+
+        return True
 
     async def wait_for_roi(self) -> None:
         """Wait until ROI-based take profit or stop loss is reached before proceeding."""
@@ -1087,9 +1254,20 @@ class HedgeBot:
             return
 
         await asyncio.sleep(5)
+        self.loop = asyncio.get_running_loop()
+        await self.sync_grvt_position("startup")
 
         iterations = 0
-        while iterations < self.iterations and not self.stop_flag:
+        while not self.stop_flag and iterations < self.iterations:
+            await self.sync_grvt_position("iteration-start")
+            if not self._within_tolerance(self.grvt_position):
+                flattened = await self._force_flatten_positions("pre-loop")
+                if not flattened:
+                    self.logger.error("❌ Unable to flatten GRVT position before starting new cycle. Stopping.")
+                    break
+                await asyncio.sleep(1)
+                continue
+
             iterations += 1
             self.logger.info("-----------------------------------------------")
             self.logger.info(f"🔄 Trading loop iteration {iterations}")
@@ -1097,110 +1275,39 @@ class HedgeBot:
 
             self.logger.info(f"[STEP 1] GRVT position: {self.grvt_position} | Lighter position: {self.lighter_position}")
 
-            if abs(self.grvt_position + self.lighter_position) > self.order_quantity*2:
+            if abs(self.grvt_position + self.lighter_position) > self.order_quantity * 2:
                 self.logger.error(f"❌ Position diff is too large: {self.grvt_position + self.lighter_position}")
                 break
 
-            self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
-            try:
-                # Determine side based on some logic (for now, alternate)
-                side = 'buy'
-                await self.place_grvt_post_only_order(side, self.order_quantity)
-            except Exception as e:
-                self.logger.error(f"⚠️ Error in trading loop: {e}")
-                self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+            step1_result = await self._execute_grvt_cycle('buy', self.order_quantity, "STEP 1")
+            if step1_result is None:
                 break
 
-            start_time = time.time()
-            while not self.order_execution_complete and not self.stop_flag:
-                # Check if GRVT order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
-                    )
-                    break
-
-                await asyncio.sleep(0.01)
-                if time.time() - start_time > 180:
-                    self.logger.error("❌ Timeout waiting for trade completion")
-                    break
+            if step1_result and not self.stop_flag:
+                if self.sleep_time > 0:
+                    self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 1...")
+                    await asyncio.sleep(self.sleep_time)
+                if not self.stop_flag:
+                    await self.wait_for_roi()
 
             if self.stop_flag:
                 break
 
-            # Sleep after step 1
-            if self.sleep_time > 0:
-                self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 1...")
-                await asyncio.sleep(self.sleep_time)
-
-            if not self.stop_flag:
-                await self.wait_for_roi()
-
-            # Close position
             self.logger.info(f"[STEP 2] GRVT position: {self.grvt_position} | Lighter position: {self.lighter_position}")
-            self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
-            try:
-                # Determine side based on some logic (for now, alternate)
-                side = 'sell'
-                await self.place_grvt_post_only_order(side, self.order_quantity)
-            except Exception as e:
-                self.logger.error(f"⚠️ Error in trading loop: {e}")
-                self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+            step2_result = await self._execute_grvt_cycle('sell', self.order_quantity, "STEP 2")
+            if step2_result is None:
                 break
 
-            while not self.order_execution_complete and not self.stop_flag:
-                # Check if GRVT order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
-                    )
-                    break
-
-                await asyncio.sleep(0.01)
-                if time.time() - start_time > 180:
-                    self.logger.error("❌ Timeout waiting for trade completion")
-                    break
-
-            # Close remaining position
             self.logger.info(f"[STEP 3] GRVT position: {self.grvt_position} | Lighter position: {self.lighter_position}")
-            self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
-            if self.grvt_position == 0:
+            await self.sync_grvt_position("pre-step3")
+            if self._within_tolerance(self.grvt_position):
                 continue
-            elif self.grvt_position > 0:
-                side = 'sell'
-            else:
-                side = 'buy'
 
-            try:
-                # Determine side based on some logic (for now, alternate)
-                await self.place_grvt_post_only_order(side, abs(self.grvt_position))
-            except Exception as e:
-                self.logger.error(f"⚠️ Error in trading loop: {e}")
-                self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+            residual_side = 'sell' if self.grvt_position > 0 else 'buy'
+            residual_quantity = abs(self.grvt_position)
+            step3_result = await self._execute_grvt_cycle(residual_side, residual_quantity, "STEP 3")
+            if step3_result is None:
                 break
-
-            # Wait for order to be filled via WebSocket
-            while not self.order_execution_complete and not self.stop_flag:
-                # Check if GRVT order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
-                    )
-                    break
-
-                await asyncio.sleep(0.01)
-                if time.time() - start_time > 180:
-                    self.logger.error("❌ Timeout waiting for trade completion")
-                    break
 
     async def run(self):
         """Run the hedge bot."""
