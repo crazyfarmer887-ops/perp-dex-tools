@@ -72,6 +72,11 @@ class HedgeBot:
         self.max_roi_wait: float = max(self.fill_timeout * 60, 120)
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
+        
+        # Enhanced position tracking
+        self._position_lock = asyncio.Lock()
+        self._grvt_order_in_flight = False
+        self._bingx_order_in_flight = False
 
         config_warnings: List[str] = []
 
@@ -345,22 +350,34 @@ class HedgeBot:
         order_id = message.get('order_id')
 
         if status == 'FILLED':
-            if side == 'buy':
-                self.grvt_position += filled_size
+            # Use lock to ensure atomic position update
+            async def update_position():
+                async with self._position_lock:
+                    pre_position = self.grvt_position
+                    
+                    if side == 'buy':
+                        self.grvt_position += filled_size
+                    else:
+                        self.grvt_position -= filled_size
+
+                    self.last_grvt_fill = {
+                        'order_id': order_id,
+                        'side': side,
+                        'size': filled_size,
+                        'price': price
+                    }
+
+                    self.logger.info(
+                        f"[GRVT] FILLED {side.upper()} {filled_size} @ {price} | "
+                        f"Position: {pre_position} -> {self.grvt_position}"
+                    )
+                    self.grvt_fill_event.set()
+            
+            # Schedule the coroutine if we're in an event loop
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(update_position(), self.loop)
             else:
-                self.grvt_position -= filled_size
-
-            self.last_grvt_fill = {
-                'order_id': order_id,
-                'side': side,
-                'size': filled_size,
-                'price': price
-            }
-
-            self.logger.info(
-                f"[GRVT] FILLED {side.upper()} {filled_size} @ {price} | Position={self.grvt_position}"
-            )
-            self.grvt_fill_event.set()
+                self.logger.warning("[GRVT] Cannot update position - no event loop available")
 
     async def setup_grvt_websocket(self) -> None:
         assert self.grvt_client is not None
@@ -470,154 +487,190 @@ class HedgeBot:
         assert self.grvt_client is not None
         assert self.grvt_contract_id is not None
 
-        self.grvt_client.config.direction = side
-        self.grvt_client.config.close_order_side = 'sell' if side == 'buy' else 'buy'
-
-        self.grvt_fill_event.clear()
-        self.last_grvt_fill = None
-
-        if price_override is not None:
-            self.logger.info(f"[GRVT] Using override price {price_override} for {side} order")
-
-        order_quantity = quantity if quantity is not None else self.order_quantity
-        if order_quantity is None or order_quantity <= 0:
-            self.logger.warning(
-                "[GRVT] Invalid %s order quantity=%s; skipping order placement.",
-                side,
-                order_quantity
-            )
-            return None
-
-        self.grvt_client.config.quantity = order_quantity
-
-        order_result = await self.grvt_client.place_open_order(
-            contract_id=self.grvt_contract_id,
-            quantity=order_quantity,
-            direction=side,
-            price=price_override
-        )
-
-        if not order_result.success or not order_result.order_id:
-            self.logger.error(f"[GRVT] Failed to place {side} order: {order_result.error_message}")
-            return None
-
-        self.logger.info(
-            "[GRVT] Order placed %s (%s) qty=%s @ %s",
-            order_result.order_id,
-            side,
-            order_quantity,
-            order_result.price
-        )
-
-        if order_result.status == 'FILLED':
-            if order_result.size is not None:
-                if side == 'buy':
-                    self.grvt_position += order_result.size
-                else:
-                    self.grvt_position -= order_result.size
-            self.last_grvt_fill = {
-                'order_id': order_result.order_id,
-                'side': side,
-                'size': order_result.size,
-                'price': order_result.price
-            }
-            self.grvt_fill_event.set()
-            
-            # Place TP/SL orders after fill
-            if order_result.price and order_result.size:
-                await self.place_grvt_tp_sl_orders(side, order_result.price, order_result.size)
-            
-            return self.last_grvt_fill
+        # Check if order already in flight
+        async with self._position_lock:
+            if self._grvt_order_in_flight:
+                self.logger.warning(
+                    f"[GRVT] Order already in flight, rejecting new {side} order request"
+                )
+                return None
+            self._grvt_order_in_flight = True
 
         try:
-            await asyncio.wait_for(self.grvt_fill_event.wait(), timeout=self.fill_timeout)
-        except asyncio.TimeoutError:
-            self.logger.warning(f"[GRVT] {side} order {order_result.order_id} timed out, cancelling")
-            cancel_result = await self.grvt_client.cancel_order(order_result.order_id)
-            if not cancel_result.success:
-                self.logger.error(f"[GRVT] Failed to cancel order {order_result.order_id}: {cancel_result.error_message}")
-            return None
-
-        # Place TP/SL orders after fill via websocket
-        if self.last_grvt_fill and self.last_grvt_fill.get('price') and self.last_grvt_fill.get('size'):
-            await self.place_grvt_tp_sl_orders(
-                self.last_grvt_fill['side'], 
-                self.last_grvt_fill['price'], 
-                self.last_grvt_fill['size']
+            # Sync position before placing order
+            pre_position = await self.grvt_client._sync_position_with_exchange()
+            self.grvt_position = pre_position
+            
+            self.logger.info(
+                f"[GRVT] Pre-order position check: {pre_position}"
             )
-        
-        return self.last_grvt_fill
+
+            self.grvt_client.config.direction = side
+            self.grvt_client.config.close_order_side = 'sell' if side == 'buy' else 'buy'
+
+            self.grvt_fill_event.clear()
+            self.last_grvt_fill = None
+
+            if price_override is not None:
+                self.logger.info(f"[GRVT] Using override price {price_override} for {side} order")
+
+            order_quantity = quantity if quantity is not None else self.order_quantity
+            if order_quantity is None or order_quantity <= 0:
+                self.logger.warning(
+                    "[GRVT] Invalid %s order quantity=%s; skipping order placement.",
+                    side,
+                    order_quantity
+                )
+                return None
+
+            self.grvt_client.config.quantity = order_quantity
+
+            order_result = await self.grvt_client.place_open_order(
+                contract_id=self.grvt_contract_id,
+                quantity=order_quantity,
+                direction=side,
+                price=price_override
+            )
+
+            if not order_result.success or not order_result.order_id:
+                self.logger.error(f"[GRVT] Failed to place {side} order: {order_result.error_message}")
+                return None
+
+            self.logger.info(
+                "[GRVT] Order placed %s (%s) qty=%s @ %s",
+                order_result.order_id,
+                side,
+                order_quantity,
+                order_result.price
+            )
+
+            if order_result.status == 'FILLED':
+                async with self._position_lock:
+                    if order_result.size is not None:
+                        if side == 'buy':
+                            self.grvt_position += order_result.size
+                        else:
+                            self.grvt_position -= order_result.size
+                    self.last_grvt_fill = {
+                        'order_id': order_result.order_id,
+                        'side': side,
+                        'size': order_result.size,
+                        'price': order_result.price
+                    }
+                    self.grvt_fill_event.set()
+                
+                # Place TP/SL orders after fill
+                if order_result.price and order_result.size:
+                    await self.place_grvt_tp_sl_orders(side, order_result.price, order_result.size)
+                
+                # Verify position after fill
+                post_position = await self.grvt_client._sync_position_with_exchange()
+                self.grvt_position = post_position
+                
+                expected_change = order_result.size if side == 'buy' else -order_result.size
+                actual_change = post_position - pre_position
+                
+                if abs(actual_change - expected_change) > Decimal('0.0001'):
+                    self.logger.warning(
+                        f"[GRVT] Position mismatch after fill! "
+                        f"Expected change: {expected_change}, Actual: {actual_change}, "
+                        f"Pre: {pre_position}, Post: {post_position}"
+                    )
+                
+                return self.last_grvt_fill
+
+            try:
+                await asyncio.wait_for(self.grvt_fill_event.wait(), timeout=self.fill_timeout)
+                
+                # Verify position after websocket fill
+                post_position = await self.grvt_client._sync_position_with_exchange()
+                self.grvt_position = post_position
+                
+                if self.last_grvt_fill:
+                    expected_change = self.last_grvt_fill['size'] if self.last_grvt_fill['side'] == 'buy' else -self.last_grvt_fill['size']
+                    actual_change = post_position - pre_position
+                    
+                    if abs(actual_change - expected_change) > Decimal('0.0001'):
+                        self.logger.warning(
+                            f"[GRVT] Position mismatch after websocket fill! "
+                            f"Expected change: {expected_change}, Actual: {actual_change}"
+                        )
+                
+            except asyncio.TimeoutError:
+                self.logger.warning(f"[GRVT] {side} order {order_result.order_id} timed out, cancelling")
+                cancel_result = await self.grvt_client.cancel_order(order_result.order_id)
+                if not cancel_result.success:
+                    self.logger.error(f"[GRVT] Failed to cancel order {order_result.order_id}: {cancel_result.error_message}")
+                return None
+
+            # Place TP/SL orders after fill via websocket
+            if self.last_grvt_fill and self.last_grvt_fill.get('price') and self.last_grvt_fill.get('size'):
+                await self.place_grvt_tp_sl_orders(
+                    self.last_grvt_fill['side'], 
+                    self.last_grvt_fill['price'], 
+                    self.last_grvt_fill['size']
+                )
+            
+            return self.last_grvt_fill
+            
+        finally:
+            # Always clear the in-flight flag
+            async with self._position_lock:
+                self._grvt_order_in_flight = False
 
     async def place_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
         assert self.bingx_client is not None
         assert self.bingx_contract_id is not None
 
-        side = str(fill['side']).lower()
+        # Check if BingX order already in flight
+        async with self._position_lock:
+            if self._bingx_order_in_flight:
+                self.logger.warning(
+                    "[BINGX] Hedge order already in flight, waiting..."
+                )
+                # Wait briefly and retry
+                await asyncio.sleep(0.5)
+                if self._bingx_order_in_flight:
+                    self.logger.error("[BINGX] Cannot place hedge - order still in flight")
+                    return False
+            self._bingx_order_in_flight = True
+
         try:
-            size = Decimal(str(fill['size']))
-        except (InvalidOperation, ValueError, TypeError):
-            self.logger.error(f"[BINGX] Invalid hedge size from fill: {fill.get('size')}")
-            return False
-        if size <= 0:
-            self.logger.warning("[BINGX] Hedge size is non-positive; skipping hedge.")
-            return False
+            # Sync BingX position before hedging
+            pre_bingx_position = await self.bingx_client.get_signed_position()
+            self.bingx_position = pre_bingx_position
+            
+            self.logger.info(
+                f"[BINGX] Pre-hedge position check: {pre_bingx_position}"
+            )
 
-        hedge_side = 'sell' if side == 'buy' else 'buy'
-        self.bingx_client.config.direction = hedge_side
-        self.bingx_client.config.close_order_side = 'buy' if hedge_side == 'sell' else 'sell'
+            side = str(fill['side']).lower()
+            try:
+                size = Decimal(str(fill['size']))
+            except (InvalidOperation, ValueError, TypeError):
+                self.logger.error(f"[BINGX] Invalid hedge size from fill: {fill.get('size')}")
+                return False
+            if size <= 0:
+                self.logger.warning("[BINGX] Hedge size is non-positive; skipping hedge.")
+                return False
 
-        entry_price: Optional[Decimal]
-        try:
-            entry_price = Decimal(str(fill.get('price')))
-        except (InvalidOperation, ValueError, TypeError):
-            entry_price = None
+            hedge_side = 'sell' if side == 'buy' else 'buy'
+            self.bingx_client.config.direction = hedge_side
+            self.bingx_client.config.close_order_side = 'buy' if hedge_side == 'sell' else 'sell'
 
-        total_executed = Decimal('0')
-        executed_orders: List[Tuple[str, Any]] = []
+            entry_price: Optional[Decimal]
+            try:
+                entry_price = Decimal(str(fill.get('price')))
+            except (InvalidOperation, ValueError, TypeError):
+                entry_price = None
 
-        # When BINGX_HEDGE_ORDER_TYPE is 'market', execute immediately with market order
-        # When 'limit', try limit first then fall back to market
-        if self.bingx_hedge_order_type == 'market':
-            self.logger.info("[BINGX] Using market order for immediate hedge execution (hedge_order_type='market')")
-            market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
-            if market_result is not None:
-                executed_orders.append(('market', market_result))
-                filled_market = self._extract_filled_size(market_result)
-                if filled_market is None or filled_market <= 0:
-                    filled_market = size
-                total_executed += filled_market
-        elif self.bingx_hedge_order_type == 'limit':
-            limit_result = await self._place_bingx_limit_hedge(size, hedge_side, entry_price)
-            if limit_result is not None:
-                executed_orders.append(('limit', limit_result))
-                filled_limit = self._extract_filled_size(limit_result)
-                if filled_limit is None:
-                    filled_limit = Decimal('0')
-                if filled_limit > 0:
-                    total_executed += filled_limit
-                if filled_limit < size:
-                    remaining = size - filled_limit
-                    if remaining > 0:
-                        self.logger.warning(
-                            "[BINGX] Limit hedge filled %s of %s; executing market hedge for remaining %s.",
-                            filled_limit,
-                            size,
-                            remaining
-                        )
-                        market_remaining = await self._place_bingx_market_hedge(
-                            remaining,
-                            hedge_side,
-                            entry_price
-                        )
-                        if market_remaining is not None:
-                            executed_orders.append(('market', market_remaining))
-                            filled_market_remaining = self._extract_filled_size(market_remaining)
-                            if filled_market_remaining is None or filled_market_remaining <= 0:
-                                filled_market_remaining = remaining
-                            total_executed += filled_market_remaining
-            else:
-                self.logger.info("[BINGX] Limit hedge unavailable; falling back to market order.")
-                # Fallback to market if limit fails
+            total_executed = Decimal('0')
+            executed_orders: List[Tuple[str, Any]] = []
+
+            # When BINGX_HEDGE_ORDER_TYPE is 'market', execute immediately with market order
+            # When 'limit', try limit first then fall back to market
+            if self.bingx_hedge_order_type == 'market':
+                self.logger.info("[BINGX] Using market order for immediate hedge execution (hedge_order_type='market')")
                 market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
                 if market_result is not None:
                     executed_orders.append(('market', market_result))
@@ -625,36 +678,96 @@ class HedgeBot:
                     if filled_market is None or filled_market <= 0:
                         filled_market = size
                     total_executed += filled_market
+            elif self.bingx_hedge_order_type == 'limit':
+                limit_result = await self._place_bingx_limit_hedge(size, hedge_side, entry_price)
+                if limit_result is not None:
+                    executed_orders.append(('limit', limit_result))
+                    filled_limit = self._extract_filled_size(limit_result)
+                    if filled_limit is None:
+                        filled_limit = Decimal('0')
+                    if filled_limit > 0:
+                        total_executed += filled_limit
+                    if filled_limit < size:
+                        remaining = size - filled_limit
+                        if remaining > 0:
+                            self.logger.warning(
+                                "[BINGX] Limit hedge filled %s of %s; executing market hedge for remaining %s.",
+                                filled_limit,
+                                size,
+                                remaining
+                            )
+                            market_remaining = await self._place_bingx_market_hedge(
+                                remaining,
+                                hedge_side,
+                                entry_price
+                            )
+                            if market_remaining is not None:
+                                executed_orders.append(('market', market_remaining))
+                                filled_market_remaining = self._extract_filled_size(market_remaining)
+                                if filled_market_remaining is None or filled_market_remaining <= 0:
+                                    filled_market_remaining = remaining
+                                total_executed += filled_market_remaining
+                else:
+                    self.logger.info("[BINGX] Limit hedge unavailable; falling back to market order.")
+                    # Fallback to market if limit fails
+                    market_result = await self._place_bingx_market_hedge(size, hedge_side, entry_price)
+                    if market_result is not None:
+                        executed_orders.append(('market', market_result))
+                        filled_market = self._extract_filled_size(market_result)
+                        if filled_market is None or filled_market <= 0:
+                            filled_market = size
+                        total_executed += filled_market
 
-        if total_executed <= 0:
-            self.logger.error("[BINGX] Failed to execute hedge order for %s %s.", hedge_side, size)
-            return False
+            if total_executed <= 0:
+                self.logger.error("[BINGX] Failed to execute hedge order for %s %s.", hedge_side, size)
+                return False
 
-        for order_type, order_result in executed_orders:
-            filled_size = self._extract_filled_size(order_result)
-            if filled_size is None or filled_size <= 0:
-                filled_size = order_result.size or Decimal('0')
+            for order_type, order_result in executed_orders:
+                filled_size = self._extract_filled_size(order_result)
+                if filled_size is None or filled_size <= 0:
+                    filled_size = order_result.size or Decimal('0')
+                self.logger.info(
+                    "[BINGX] %s %s %s @ %s | status=%s",
+                    order_type.upper(),
+                    hedge_side.upper(),
+                    filled_size,
+                    order_result.price,
+                    order_result.status,
+                )
+
+            async with self._position_lock:
+                if hedge_side == 'buy':
+                    self.bingx_position += total_executed
+                else:
+                    self.bingx_position -= total_executed
+
             self.logger.info(
-                "[BINGX] %s %s %s @ %s | status=%s",
-                order_type.upper(),
+                "[BINGX] Hedge complete | side=%s | executed=%s | position=%s",
                 hedge_side.upper(),
-                filled_size,
-                order_result.price,
-                order_result.status,
+                total_executed,
+                self.bingx_position
             )
-
-        if hedge_side == 'buy':
-            self.bingx_position += total_executed
-        else:
-            self.bingx_position -= total_executed
-
-        self.logger.info(
-            "[BINGX] Hedge complete | side=%s | executed=%s | position=%s",
-            hedge_side.upper(),
-            total_executed,
-            self.bingx_position
-        )
-        return True
+            
+            # Verify BingX position after hedge
+            post_bingx_position = await self.bingx_client.get_signed_position()
+            self.bingx_position = post_bingx_position
+            
+            expected_change = total_executed if hedge_side == 'buy' else -total_executed
+            actual_change = post_bingx_position - pre_bingx_position
+            
+            if abs(actual_change - expected_change) > Decimal('0.0001'):
+                self.logger.warning(
+                    f"[BINGX] Position mismatch after hedge! "
+                    f"Expected change: {expected_change}, Actual: {actual_change}, "
+                    f"Pre: {pre_bingx_position}, Post: {post_bingx_position}"
+                )
+            
+            return True
+            
+        finally:
+            # Always clear the in-flight flag
+            async with self._position_lock:
+                self._bingx_order_in_flight = False
 
     async def _ensure_bingx_hedge(self, fill: Dict[str, Any]) -> bool:
         attempts = 0
@@ -1031,10 +1144,23 @@ class HedgeBot:
         return grvt_position, bingx_position
 
     async def _sync_positions_from_exchanges(self) -> Tuple[Decimal, Decimal]:
-        grvt_position, bingx_position = await self._fetch_signed_positions()
-        self.grvt_position = grvt_position
-        self.bingx_position = bingx_position
-        return grvt_position, bingx_position
+        async with self._position_lock:
+            grvt_position, bingx_position = await self._fetch_signed_positions()
+            
+            # Log if there's a significant difference
+            if abs(grvt_position - self.grvt_position) > Decimal('0.0001'):
+                self.logger.info(
+                    f"[SYNC] GRVT position adjusted: {self.grvt_position} -> {grvt_position}"
+                )
+            if abs(bingx_position - self.bingx_position) > Decimal('0.0001'):
+                self.logger.info(
+                    f"[SYNC] BingX position adjusted: {self.bingx_position} -> {bingx_position}"
+                )
+            
+            self.grvt_position = grvt_position
+            self.bingx_position = bingx_position
+            
+            return grvt_position, bingx_position
 
     async def _place_grvt_limit_close(self, position: Decimal) -> bool:
         assert self.grvt_client is not None
@@ -1316,6 +1442,18 @@ class HedgeBot:
             await asyncio.sleep(self.roi_poll_interval)
 
     async def execute_cycle(self, side: str) -> bool:
+        # Ensure positions are synced before starting cycle
+        await self._sync_positions_from_exchanges()
+        
+        # Check for any orders in flight
+        async with self._position_lock:
+            if self._grvt_order_in_flight or self._bingx_order_in_flight:
+                self.logger.warning(
+                    f"[CYCLE] Cannot start {side} cycle - orders in flight "
+                    f"(GRVT: {self._grvt_order_in_flight}, BingX: {self._bingx_order_in_flight})"
+                )
+                return False
+        
         price_override = None
         if self.pending_grvt_price and self.pending_grvt_price[0] == side:
             price_override = self.pending_grvt_price[1]

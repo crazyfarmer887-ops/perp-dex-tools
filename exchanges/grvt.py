@@ -51,6 +51,13 @@ class GrvtClient(BaseExchangeClient):
         self._order_update_handler = None
         self._ws_client = None
         self._order_update_callback = None
+        
+        # Position tracking with locks for thread-safety
+        self._position_lock = asyncio.Lock()
+        self._tracked_position = Decimal('0')
+        self._pending_orders = {}  # Track pending orders by ID
+        self._order_lock = asyncio.Lock()
+        self._last_position_sync = 0
 
     def _initialize_grvt_clients(self) -> None:
         """Initialize the GRVT REST and WebSocket clients."""
@@ -305,139 +312,242 @@ class GrvtClient(BaseExchangeClient):
         direction: str,
         price: Optional[Decimal] = None
     ) -> OrderResult:
-        """Place an open order with GRVT."""
-        attempt = 0
-        max_retries = 20  # Prevent infinite loops
-        
-        while attempt < max_retries:
-            attempt += 1
-            if attempt % 5 == 0:
-                self.logger.log(f"[OPEN] Attempt {attempt} to place order", "INFO")
-                active_orders = await self.get_active_orders(contract_id)
-                active_open_orders = 0
-                for order in active_orders:
-                    if order.side == self.config.direction:
-                        active_open_orders += 1
-                if active_open_orders > 1:
-                    self.logger.log(f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}", "ERROR")
-                    raise Exception(f"[OPEN] ERROR: Active open orders abnormal: {active_open_orders}")
+        """Place an open order with GRVT with strict position tracking."""
+        async with self._order_lock:
+            # Verify current position before placing order
+            await self._sync_position_with_exchange()
+            
+            # Check for duplicate pending orders
+            active_orders = await self.get_active_orders(contract_id)
+            active_open_orders = [o for o in active_orders if o.side == direction]
+            
+            if len(active_open_orders) > 0:
+                self.logger.log(
+                    f"[OPEN] WARNING: {len(active_open_orders)} active {direction} orders already exist. "
+                    f"Checking if we should proceed...",
+                    "WARNING"
+                )
+                # Allow only if quantity matches exactly (retry scenario)
+                if len(active_open_orders) >= 2:
+                    self.logger.log(
+                        f"[OPEN] ERROR: Too many active {direction} orders ({len(active_open_orders)}). Aborting.",
+                        "ERROR"
+                    )
+                    return OrderResult(
+                        success=False, 
+                        error_message=f"Too many active {direction} orders: {len(active_open_orders)}"
+                    )
+            
+            attempt = 0
+            max_retries = 20  # Prevent infinite loops
+            
+            while attempt < max_retries:
+                attempt += 1
+                
+                # Periodic safety check
+                if attempt % 5 == 0:
+                    self.logger.log(f"[OPEN] Attempt {attempt} to place order", "INFO")
+                    await self._sync_position_with_exchange()
+                    
+                    # Re-check active orders
+                    active_orders = await self.get_active_orders(contract_id)
+                    active_open_orders = [o for o in active_orders if o.side == direction]
+                    
+                    if len(active_open_orders) > 1:
+                        self.logger.log(
+                            f"[OPEN] ERROR: Active {direction} orders abnormal: {len(active_open_orders)}", 
+                            "ERROR"
+                        )
+                        return OrderResult(
+                            success=False,
+                            error_message=f"Active {direction} orders abnormal: {len(active_open_orders)}"
+                        )
 
-            # Get current market prices
-            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+                # Get current market prices
+                best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
 
-            if best_bid <= 0 or best_ask <= 0:
-                return OrderResult(success=False, error_message='Invalid bid/ask prices')
+                if best_bid <= 0 or best_ask <= 0:
+                    await asyncio.sleep(0.1)
+                    continue
 
-            # Determine order side and price
-            if direction == 'buy':
-                if price is not None:
-                    order_price = Decimal(price)
-                    if order_price >= best_ask:
+                # Determine order side and price
+                if direction == 'buy':
+                    if price is not None:
+                        order_price = Decimal(price)
+                        if order_price >= best_ask:
+                            order_price = best_ask - self.config.tick_size
+                    else:
                         order_price = best_ask - self.config.tick_size
-                else:
-                    order_price = best_ask - self.config.tick_size
-            elif direction == 'sell':
-                if price is not None:
-                    order_price = Decimal(price)
-                    if order_price <= best_bid:
+                elif direction == 'sell':
+                    if price is not None:
+                        order_price = Decimal(price)
+                        if order_price <= best_bid:
+                            order_price = best_bid + self.config.tick_size
+                    else:
                         order_price = best_bid + self.config.tick_size
                 else:
-                    order_price = best_bid + self.config.tick_size
-            else:
-                raise Exception(f"[OPEN] Invalid direction: {direction}")
+                    return OrderResult(success=False, error_message=f"Invalid direction: {direction}")
 
-            if order_price <= 0:
-                return OrderResult(success=False, error_message='Calculated order price is non-positive')
+                if order_price <= 0:
+                    await asyncio.sleep(0.1)
+                    continue
 
-            order_price = self.round_to_tick(order_price)
+                order_price = self.round_to_tick(order_price)
 
-            if direction == 'buy' and order_price >= best_ask:
-                order_price = self.round_to_tick(best_ask - self.config.tick_size)
-            elif direction == 'sell' and order_price <= best_bid:
-                order_price = self.round_to_tick(best_bid + self.config.tick_size)
+                if direction == 'buy' and order_price >= best_ask:
+                    order_price = self.round_to_tick(best_ask - self.config.tick_size)
+                elif direction == 'sell' and order_price <= best_bid:
+                    order_price = self.round_to_tick(best_bid + self.config.tick_size)
 
-            # Place the order using GRVT SDK
-            try:
-                order_info = await self.place_post_only_order(contract_id, quantity, order_price, direction)
-            except Exception as e:
-                self.logger.log(f"[OPEN] Error placing order: {e}", "ERROR")
-                continue
+                # Place the order using GRVT SDK
+                try:
+                    order_info = await self.place_post_only_order(contract_id, quantity, order_price, direction)
+                except Exception as e:
+                    self.logger.log(f"[OPEN] Error placing order: {e}", "ERROR")
+                    await asyncio.sleep(0.1)
+                    continue
 
-            order_status = order_info.status
-            order_id = order_info.order_id
+                order_status = order_info.status
+                order_id = order_info.order_id
 
-            if order_status == 'REJECTED':
-                continue
-            if order_status in ['OPEN', 'FILLED']:
-                return OrderResult(
-                    success=True,
-                    order_id=order_id,
-                    side=direction,
-                    size=quantity,
-                    price=order_price,
-                    status=order_status
-                )
-            elif order_status == 'PENDING':
-                raise Exception("[OPEN] Order not processed after 10 seconds")
-            else:
-                raise Exception(f"[OPEN] Unexpected order status: {order_status}")
-        
-        return OrderResult(success=False, error_message=f"Failed to place open order after {max_retries} attempts")
+                if order_status == 'REJECTED':
+                    await asyncio.sleep(0.05)
+                    continue
+                    
+                if order_status in ['OPEN', 'FILLED']:
+                    # Track this order
+                    async with self._position_lock:
+                        self._pending_orders[order_id] = {
+                            'side': direction,
+                            'quantity': quantity,
+                            'price': order_price,
+                            'status': order_status,
+                            'timestamp': time.time()
+                        }
+                    
+                    return OrderResult(
+                        success=True,
+                        order_id=order_id,
+                        side=direction,
+                        size=quantity,
+                        price=order_price,
+                        status=order_status
+                    )
+                elif order_status == 'PENDING':
+                    await asyncio.sleep(0.1)
+                    continue
+                else:
+                    self.logger.log(f"[OPEN] Unexpected order status: {order_status}", "WARNING")
+                    await asyncio.sleep(0.1)
+                    continue
+            
+            return OrderResult(
+                success=False, 
+                error_message=f"Failed to place open order after {max_retries} attempts"
+            )
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        """Place a close order with GRVT."""
-        # Get current market prices
-        attempt = 0
-        active_close_orders = await self._get_active_close_orders(contract_id)
-        while True:
-            attempt += 1
-            if attempt % 5 == 0:
-                self.logger.log(f"[CLOSE] Attempt {attempt} to place order", "INFO")
-                current_close_orders = await self._get_active_close_orders(contract_id)
-
-                if current_close_orders - active_close_orders > 1:
-                    self.logger.log(f"[CLOSE] ERROR: Active close orders abnormal: "
-                                    f"{active_close_orders}, {current_close_orders}", "ERROR")
-                    raise Exception(f"[CLOSE] ERROR: Active close orders abnormal: "
-                                    f"{active_close_orders}, {current_close_orders}")
-                else:
-                    active_close_orders = current_close_orders
-
-            # Adjust price to ensure maker order
-            best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
-
-            if side == 'sell' and price <= best_bid:
-                adjusted_price = best_bid + self.config.tick_size
-            elif side == 'buy' and price >= best_ask:
-                adjusted_price = best_ask - self.config.tick_size
-            else:
-                adjusted_price = price
-
-            adjusted_price = self.round_to_tick(adjusted_price)
-            try:
-                order_info = await self.place_post_only_order(contract_id, quantity, adjusted_price, side)
-            except Exception as e:
-                self.logger.log(f"[CLOSE] Error placing order: {e}", "ERROR")
-                continue
-
-            order_status = order_info.status
-            order_id = order_info.order_id
-
-            if order_status == 'REJECTED':
-                continue
-            if order_status in ['OPEN', 'FILLED']:
-                return OrderResult(
-                    success=True,
-                    order_id=order_id,
-                    side=side,
-                    size=quantity,
-                    price=adjusted_price,
-                    status=order_status
+        """Place a close order with GRVT with strict validation."""
+        async with self._order_lock:
+            # Sync position first
+            await self._sync_position_with_exchange()
+            
+            # Verify we have a position to close
+            current_position = abs(self._tracked_position)
+            if current_position < quantity * Decimal('0.01'):  # Less than 1% of order size
+                self.logger.log(
+                    f"[CLOSE] WARNING: Attempting to close {quantity} but position is {self._tracked_position}",
+                    "WARNING"
                 )
-            elif order_status == 'PENDING':
-                raise Exception("[CLOSE] Order not processed after 10 seconds")
-            else:
-                raise Exception(f"[CLOSE] Unexpected order status: {order_status}")
+            
+            attempt = 0
+            max_retries = 30
+            initial_close_orders = await self._get_active_close_orders(contract_id)
+            
+            while attempt < max_retries:
+                attempt += 1
+                
+                # Periodic validation
+                if attempt % 5 == 0:
+                    self.logger.log(f"[CLOSE] Attempt {attempt} to place order", "INFO")
+                    await self._sync_position_with_exchange()
+                    
+                    current_close_orders = await self._get_active_close_orders(contract_id)
+                    close_order_delta = current_close_orders - initial_close_orders
+
+                    if close_order_delta > 1:
+                        self.logger.log(
+                            f"[CLOSE] ERROR: Too many close orders created. "
+                            f"Initial: {initial_close_orders}, Current: {current_close_orders}",
+                            "ERROR"
+                        )
+                        return OrderResult(
+                            success=False,
+                            error_message=f"Too many close orders: {close_order_delta} extra orders"
+                        )
+
+                # Adjust price to ensure maker order
+                best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+
+                if best_bid <= 0 or best_ask <= 0:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                if side == 'sell' and price <= best_bid:
+                    adjusted_price = best_bid + self.config.tick_size
+                elif side == 'buy' and price >= best_ask:
+                    adjusted_price = best_ask - self.config.tick_size
+                else:
+                    adjusted_price = price
+
+                adjusted_price = self.round_to_tick(adjusted_price)
+                
+                try:
+                    order_info = await self.place_post_only_order(contract_id, quantity, adjusted_price, side)
+                except Exception as e:
+                    self.logger.log(f"[CLOSE] Error placing order: {e}", "ERROR")
+                    await asyncio.sleep(0.1)
+                    continue
+
+                order_status = order_info.status
+                order_id = order_info.order_id
+
+                if order_status == 'REJECTED':
+                    await asyncio.sleep(0.05)
+                    continue
+                    
+                if order_status in ['OPEN', 'FILLED']:
+                    # Track close order
+                    async with self._position_lock:
+                        self._pending_orders[order_id] = {
+                            'side': side,
+                            'quantity': quantity,
+                            'price': adjusted_price,
+                            'status': order_status,
+                            'type': 'CLOSE',
+                            'timestamp': time.time()
+                        }
+                    
+                    return OrderResult(
+                        success=True,
+                        order_id=order_id,
+                        side=side,
+                        size=quantity,
+                        price=adjusted_price,
+                        status=order_status
+                    )
+                elif order_status == 'PENDING':
+                    await asyncio.sleep(0.1)
+                    continue
+                else:
+                    self.logger.log(f"[CLOSE] Unexpected order status: {order_status}", "WARNING")
+                    await asyncio.sleep(0.1)
+                    continue
+            
+            return OrderResult(
+                success=False,
+                error_message=f"Failed to place close order after {max_retries} attempts"
+            )
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with GRVT."""
@@ -554,6 +664,57 @@ class GrvtClient(BaseExchangeClient):
                 return Decimal('0')
 
         return Decimal('0')
+    
+    async def _sync_position_with_exchange(self) -> Decimal:
+        """Synchronize tracked position with exchange position."""
+        current_time = time.time()
+        
+        # Rate limit position sync to avoid excessive API calls
+        if current_time - self._last_position_sync < 0.5:
+            return self._tracked_position
+        
+        async with self._position_lock:
+            try:
+                exchange_position = await self.get_signed_position()
+                self._tracked_position = exchange_position
+                self._last_position_sync = current_time
+                
+                self.logger.log(
+                    f"[POSITION] Synced with exchange: {exchange_position}",
+                    "DEBUG"
+                )
+                
+                return exchange_position
+            except Exception as e:
+                self.logger.log(f"[POSITION] Error syncing position: {e}", "ERROR")
+                return self._tracked_position
+    
+    async def _validate_position_integrity(self, expected_change: Decimal, side: str) -> bool:
+        """Validate position change matches expected change."""
+        async with self._position_lock:
+            pre_position = self._tracked_position
+            await self._sync_position_with_exchange()
+            post_position = self._tracked_position
+            
+            actual_change = post_position - pre_position
+            
+            # For buy orders, position should increase; for sell, decrease
+            if side == 'buy':
+                expected = expected_change
+            else:
+                expected = -expected_change
+            
+            tolerance = Decimal('0.0001')  # 0.01% tolerance
+            if abs(actual_change - expected) > tolerance:
+                self.logger.log(
+                    f"[POSITION] WARNING: Position change mismatch. "
+                    f"Expected: {expected}, Actual: {actual_change}, "
+                    f"Pre: {pre_position}, Post: {post_position}",
+                    "WARNING"
+                )
+                return False
+            
+            return True
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID and tick size for a ticker."""
