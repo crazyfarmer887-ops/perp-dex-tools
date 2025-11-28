@@ -420,8 +420,9 @@ class HedgeBot:
     async def place_grvt_tp_sl_orders(self, entry_side: str, entry_price: Decimal, position_size: Decimal) -> None:
         """Place GRVT TP and SL limit orders after a position is filled.
         
-        Uses regular limit orders (not post-only) with reduce_only flag to ensure
-        orders close existing positions rather than opening new ones.
+        Uses Post-Only limit orders to ensure maker fees. TP/SL prices are set away from
+        current market price, so Post-Only should succeed without immediate execution.
+        Uses reduce_only flag to ensure orders close existing positions.
         """
         if self.grvt_client is None or self.grvt_contract_id is None:
             return
@@ -452,17 +453,17 @@ class HedgeBot:
                 except Exception as exc:
                     self.logger.warning(f"⚠️ Failed to round TP price: {exc}")
             
-            self.logger.info(f"[GRVT] Placing TP limit order: {close_side.upper()} {position_size} @ {tp_price}")
+            self.logger.info(f"[GRVT] Placing TP Post-Only order: {close_side.upper()} {position_size} @ {tp_price}")
             
             try:
-                # Use regular limit order (not post-only) with reduce_only=True
-                # This ensures the order can execute immediately at the target price
+                # Use Post-Only limit order for maker fees
+                # TP price is away from current market, so Post-Only should succeed
                 tp_result = await self.grvt_client.place_limit_order(
                     contract_id=self.grvt_contract_id,
                     quantity=position_size,
                     price=tp_price,
                     side=close_side,
-                    post_only=False,  # Allow immediate execution at TP price
+                    post_only=True,   # Post-Only for maker fees
                     reduce_only=True  # Only reduce existing position
                 )
                 
@@ -488,16 +489,17 @@ class HedgeBot:
                 except Exception as exc:
                     self.logger.warning(f"⚠️ Failed to round SL price: {exc}")
             
-            self.logger.info(f"[GRVT] Placing SL limit order: {close_side.upper()} {position_size} @ {sl_price}")
+            self.logger.info(f"[GRVT] Placing SL Post-Only order: {close_side.upper()} {position_size} @ {sl_price}")
             
             try:
-                # Use regular limit order (not post-only) with reduce_only=True
+                # Use Post-Only limit order for maker fees
+                # SL price is away from current market, so Post-Only should succeed
                 sl_result = await self.grvt_client.place_limit_order(
                     contract_id=self.grvt_contract_id,
                     quantity=position_size,
                     price=sl_price,
                     side=close_side,
-                    post_only=False,  # Allow immediate execution at SL price
+                    post_only=True,   # Post-Only for maker fees
                     reduce_only=True  # Only reduce existing position
                 )
                 
