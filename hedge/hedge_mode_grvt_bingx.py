@@ -73,6 +73,32 @@ class HedgeBot:
         self.last_roi_reason: Optional[str] = None
         self.pending_grvt_price: Optional[Tuple[str, Decimal]] = None
 
+        # Initialize position lock for thread-safe position updates
+        self._position_lock = asyncio.Lock()
+
+        # Initialize logger FIRST before any config parsing that might need logging
+        os.makedirs("logs", exist_ok=True)
+        self.log_filename = f"logs/grvt_bingx_{self.ticker.lower()}_hedge_log.txt"
+
+        self.logger = logging.getLogger(f"hedge_grvt_bingx_{self.ticker}")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+        self.logger.handlers.clear()
+
+        file_handler = logging.FileHandler(self.log_filename)
+        file_handler.setLevel(logging.INFO)
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+        console_handler.setFormatter(console_formatter)
+
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+
+        # Now we can safely use self.logger in config parsing
         config_warnings: List[str] = []
 
         def _coerce_decimal(value: Any, default: Decimal, label: str) -> Decimal:
@@ -239,27 +265,7 @@ class HedgeBot:
         self.grvt_fill_event = asyncio.Event()
         self.last_grvt_fill: Optional[Dict[str, Any]] = None
 
-        os.makedirs("logs", exist_ok=True)
-        self.log_filename = f"logs/grvt_bingx_{self.ticker.lower()}_hedge_log.txt"
-
-        self.logger = logging.getLogger(f"hedge_grvt_bingx_{self.ticker}")
-        self.logger.setLevel(logging.INFO)
-        self.logger.propagate = False
-        self.logger.handlers.clear()
-
-        file_handler = logging.FileHandler(self.log_filename)
-        file_handler.setLevel(logging.INFO)
-        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(file_formatter)
-
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
-        console_formatter = logging.Formatter('%(levelname)s: %(message)s')
-        console_handler.setFormatter(console_formatter)
-
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(console_handler)
-
+        # Log any config warnings (logger already initialized above)
         for message in config_warnings:
             self.logger.warning(message)
 
@@ -277,6 +283,35 @@ class HedgeBot:
             self.position_close_retry_delay,
             f"{self.position_close_timeout:.1f}s" if self.position_close_timeout > 0 else "DISABLED"
         )
+
+    # ------------------------------------------------------------------ #
+    # Position management with thread-safe locking
+    # ------------------------------------------------------------------ #
+
+    async def _update_grvt_position(self, delta: Decimal) -> Decimal:
+        """Thread-safe update of GRVT position."""
+        async with self._position_lock:
+            self.grvt_position += delta
+            return self.grvt_position
+
+    async def _update_bingx_position(self, delta: Decimal) -> Decimal:
+        """Thread-safe update of BingX position."""
+        async with self._position_lock:
+            self.bingx_position += delta
+            return self.bingx_position
+
+    async def _set_positions(self, grvt: Optional[Decimal] = None, bingx: Optional[Decimal] = None) -> None:
+        """Thread-safe set of positions."""
+        async with self._position_lock:
+            if grvt is not None:
+                self.grvt_position = grvt
+            if bingx is not None:
+                self.bingx_position = bingx
+
+    async def _get_positions(self) -> Tuple[Decimal, Decimal]:
+        """Thread-safe get of both positions."""
+        async with self._position_lock:
+            return self.grvt_position, self.bingx_position
 
     # ------------------------------------------------------------------ #
     # Initialization helpers
@@ -345,10 +380,21 @@ class HedgeBot:
         order_id = message.get('order_id')
 
         if status == 'FILLED':
-            if side == 'buy':
-                self.grvt_position += filled_size
+            # Calculate position delta
+            delta = filled_size if side == 'buy' else -filled_size
+
+            # Schedule async position update if we have a running loop
+            if self.loop is not None and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self._update_grvt_position(delta),
+                    self.loop
+                )
             else:
-                self.grvt_position -= filled_size
+                # Fallback for sync context (less safe but functional)
+                if side == 'buy':
+                    self.grvt_position += filled_size
+                else:
+                    self.grvt_position -= filled_size
 
             self.last_grvt_fill = {
                 'order_id': order_id,
@@ -372,7 +418,11 @@ class HedgeBot:
         await self.bingx_client.connect()
 
     async def place_grvt_tp_sl_orders(self, entry_side: str, entry_price: Decimal, position_size: Decimal) -> None:
-        """Place GRVT TP and SL limit orders after a position is filled."""
+        """Place GRVT TP and SL limit orders after a position is filled.
+        
+        Uses regular limit orders (not post-only) with reduce_only flag to ensure
+        orders close existing positions rather than opening new ones.
+        """
         if self.grvt_client is None or self.grvt_contract_id is None:
             return
         
@@ -405,16 +455,15 @@ class HedgeBot:
             self.logger.info(f"[GRVT] Placing TP limit order: {close_side.upper()} {position_size} @ {tp_price}")
             
             try:
-                # Configure the client for the close order
-                self.grvt_client.config.direction = close_side
-                self.grvt_client.config.close_order_side = entry_side
-                self.grvt_client.config.quantity = position_size
-                
-                tp_result = await self.grvt_client.place_open_order(
+                # Use regular limit order (not post-only) with reduce_only=True
+                # This ensures the order can execute immediately at the target price
+                tp_result = await self.grvt_client.place_limit_order(
                     contract_id=self.grvt_contract_id,
                     quantity=position_size,
-                    direction=close_side,
-                    price=tp_price
+                    price=tp_price,
+                    side=close_side,
+                    post_only=False,  # Allow immediate execution at TP price
+                    reduce_only=True  # Only reduce existing position
                 )
                 
                 if tp_result.success:
@@ -442,16 +491,14 @@ class HedgeBot:
             self.logger.info(f"[GRVT] Placing SL limit order: {close_side.upper()} {position_size} @ {sl_price}")
             
             try:
-                # Configure the client for the close order
-                self.grvt_client.config.direction = close_side
-                self.grvt_client.config.close_order_side = entry_side
-                self.grvt_client.config.quantity = position_size
-                
-                sl_result = await self.grvt_client.place_open_order(
+                # Use regular limit order (not post-only) with reduce_only=True
+                sl_result = await self.grvt_client.place_limit_order(
                     contract_id=self.grvt_contract_id,
                     quantity=position_size,
-                    direction=close_side,
-                    price=sl_price
+                    price=sl_price,
+                    side=close_side,
+                    post_only=False,  # Allow immediate execution at SL price
+                    reduce_only=True  # Only reduce existing position
                 )
                 
                 if sl_result.success:
@@ -511,10 +558,9 @@ class HedgeBot:
 
         if order_result.status == 'FILLED':
             if order_result.size is not None:
-                if side == 'buy':
-                    self.grvt_position += order_result.size
-                else:
-                    self.grvt_position -= order_result.size
+                # Thread-safe position update
+                delta = order_result.size if side == 'buy' else -order_result.size
+                await self._update_grvt_position(delta)
             self.last_grvt_fill = {
                 'order_id': order_result.order_id,
                 'side': side,
@@ -643,16 +689,15 @@ class HedgeBot:
                 order_result.status,
             )
 
-        if hedge_side == 'buy':
-            self.bingx_position += total_executed
-        else:
-            self.bingx_position -= total_executed
+        # Thread-safe position update
+        delta = total_executed if hedge_side == 'buy' else -total_executed
+        new_position = await self._update_bingx_position(delta)
 
         self.logger.info(
             "[BINGX] Hedge complete | side=%s | executed=%s | position=%s",
             hedge_side.upper(),
             total_executed,
-            self.bingx_position
+            new_position
         )
         return True
 
@@ -1032,8 +1077,7 @@ class HedgeBot:
 
     async def _sync_positions_from_exchanges(self) -> Tuple[Decimal, Decimal]:
         grvt_position, bingx_position = await self._fetch_signed_positions()
-        self.grvt_position = grvt_position
-        self.bingx_position = bingx_position
+        await self._set_positions(grvt=grvt_position, bingx=bingx_position)
         return grvt_position, bingx_position
 
     async def _place_grvt_limit_close(self, position: Decimal) -> bool:
@@ -1305,8 +1349,12 @@ class HedgeBot:
                 # Cancel any outstanding TP/SL orders before continuing
                 try:
                     active_orders = await self.grvt_client.get_active_orders(self.grvt_contract_id)
+                    # Determine close_order_side based on current position
+                    # If we have a long position (grvt_position > 0), close_order_side is 'sell'
+                    # If we have a short position (grvt_position < 0), close_order_side is 'buy'
+                    close_order_side = 'sell' if self.grvt_position > 0 else 'buy'
                     for order in active_orders:
-                        if order.side == self.config.close_order_side:
+                        if order.side == close_order_side:
                             self.logger.info(f"Cancelling outstanding TP/SL order {order.order_id}")
                             await self.grvt_client.cancel_order(order.order_id)
                 except Exception as exc:

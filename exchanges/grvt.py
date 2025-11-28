@@ -248,6 +248,82 @@ class GrvtClient(BaseExchangeClient):
 
         return best_bid, best_ask
 
+    async def place_limit_order(
+        self,
+        contract_id: str,
+        quantity: Decimal,
+        price: Decimal,
+        side: str,
+        post_only: bool = False,
+        reduce_only: bool = False
+    ) -> OrderResult:
+        """Place a limit order with GRVT using official SDK.
+        
+        Args:
+            contract_id: The contract ID to trade
+            quantity: Order quantity
+            price: Order price
+            side: 'buy' or 'sell'
+            post_only: If True, order will be rejected if it would execute immediately
+            reduce_only: If True, order will only reduce existing position
+            
+        Returns:
+            OrderResult with order details
+        """
+        params = {
+            'order_duration_secs': 30 * 86400 - 1,  # GRVT SDK: signature expired cap is 30 days
+        }
+        if post_only:
+            params['post_only'] = True
+        if reduce_only:
+            params['reduce_only'] = True
+
+        try:
+            order_result = self.rest_client.create_limit_order(
+                symbol=contract_id,
+                side=side,
+                amount=quantity,
+                price=price,
+                params=params
+            )
+        except Exception as e:
+            self.logger.log(f"Error placing limit order: {e}", "ERROR")
+            return OrderResult(success=False, error_message=str(e))
+
+        if not order_result:
+            return OrderResult(success=False, error_message="No response from exchange")
+
+        client_order_id = order_result.get('metadata', {}).get('client_order_id')
+        order_status = order_result.get('state', {}).get('status', 'UNKNOWN')
+        
+        # Wait for order to be processed
+        order_status_start_time = time.time()
+        order_info = await self.get_order_info(client_order_id=client_order_id)
+        if order_info is not None:
+            order_status = order_info.status
+
+        while order_status in ['PENDING'] and time.time() - order_status_start_time < 10:
+            await asyncio.sleep(0.05)
+            order_info = await self.get_order_info(client_order_id=client_order_id)
+            if order_info is not None:
+                order_status = order_info.status
+
+        if order_status == 'PENDING':
+            return OrderResult(success=False, error_message='Order not processed after 10 seconds')
+        
+        if order_info is None:
+            return OrderResult(success=False, error_message='Failed to get order info')
+
+        return OrderResult(
+            success=order_status in ['OPEN', 'FILLED'],
+            order_id=order_info.order_id,
+            side=side,
+            size=quantity,
+            price=price,
+            status=order_status,
+            filled_size=order_info.filled_size
+        )
+
     async def place_post_only_order(self, contract_id: str, quantity: Decimal, price: Decimal,
                                     side: str) -> OrderResult:
         """Place a post only order with GRVT using official SDK."""
@@ -281,7 +357,7 @@ class GrvtClient(BaseExchangeClient):
                 order_status = order_info.status
 
         if order_status == 'PENDING':
-            raise Exception('Paradex Server Error: Order not processed after 10 seconds')
+            raise Exception('GRVT Server Error: Order not processed after 10 seconds')
         else:
             return order_info
 
@@ -386,13 +462,17 @@ class GrvtClient(BaseExchangeClient):
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
         """Place a close order with GRVT."""
+        # Configuration constants
+        MAX_CLOSE_ORDER_RETRIES = 50  # Maximum number of retry attempts
+        RETRY_DELAY_SECONDS = 0.5  # Delay between retries
+
         # Get current market prices
         attempt = 0
         active_close_orders = await self._get_active_close_orders(contract_id)
-        while True:
+        while attempt < MAX_CLOSE_ORDER_RETRIES:
             attempt += 1
             if attempt % 5 == 0:
-                self.logger.log(f"[CLOSE] Attempt {attempt} to place order", "INFO")
+                self.logger.log(f"[CLOSE] Attempt {attempt}/{MAX_CLOSE_ORDER_RETRIES} to place order", "INFO")
                 current_close_orders = await self._get_active_close_orders(contract_id)
 
                 if current_close_orders - active_close_orders > 1:
@@ -418,12 +498,14 @@ class GrvtClient(BaseExchangeClient):
                 order_info = await self.place_post_only_order(contract_id, quantity, adjusted_price, side)
             except Exception as e:
                 self.logger.log(f"[CLOSE] Error placing order: {e}", "ERROR")
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
 
             order_status = order_info.status
             order_id = order_info.order_id
 
             if order_status == 'REJECTED':
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
             if order_status in ['OPEN', 'FILLED']:
                 return OrderResult(
@@ -438,6 +520,13 @@ class GrvtClient(BaseExchangeClient):
                 raise Exception("[CLOSE] Order not processed after 10 seconds")
             else:
                 raise Exception(f"[CLOSE] Unexpected order status: {order_status}")
+
+        # Max retries exceeded
+        self.logger.log(f"[CLOSE] Failed to place close order after {MAX_CLOSE_ORDER_RETRIES} attempts", "ERROR")
+        return OrderResult(
+            success=False,
+            error_message=f"Failed to place close order after {MAX_CLOSE_ORDER_RETRIES} attempts"
+        )
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with GRVT."""
